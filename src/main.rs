@@ -1,7 +1,9 @@
 mod daemon;
+mod helper;
 mod paths;
 mod ports;
 mod provision;
+mod routes;
 mod vm;
 
 use std::io::{BufRead, BufReader, Write};
@@ -45,14 +47,43 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Manage the privileged route helper that makes container IPs reachable
+    Helper {
+        #[command(subcommand)]
+        action: HelperCmd,
+    },
     /// Run the VM in the foreground (used internally by `start`)
     #[command(hide = true)]
     Daemon,
 }
 
+#[derive(Subcommand)]
+enum HelperCmd {
+    /// Install the helper (run with sudo)
+    Install,
+    /// Remove the helper and its routes (run with sudo)
+    Uninstall,
+    /// Run the helper (used by launchd)
+    #[command(hide = true)]
+    Serve {
+        #[arg(long)]
+        uid: u32,
+    },
+}
+
 fn main() -> Result<()> {
+    let command = Cli::parse().command;
+    // The route helper runs under launchd as root with no HOME and needs no
+    // berth paths, so handle it before touching them.
+    if let Cmd::Helper { action } = command {
+        return match action {
+            HelperCmd::Install => helper::install(),
+            HelperCmd::Uninstall => helper::uninstall(),
+            HelperCmd::Serve { uid } => helper::serve(uid),
+        };
+    }
     let paths = Paths::new();
-    match Cli::parse().command {
+    match command {
         Cmd::Start => start(&paths),
         Cmd::Stop => stop(&paths),
         Cmd::Status => status(&paths),
@@ -60,6 +91,7 @@ fn main() -> Result<()> {
         Cmd::Shell { command } => shell(&paths, &command),
         Cmd::Delete { yes } => delete(&paths, yes),
         Cmd::Daemon => daemon::run(paths),
+        Cmd::Helper { .. } => unreachable!(),
     }
 }
 
@@ -187,6 +219,7 @@ fn status(paths: &Paths) -> Result<()> {
             if !s.ports.is_empty() {
                 println!("Ports:   {}", s.ports.join(", "));
             }
+            println!("IPs:     {}", s.container_ips);
         }
     }
     Ok(())

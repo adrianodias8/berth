@@ -4,6 +4,7 @@
 //!   tcp 127.0.0.1:8080\n
 //!   unix /run/docker.sock\n
 //!   info domains\n          (replies with the domain table as JSON)
+//!   info network\n          (replies with the guest address and Docker subnets)
 //!
 //! A failed connect just closes the stream. The agent also runs the container
 //! domain controller (domains.rs) and its mDNS responder (mdns.rs).
@@ -64,6 +65,13 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
             splice(host, guest)
         }
         Some(("unix", path)) => splice(host, UnixStream::connect(path)?),
+        Some(("info", "network")) => {
+            let table = TABLE.get().unwrap().read().unwrap();
+            let info = domains::NetworkInfo { gateway: table.guest_ip, subnets: table.subnets.clone() };
+            drop(table);
+            serde_json::to_writer(&mut host, &info).map_err(io::Error::other)?;
+            Ok(())
+        }
         Some(("info", "domains")) => {
             let entries = TABLE.get().unwrap().read().unwrap().entries.clone();
             serde_json::to_writer(&mut host, &entries).map_err(io::Error::other)?;

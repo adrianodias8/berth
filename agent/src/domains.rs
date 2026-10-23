@@ -39,6 +39,15 @@ pub struct Table {
     pub entries: Vec<Entry>,
     /// The guest's own address, answered for the bare suffix.
     pub guest_ip: Option<Ipv4Addr>,
+    /// Docker bridge subnets, for the host to route container IPs via us.
+    pub subnets: Vec<String>,
+}
+
+/// What the host needs to route container IPs to this VM.
+#[derive(Serialize)]
+pub struct NetworkInfo {
+    pub gateway: Option<Ipv4Addr>,
+    pub subnets: Vec<String>,
 }
 
 impl Table {
@@ -193,6 +202,10 @@ fn sync(table: &Shared) -> io::Result<()> {
     let up = uplink()?;
     let pool = pool(&up);
     let containers = docker::containers()?;
+    let mut subnets: Vec<String> =
+        docker::networks()?.iter().flat_map(|n| n.ipv4_subnets().map(str::to_string)).collect();
+    subnets.sort();
+    subnets.dedup();
 
     // Stable assignment: hash the container name into the pool and probe, so a
     // container keeps its IP across restarts unless there is a collision.
@@ -228,6 +241,7 @@ fn sync(table: &Shared) -> io::Result<()> {
             .collect();
         t.entries = entries;
         t.guest_ip = Some(up.ip);
+        t.subnets = subnets;
         gone
     };
     if let Err(err) = crate::mdns::goodbye(&gone, up.ip) {
@@ -247,8 +261,8 @@ fn apply(up: &Uplink, mapping: &BTreeMap<Ipv4Addr, Ipv4Addr>) -> io::Result<()> 
     }
 
     // Our NAT chain runs first in PREROUTING; rebuilt on every sync.
-    run_quiet("iptables", &["-t", "nat", "-N", NAT_CHAIN]);
-    if !run_quiet("iptables", &["-t", "nat", "-C", "PREROUTING", "-j", NAT_CHAIN]) {
+    exec_quiet("iptables", &["-t", "nat", "-N", NAT_CHAIN]);
+    if !exec_quiet("iptables", &["-t", "nat", "-C", "PREROUTING", "-j", NAT_CHAIN]) {
         exec("iptables", &["-t", "nat", "-I", "PREROUTING", "1", "-j", NAT_CHAIN]);
     }
     exec("iptables", &["-t", "nat", "-F", NAT_CHAIN]);
@@ -259,10 +273,19 @@ fn apply(up: &Uplink, mapping: &BTreeMap<Ipv4Addr, Ipv4Addr>) -> io::Result<()> 
         );
     }
     // Docker's FORWARD policy drops new connections to unpublished container
-    // ports; let through anything we (or Docker) DNATed.
-    let accept = ["DOCKER-USER", "-m", "conntrack", "--ctstate", "DNAT", "-j", "ACCEPT"];
-    if !run_quiet("iptables", &[&["-C"], &accept[..]].concat()) {
-        exec("iptables", &[&["-I"], &accept[..]].concat());
+    // ports. Let through anything we (or Docker) DNATed, and traffic from the
+    // Mac's side of the NAT network, which reaches container IPs directly once
+    // the host routes container subnets via this VM.
+    let host_mask = !u32::MAX.checked_shr(u32::from(up.prefix)).unwrap_or(0);
+    let host_net = format!("{}/{}", Ipv4Addr::from(u32::from(up.ip) & host_mask), up.prefix);
+    let rules: [&[&str]; 2] = [
+        &["DOCKER-USER", "-m", "conntrack", "--ctstate", "DNAT", "-j", "ACCEPT"],
+        &["DOCKER-USER", "-i", &up.ifname, "-s", &host_net, "-j", "ACCEPT"],
+    ];
+    for rule in rules {
+        if !exec_quiet("iptables", &[&["-C"], rule].concat()) {
+            exec("iptables", &[&["-I"], rule].concat());
+        }
     }
     Ok(())
 }
@@ -281,7 +304,7 @@ fn exec(cmd: &str, args: &[&str]) -> bool {
     }
 }
 
-fn run_quiet(cmd: &str, args: &[&str]) -> bool {
+fn exec_quiet(cmd: &str, args: &[&str]) -> bool {
     Command::new(cmd).args(args).output().is_ok_and(|o| o.status.success())
 }
 

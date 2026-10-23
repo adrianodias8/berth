@@ -49,6 +49,9 @@ pub struct Status {
     pub memory: u64,
     #[serde(default)]
     pub ports: Vec<String>,
+    /// Direct container IP routing, human-readable.
+    #[serde(default)]
+    pub container_ips: String,
 }
 
 static STOPPING: AtomicBool = AtomicBool::new(false);
@@ -140,6 +143,7 @@ async fn handle_control(stream: UnixStream, cpus: usize, memory: u64) -> Result<
                 cpus,
                 memory,
                 ports: ports::forwarded(),
+                container_ips: crate::routes::state(),
             })?
         }
         Request::Domains => {
@@ -232,6 +236,7 @@ async fn shutdown() {
 }
 
 fn exit(paths: &Paths) -> ! {
+    crate::routes::clear();
     for path in [paths.control_socket(), paths.docker_socket(), paths.ssh_socket(), paths.pid_file()] {
         let _ = std::fs::remove_file(path);
     }

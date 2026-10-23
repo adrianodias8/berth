@@ -19,8 +19,9 @@ type Key = (&'static str, u16);
 
 static FORWARDS: Mutex<BTreeMap<Key, JoinHandle<()>>> = Mutex::new(BTreeMap::new());
 
-/// Container events after which the set of published ports may have changed.
-const EVENTS_PATH: &str = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%2C%22event%22%3A%5B%22start%22%2C%22die%22%2C%22pause%22%2C%22unpause%22%5D%7D";
+/// Events after which published ports or network subnets may have changed:
+/// container start/die/pause/unpause and any network event.
+const EVENTS_PATH: &str = "/events?filters=%7B%22type%22%3A%5B%22container%22%2C%22network%22%5D%2C%22event%22%3A%5B%22start%22%2C%22die%22%2C%22pause%22%2C%22unpause%22%2C%22create%22%2C%22destroy%22%2C%22connect%22%2C%22disconnect%22%5D%7D";
 
 #[derive(Deserialize)]
 struct Container {
@@ -80,6 +81,7 @@ async fn watch(synced: &mut bool) -> Result<()> {
 }
 
 async fn sync() -> Result<()> {
+    crate::routes::sync().await;
     let mut body = String::new();
     docker_get("/containers/json").await?.read_to_string(&mut body).await?;
     let containers: Vec<Container> = serde_json::from_str(&body)?;

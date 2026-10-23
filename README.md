@@ -27,10 +27,12 @@ with published ports and container domain names on the Mac.
   Each running container gets its own address on the Mac↔VM network, so every
   port and protocol works without publishing (`curl http://web.berth.local`,
   `redis-cli -h cache.shop.berth.local`, `ping`).
+- Direct container IPs from the Mac (`curl 172.17.0.2`, `ping`), for every Docker
+  bridge network, once the route helper is installed (below)
 - Memory balloon, so the VM's RAM size is a ceiling, not a reservation
 
-Not yet: HTTPS and port-less HTTP for apps not on port 80, direct container IPs,
-UDP published ports, `host.docker.internal`, Linux machines, GUI. See the roadmap below.
+Not yet: HTTPS and port-less HTTP for apps not on port 80, UDP published ports,
+`host.docker.internal`, Linux machines, GUI. See the roadmap below.
 
 ## Build
 
@@ -54,6 +56,24 @@ berth shell               # SSH into the VM; `berth shell uname -a` runs a comma
 berth stop
 berth delete --yes        # wipe the VM disk (containers, images, volumes)
 ```
+
+### Direct container IPs (optional, one-time sudo)
+
+Reaching container IPs needs a route on the Mac for each Docker subnet, and
+routes need root. A small helper does only that:
+
+```sh
+sudo berth helper install     # run in a terminal; asks for your password
+sudo berth helper uninstall   # removes it and its routes
+```
+
+It copies `berth` to a root-owned `/Library/PrivilegedHelperTools/dev.berth.helper`
+and runs it as a LaunchDaemon on `/var/run/dev.berth.helper.sock`, which only your
+user can use. It accepts only private subnets (10/8, 172.16/12, 192.168/16,
+100.64/10, 198.18/15) pointing at a VM bridge interface, and refuses any subnet that
+overlaps a network the Mac already routes. Routes follow Docker networks as they
+are created and removed, and are withdrawn when berth stops. `berth status` shows
+the state on the `IPs:` line; the helper logs to `/var/log/dev.berth.helper.log`.
 
 berth keeps its own data in `~/.berth` and its own Docker context, so it runs
 alongside OrbStack or Docker Desktop without touching them.
@@ -91,6 +111,7 @@ removes the address and sends an mDNS goodbye so the Mac drops the cached name.
   balloon) and helpers that run calls on the main dispatch queue, where the VM lives
 - `src/daemon.rs`: background process; control socket, socket bridges, shutdown
 - `src/ports.rs`: published-port forwarding driven by Docker events
+- `src/routes.rs`, `src/helper.rs`: container subnet routes and the root helper
 - `agent/`: the guest agent, a static Linux binary embedded in `berth` and
   refreshed into `~/.berth/guest/` on every start
   - `domains.rs`: Docker watcher, service IPs, guest addresses and NAT
@@ -104,8 +125,8 @@ Logs are in `~/.berth/log/` (`daemon.log`, `console.log`).
 
 1. ✅ VM + Docker socket
 2. ✅ Port forwarding for published ports (TCP), Rust guest agent, container
-   domain names. Next: HTTPS with a local CA and port-less HTTP for any port,
-   `host.docker.internal`, UDP published ports, direct container IPs (needs a root helper)
+   domain names, direct container IPs. Next: HTTPS with a local CA and port-less
+   HTTP for any port, `host.docker.internal`, UDP published ports
 3. Custom kernel with direct boot for sub-second
    start; userspace networking and file sharing tuned for throughput
 4. Linux machines (`berth create ubuntu`), menu-bar app, Kubernetes
@@ -115,4 +136,5 @@ Logs are in `~/.berth/log/` (`daemon.log`, `console.log`).
 berth matches OrbStack's documented and externally observable behavior. It
 contains no OrbStack code: it was written from OrbStack's public documentation and
 by observing a running install from the outside (names it answers, addresses,
-routes). OrbStack is a trademark of its owner; berth is not affiliated with it.
+routes). Where OrbStack relies on a macOS entitlement Apple grants only to approved
+developers (its per-network vmnet interfaces), berth uses a root route helper instead. OrbStack is a trademark of its owner; berth is not affiliated with it.

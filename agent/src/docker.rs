@@ -31,6 +31,38 @@ pub struct Endpoint {
     pub ip: String,
 }
 
+#[derive(Deserialize, Debug)]
+pub struct Network {
+    #[serde(rename = "Driver", default)]
+    pub driver: String,
+    #[serde(rename = "IPAM")]
+    pub ipam: Option<Ipam>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct Ipam {
+    #[serde(rename = "Config", default)]
+    pub config: Option<Vec<IpamConfig>>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct IpamConfig {
+    #[serde(rename = "Subnet", default)]
+    pub subnet: String,
+}
+
+impl Network {
+    /// IPv4 subnets of a bridge network; other drivers have no routable subnet.
+    pub fn ipv4_subnets(&self) -> impl Iterator<Item = &str> {
+        let bridge = self.driver == "bridge";
+        self.ipam
+            .iter()
+            .flat_map(|i| i.config.iter().flatten())
+            .map(|c| c.subnet.as_str())
+            .filter(move |s| bridge && !s.contains(':') && !s.is_empty())
+    }
+}
+
 impl Container {
     pub fn name(&self) -> Option<&str> {
         self.names.first().map(|n| n.trim_start_matches('/'))
@@ -65,5 +97,11 @@ pub fn get(path: &str) -> io::Result<BufReader<UnixStream>> {
 pub fn containers() -> io::Result<Vec<Container>> {
     let mut body = String::new();
     get("/containers/json")?.read_to_string(&mut body)?;
+    serde_json::from_str(&body).map_err(io::Error::other)
+}
+
+pub fn networks() -> io::Result<Vec<Network>> {
+    let mut body = String::new();
+    get("/networks")?.read_to_string(&mut body)?;
     serde_json::from_str(&body).map_err(io::Error::other)
 }
