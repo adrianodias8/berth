@@ -547,6 +547,13 @@ impl Server {
         self.entry_with(path, &m)
     }
 
+    /// `entry` for a path the guest just created, noted for the watcher.
+    fn entry_noted(&self, path: PathBuf) -> Reply {
+        let m = fs::symlink_metadata(&path).map_err(|e| io_errno(&e))?;
+        crate::watch::guest_wrote(&path, &m);
+        self.entry_with(path, &m)
+    }
+
     /// `entry` for a path whose metadata the caller already has.
     fn entry_with(&self, path: PathBuf, m: &fs::Metadata) -> Reply {
         let nodeid = if path == self.root { FUSE_ROOT_ID } else { m.ino() };
@@ -694,6 +701,7 @@ impl Server {
             Some(m) => m,
             None => stat().map_err(|e| io_errno(&e))?,
         };
+        crate::watch::guest_wrote(&path, &m);
         Ok(self.attr_reply(nodeid, &m))
     }
 
@@ -705,7 +713,7 @@ impl Server {
     fn symlink(&self, parent: u64, name: &[u8], target: &[u8]) -> Reply {
         let path = self.child(parent, name)?;
         std::os::unix::fs::symlink(OsStr::from_bytes(target), &path).map_err(|e| io_errno(&e))?;
-        self.entry(path)
+        self.entry_noted(path)
     }
 
     fn mkdir(&self, parent: u64, name: &[u8], mode: u32) -> Reply {
@@ -714,18 +722,23 @@ impl Server {
         if unsafe { libc::mkdir(c.as_ptr(), (mode & 0o7777) as libc::mode_t) } != 0 {
             return Err(io_errno(&std::io::Error::last_os_error()));
         }
-        self.entry(path)
+        self.entry_noted(path)
     }
 
     fn remove(&self, parent: u64, name: &[u8], dir: bool) -> Reply {
         let path = self.child(parent, name)?;
         if dir { fs::remove_dir(&path) } else { fs::remove_file(&path) }.map_err(|e| io_errno(&e))?;
+        crate::watch::guest_removed(&path);
         Ok(Vec::new())
     }
 
     fn rename(&self, olddir: u64, old: &[u8], newdir: u64, new: &[u8]) -> Reply {
         let (from, to) = (self.child(olddir, old)?, self.child(newdir, new)?);
         fs::rename(&from, &to).map_err(|e| io_errno(&e))?;
+        crate::watch::guest_removed(&from);
+        if let Ok(m) = fs::symlink_metadata(&to) {
+            crate::watch::guest_wrote(&to, &m);
+        }
         // Path-keyed nodes under the old name move with it.
         for node in self.nodes.lock().unwrap().values_mut() {
             if let Ok(rest) = node.path.strip_prefix(&from) {
@@ -738,7 +751,7 @@ impl Server {
     fn link(&self, old: u64, newdir: u64, name: &[u8]) -> Reply {
         let (from, to) = (self.path(old)?, self.child(newdir, name)?);
         fs::hard_link(&from, &to).map_err(|e| io_errno(&e))?;
-        self.entry(to)
+        self.entry_noted(to)
     }
 
     fn new_handle(&self, handle: Handle) -> u64 {
@@ -787,6 +800,7 @@ impl Server {
         let path = self.child(parent, name)?;
         let file = Arc::new(Self::open_file(&path, flags | 0o100, mode & 0o7777)?);
         let m = file.metadata().map_err(|e| io_errno(&e))?;
+        crate::watch::guest_wrote(&path, &m);
         let mut body = self.entry_with(path.clone(), &m)?;
         // A no-open kernel never sends RELEASE, even for created files: keep
         // the file as the node's (closed when evicted) and reply fh 0.
@@ -861,6 +875,9 @@ impl Server {
     fn write(&self, nodeid: u64, fh: u64, offset: u64, data: &[u8]) -> Reply {
         let f = self.file_for(nodeid, fh)?;
         f.write_all_at(data, offset).map_err(|e| io_errno(&e))?;
+        if let (Ok(path), Ok(m)) = (self.path(nodeid), f.metadata()) {
+            crate::watch::guest_wrote(&path, &m);
+        }
         let mut out = Out::default();
         out.u32(data.len() as u32).u32(0);
         Ok(out.0)

@@ -9,11 +9,17 @@
 //! coalesces flags, so it isn't reliably "metadata only"). To avoid a loop we
 //! forward a path only when its state changed: existence, mtime or size. A
 //! chmod changes none of them; real edits, creations and deletions do.
+//!
+//! Changes the guest itself makes through berth's own file server (fuse.rs)
+//! come back as FSEvents too. Touching those would only send the guest's own
+//! change back to it, at a round trip per file (it made `composer install`
+//! twice as slow), so the server records the state each change left (mtime
+//! and size, or removed) and we skip a path that still looks exactly so.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use notify::event::{EventKind, ModifyKind};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -26,6 +32,34 @@ const BATCH: Duration = Duration::from_millis(100);
 /// Per batch; a huge burst (git checkout, npm install) is truncated, and the
 /// directory touches still prompt watchers to rescan.
 const MAX_PATHS: usize = 2000;
+
+/// How long a guest change is remembered: FSEvents arrive well within this.
+const ECHO_WINDOW: Duration = Duration::from_secs(10);
+
+static GUEST_CHANGES: LazyLock<Mutex<HashMap<PathBuf, (Signature, Instant)>>> = LazyLock::new(Default::default);
+
+fn note(path: &Path, sig: Signature) {
+    let mut changes = GUEST_CHANGES.lock().unwrap();
+    if changes.len() > 500_000 {
+        changes.retain(|_, (_, t)| t.elapsed() < ECHO_WINDOW);
+    }
+    changes.insert(path.to_path_buf(), (sig, Instant::now()));
+}
+
+/// The file server wrote `path` for the guest; `meta` is its state after.
+pub fn guest_wrote(path: &Path, meta: &std::fs::Metadata) {
+    note(path, signature_of(meta));
+}
+
+/// The file server removed (or renamed away) `path` for the guest.
+pub fn guest_removed(path: &Path) {
+    note(path, None);
+}
+
+/// The event is the guest's own change: the path is as the guest left it.
+fn is_echo(path: &Path, sig: Signature) -> bool {
+    GUEST_CHANGES.lock().unwrap().get(path).is_some_and(|(s, t)| *s == sig && t.elapsed() < ECHO_WINDOW)
+}
 
 struct State {
     watcher: RecommendedWatcher,
@@ -73,8 +107,18 @@ fn relevant(event: &notify::Event) -> Option<Vec<PathBuf>> {
 type Signature = Option<(std::time::SystemTime, u64)>;
 
 fn signature(path: &Path) -> Signature {
-    let meta = std::fs::symlink_metadata(path).ok()?;
+    signature_of(&std::fs::symlink_metadata(path).ok()?)
+}
+
+fn signature_of(meta: &std::fs::Metadata) -> Signature {
     Some((meta.modified().ok()?, if meta.is_dir() { 0 } else { meta.len() }))
+}
+
+/// Of removed paths only the topmost needs touching: the guest then finds
+/// it gone and drops everything it cached under it, so `rm -rf vendor` on
+/// the Mac costs one touch, not one per file.
+fn topmost_removed(path: &Path) -> bool {
+    path.parent().is_none_or(|parent| signature(parent).is_some())
 }
 
 /// Keep paths whose signature changed since we last sent them, recording the
@@ -87,7 +131,9 @@ fn changed(seen: &mut HashMap<PathBuf, Signature>, paths: BTreeSet<PathBuf>) -> 
         .into_iter()
         .filter(|p| {
             let sig = signature(p);
-            seen.insert(p.clone(), sig) != Some(sig)
+            // Echoes still update what we've seen, so a later edit on the Mac
+            // compares against the guest's version.
+            seen.insert(p.clone(), sig) != Some(sig) && !is_echo(p, sig) && (sig.is_some() || topmost_removed(p))
         })
         .collect()
 }
@@ -101,6 +147,7 @@ async fn forward(mut rx: mpsc::UnboundedReceiver<Vec<PathBuf>>) {
         while let Ok(more) = rx.try_recv() {
             batch.extend(more);
         }
+        GUEST_CHANGES.lock().unwrap().retain(|_, (_, t)| t.elapsed() < ECHO_WINDOW);
         let paths: Vec<String> = changed(&mut seen, batch)
             .into_iter()
             .take(MAX_PATHS)
@@ -209,9 +256,42 @@ mod tests {
         // A real edit (size changes) is forwarded.
         std::fs::write(&file, "v2 longer").unwrap();
         assert_eq!(changed(&mut seen, one(&file)).len(), 1);
-        // Deletion is a change too.
+        // Deletion is a change too...
         std::fs::remove_file(&file).unwrap();
         assert_eq!(changed(&mut seen, one(&file)).len(), 1);
+        // ...but under a removed directory only the directory is touched.
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("x"), "").unwrap();
+        changed(&mut seen, [sub.clone(), sub.join("x")].into());
+        std::fs::remove_dir_all(&sub).unwrap();
+        assert_eq!(changed(&mut seen, [sub.clone(), sub.join("x")].into()), vec![sub]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_guests_own_changes_are_not_echoed() {
+        let dir = std::env::temp_dir().join(format!("berth-watch-echo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mine, theirs) = (dir.join("from-guest"), dir.join("from-mac"));
+        std::fs::write(&mine, "x").unwrap();
+        std::fs::write(&theirs, "x").unwrap();
+        guest_wrote(&mine, &std::fs::metadata(&mine).unwrap());
+        let mut seen = HashMap::new();
+        assert_eq!(changed(&mut seen, [mine.clone(), theirs.clone()].into()), vec![theirs]);
+        assert!(seen.contains_key(&mine), "still recorded");
+        // The Mac then changing or removing the guest's file is no echo.
+        std::fs::write(&mine, "edited on the Mac").unwrap();
+        assert_eq!(changed(&mut seen, [mine.clone()].into()), vec![mine.clone()]);
+        std::fs::remove_file(&mine).unwrap();
+        assert_eq!(changed(&mut seen, [mine.clone()].into()), vec![mine.clone()]);
+        // But the guest's own removal is.
+        let gone = dir.join("removed-by-guest");
+        std::fs::write(&gone, "").unwrap();
+        changed(&mut seen, [gone.clone()].into());
+        std::fs::remove_file(&gone).unwrap();
+        guest_removed(&gone);
+        assert!(changed(&mut seen, [gone].into()).is_empty());
         std::fs::remove_dir_all(dir).ok();
     }
 

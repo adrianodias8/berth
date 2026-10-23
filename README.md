@@ -67,9 +67,9 @@ images, volumes, networks, Kubernetes, machines, terminals, logs, files and stat
   per operation, and nothing on the guest side changes that.
 - DDEV + Drupal CMS: `ddev composer create-project` fails on Apple's virtiofs
   (the project folder shows as root-owned in containers, so `rsync -g` can't
-  set its group). It works on berth's own share (below), where everything that
-  writes many small files is still 2–2.4x slower than OrbStack; warm page loads
-  are on par (`bench/results/2026-10-23-ddev-drupal.md`).
+  set its group). It works on berth's own share (below); with its polling guest
+  driver small-file extraction matches OrbStack and Composer is ~1.5x slower;
+  warm page loads are on par (`bench/results/2026-10-23-ddev-drupal.md`).
 - Memory used by a workload isn't returned to macOS after it ends (OrbStack in the
   same test didn't return it within 2 minutes either).
 - Deleting a file on the Mac doesn't raise an inotify event in containers.

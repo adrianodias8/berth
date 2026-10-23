@@ -12,7 +12,8 @@
 //! / _NEGATIVE_TIMEOUT (seconds, default 1), BERTH_FS_WRITEBACK=1, BERTH_FS_POLL_US (default
 //! 100), BERTH_FS_QUEUES (request queues, default 1), BERTH_FS_THREADS=1
 //! (serve concurrent requests on worker threads), BERTH_FS_STATS=1,
-//! BERTH_FS_TRACE=1 (log every request).
+//! BERTH_FS_TRACE=1 (log every request), BERTH_FS_POLL_DRIVER=1 (present
+//! the device for the polling guest driver: `mount -t virtiofs_poll`).
 //!
 //! Where the time goes: the framework takes ~70 µs to deliver each queue
 //! notification to us and about as long to get a reply back to the guest,
@@ -56,6 +57,9 @@ use crate::fuse::{CachePolicy, Server};
 
 /// virtio-fs device ID; config space is `tag[36]` + `num_request_queues`.
 const VIRTIO_ID_FS: u16 = 26;
+/// The same device under its own ID, bound only by berth's polling guest
+/// driver (guest/kmod/virtiofs_poll) instead of the built-in one.
+const BERTH_FS_DEVICE_ID: u16 = 62;
 const TAG: &str = "berthfs";
 /// Queue 0 is the high-priority queue (FORGET etc.), then the request
 /// queues (Linux 6.11+ spreads CPUs over several, but more didn't help).
@@ -504,7 +508,10 @@ pub fn device(root: &std::path::Path) -> Option<Retained<NSObject>> {
         writeback: std::env::var_os("BERTH_FS_WRITEBACK").is_some(),
     };
     let request_queues = (num("BERTH_FS_QUEUES", DEFAULT_REQUEST_QUEUES as f64) as u16).clamp(1, 16);
-    let threaded = num("BERTH_FS_THREADS", 0.0) != 0.0;
+    let poll_driver = std::env::var_os("BERTH_FS_POLL_DRIVER").is_some();
+    // With the polling guest driver the transport is cheap enough that our
+    // serving thread becomes the limit for parallel work.
+    let threaded = num("BERTH_FS_THREADS", if poll_driver { 1.0 } else { 0.0 }) != 0.0;
     eprintln!(
         "virtiofs: experimental device '{TAG}' for {} ({policy:?}, {request_queues} request queues, {})",
         root.display(),
@@ -533,7 +540,7 @@ pub fn device(root: &std::path::Path) -> Option<Retained<NSObject>> {
             ProtocolObject::from_ref(&*device),
         );
         let config = VZCustomVirtioDeviceConfiguration::new();
-        config.setDeviceID(VIRTIO_ID_FS);
+        config.setDeviceID(if poll_driver { BERTH_FS_DEVICE_ID } else { VIRTIO_ID_FS });
         config.setPCIClassID(0x01); // mass storage
         config.setPCISubclassID(0x80);
         config.setVirtioQueueCount(1 + request_queues);
