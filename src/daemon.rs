@@ -18,6 +18,7 @@ use crate::vm::{self, AGENT_VSOCK_PORT, Resources};
 
 /// Agent targets (see agent/src/main.rs).
 pub const DOCKER_TARGET: &str = "unix /run/docker.sock";
+pub const PODMAN_TARGET: &str = "unix /run/podman/podman.sock";
 const SSH_TARGET: &str = "tcp 127.0.0.1:22";
 
 unsafe extern "C" {
@@ -32,6 +33,12 @@ pub enum Request {
     Domains,
     K8s { action: String },
     Machine { action: String, args: Vec<String> },
+    Engine { args: String },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct EngineReply {
+    pub output: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -79,7 +86,7 @@ static STOPPING: AtomicBool = AtomicBool::new(false);
 pub fn run(paths: Paths) -> Result<()> {
     paths.create_dirs()?;
     std::fs::write(paths.pid_file(), std::process::id().to_string())?;
-    for sock in [paths.control_socket(), paths.docker_socket(), paths.ssh_socket()] {
+    for sock in [paths.control_socket(), paths.docker_socket(), paths.ssh_socket(), paths.podman_socket()] {
         let _ = std::fs::remove_file(sock);
     }
 
@@ -111,6 +118,7 @@ async fn serve(paths: Paths, cpus: usize, memory: u64) -> Result<()> {
     let control = UnixListener::bind(paths.control_socket())?;
     bridge(UnixListener::bind(paths.docker_socket())?, DOCKER_TARGET, "docker");
     bridge(UnixListener::bind(paths.ssh_socket())?, SSH_TARGET, "ssh");
+    bridge(UnixListener::bind(paths.podman_socket())?, PODMAN_TARGET, "podman");
     crate::watch::start();
     tokio::spawn(ports::run());
     tokio::spawn(crate::memory::run(memory));
@@ -186,6 +194,12 @@ async fn handle_control(stream: UnixStream, cpus: usize, memory: u64) -> Result<
             guest.read_to_string(&mut output).await?;
             serde_json::to_string(&MachineReply { output })?
         }
+        Request::Engine { args } => {
+            let mut guest = guest_stream(&format!("engine {args}")).await?;
+            let mut output = String::new();
+            guest.read_to_string(&mut output).await?;
+            serde_json::to_string(&EngineReply { output })?
+        }
         Request::Domains => {
             let mut guest = guest_stream("info domains").await?;
             let mut json = String::new();
@@ -235,6 +249,8 @@ fn bridge(listener: UnixListener, target: &'static str, name: &'static str) {
 ///                               here and proxy plain HTTP to the container
 ///   memory-pressure             the guest is stalling on memory: deflate the
 ///                               balloon now (memory.rs)
+///   sync                        containers changed outside Docker's event
+///                               stream (nerdctl): re-sync port forwarding
 async fn serve_host_connections() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     if vm::INCOMING.set(tx).is_err() {
@@ -311,6 +327,7 @@ async fn host_connection(fd: std::os::fd::OwnedFd, tls: Option<tokio_rustls::Tls
             }
         }
         ["memory-pressure"] => crate::memory::on_pressure(max_memory).await,
+        ["sync"] => ports::trigger(),
         _ => anyhow::bail!("bad header {header:?}"),
     }
     Ok(())
@@ -366,7 +383,7 @@ async fn shutdown() {
 
 fn exit(paths: &Paths) -> ! {
     crate::routes::clear();
-    for path in [paths.control_socket(), paths.docker_socket(), paths.ssh_socket(), paths.pid_file()] {
+    for path in [paths.control_socket(), paths.docker_socket(), paths.ssh_socket(), paths.podman_socket(), paths.pid_file()] {
         let _ = std::fs::remove_file(path);
     }
     std::process::exit(0);

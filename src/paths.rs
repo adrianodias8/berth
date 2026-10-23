@@ -66,6 +66,9 @@ impl Paths {
     pub fn docker_socket(&self) -> PathBuf {
         self.run().join("docker.sock")
     }
+    pub fn podman_socket(&self) -> PathBuf {
+        self.run().join("podman.sock")
+    }
     pub fn ssh_socket(&self) -> PathBuf {
         self.run().join("ssh.sock")
     }

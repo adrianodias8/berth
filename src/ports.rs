@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::task::JoinHandle;
 
-use crate::daemon::{DOCKER_TARGET, guest_stream, is_disconnect};
+use crate::daemon::{DOCKER_TARGET, PODMAN_TARGET, guest_stream, is_disconnect};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Proto {
@@ -74,6 +74,19 @@ fn display((bind, port, proto): Key) -> String {
 }
 
 pub async fn run() {
+    // Podman containers publish ports too; follow its event stream as well
+    // (the socket only answers while Podman is enabled).
+    tokio::spawn(async {
+        loop {
+            if let Ok(events) = docker_get_from(PODMAN_TARGET, "/events").await {
+                let mut lines = events.lines();
+                while let Ok(Some(_)) = lines.next_line().await {
+                    let _ = sync().await;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
     let mut synced = false;
     loop {
         if let Err(err) = watch(&mut synced).await {
@@ -97,11 +110,34 @@ async fn watch(synced: &mut bool) -> Result<()> {
     bail!("docker event stream ended");
 }
 
+/// Re-sync now (the agent asks when nerdctl containers change).
+pub fn trigger() {
+    tokio::spawn(async {
+        let _ = sync().await;
+    });
+}
+
 async fn sync() -> Result<()> {
     crate::routes::sync().await;
     let mut body = String::new();
     docker_get("/containers/json").await?.read_to_string(&mut body).await?;
-    let containers: Vec<Container> = serde_json::from_str(&body)?;
+    let mut containers: Vec<Container> = serde_json::from_str(&body)?;
+    // Podman's Docker-compatible list has the same shape; absent if disabled.
+    let mut podman = String::new();
+    if let Ok(mut reader) = docker_get_from(PODMAN_TARGET, "/containers/json").await
+        && reader.read_to_string(&mut podman).await.is_ok()
+        && let Ok(more) = serde_json::from_str::<Vec<Container>>(&podman)
+    {
+        containers.extend(more);
+    }
+    // nerdctl has no API socket; the agent lists its containers in this shape.
+    let mut nerdctl = String::new();
+    if let Ok(mut guest) = guest_stream("info nerdctl").await
+        && guest.read_to_string(&mut nerdctl).await.is_ok()
+        && let Ok(more) = serde_json::from_str::<Vec<Container>>(&nerdctl)
+    {
+        containers.extend(more);
+    }
 
     // Same event stream drives file-change forwarding for bind mounts.
     let home = crate::paths::Paths::new().home;
@@ -273,7 +309,11 @@ async fn forward(listener: TcpListener, port: u16, direct: bool) {
 
 /// GET from the guest's Docker API; returns the body reader after the headers.
 async fn docker_get(path: &str) -> Result<BufReader<UnixStream>> {
-    let mut stream = guest_stream(DOCKER_TARGET).await?;
+    docker_get_from(DOCKER_TARGET, path).await
+}
+
+async fn docker_get_from(target: &str, path: &str) -> Result<BufReader<UnixStream>> {
+    let mut stream = guest_stream(target).await?;
     stream
         .write_all(format!("GET {path} HTTP/1.0\r\nHost: docker\r\n\r\n").as_bytes())
         .await?;

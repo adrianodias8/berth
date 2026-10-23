@@ -1,6 +1,7 @@
 mod cli_tools;
 mod context;
 mod daemon;
+mod engines;
 mod helper;
 mod k8s;
 mod machines;
@@ -45,6 +46,17 @@ enum Cmd {
     Status,
     /// List container domain names and their addresses
     Domains,
+    /// Container engines next to Docker: Podman and containerd/nerdctl
+    Engine {
+        #[command(subcommand)]
+        action: EngineCmd,
+    },
+    /// Run nerdctl in the VM (enable it first: berth engine enable nerdctl)
+    #[command(disable_help_flag = true)]
+    Nerdctl {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Linux machines: full distros with systemd, your user and home folder
     Machine {
         #[command(subcommand)]
@@ -78,6 +90,16 @@ enum Cmd {
     /// Run the VM in the foreground (used internally by `start`)
     #[command(hide = true)]
     Daemon,
+}
+
+#[derive(Subcommand)]
+enum EngineCmd {
+    /// Install and start an engine: podman or nerdctl
+    Enable { name: String },
+    /// Stop an engine (its containers and images are kept)
+    Disable { name: String },
+    /// Show which engines are enabled
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -156,6 +178,23 @@ fn main() -> Result<()> {
         Cmd::Stop => stop(&paths),
         Cmd::Status => status(&paths),
         Cmd::Domains => domains(&paths),
+        Cmd::Engine { action } => {
+            if current_status(&paths).is_none() {
+                bail!("berth is not running");
+            }
+            match action {
+                EngineCmd::Enable { name } => engines::enable(&paths, &name),
+                EngineCmd::Disable { name } => engines::disable(&paths, &name),
+                EngineCmd::Status => engines::status(&paths),
+            }
+        }
+        Cmd::Nerdctl { args } => {
+            if current_status(&paths).is_none() {
+                bail!("berth is not running");
+            }
+            let tty = unsafe { libc::isatty(0) } == 1 && unsafe { libc::isatty(1) } == 1;
+            ssh(&paths, &engines::nerdctl_command(&args), tty)
+        }
         Cmd::Machine { action } => {
             if current_status(&paths).is_none() {
                 bail!("berth is not running");

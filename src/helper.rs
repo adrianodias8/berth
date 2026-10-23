@@ -37,7 +37,7 @@ pub struct Route {
 }
 
 /// Bumped when the helper gains abilities, so berth can ask for a reinstall.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 pub struct SetRoutes {

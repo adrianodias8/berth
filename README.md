@@ -27,6 +27,13 @@ from its code.
 - ASIF disk image on macOS 26+: deleting images and containers frees disk space
   on the Mac. VM data is excluded from Time Machine.
 
+- **Alternative engines** next to Docker: `berth engine enable podman` (Debian's
+  Podman 5, API at `~/.berth/run/podman.sock`, the macOS `podman` client with a
+  default `berth` connection) and `berth engine enable nerdctl` (nerdctl + BuildKit
+  on the containerd Docker already runs, in its own namespace; `nerdctl` on the Mac
+  runs it in the VM from your current directory). Containers from every engine get
+  published ports, domains, container IPs and `host.docker.internal`.
+
 **Networking**
 - Published ports (`-p 8080:80`, TCP and UDP) on the Mac, IPv4 and IPv6, following
   Docker's bind address
@@ -114,6 +121,7 @@ berth status
 berth domains             # container names and addresses
 berth tls trust           # trust the local CA for https://*.berth.local (one-time, asks for password)
 berth k8s enable          # Kubernetes (k3s) with a `berth` kubectl context
+berth engine enable podman   # or nerdctl; berth engine status
 berth machine create dev  # an Ubuntu machine; then: berth machine shell dev
 berth shell               # SSH into the VM; `berth shell uname -a` runs a command
 berth stop
@@ -205,6 +213,7 @@ refuses any other name, so trusting it cannot be abused for real sites.
 - `src/memory.rs`: balloon controller
 - `src/k8s.rs`, `src/machines.rs`: Kubernetes and Linux machines (agent: `k8s.rs`, `machines.rs`)
 - `src/cli_tools.rs`: bundled Docker/Compose/Buildx/kubectl CLIs
+- `src/engines.rs` (agent: `engines.rs`): Podman and nerdctl
 - `agent/`: the guest agent, a static Linux binary embedded in `berth` and
   refreshed into `~/.berth/guest/` on every start
   - `domains.rs`: Docker watcher, service IPs, guest addresses and NAT
@@ -224,11 +233,17 @@ Logs are in `~/.berth/log/` (`daemon.log`, `console.log`).
 Informed by OrbStack users' most-requested features (public issue tracker and
 discussions) and the limits above:
 
-- **Engine choice**: Podman and containerd/nerdctl alongside Docker (OrbStack's
-  most-upvoted open request)
 - **Faster file sharing**: a userspace file server (e.g. NFS) over the VM network
   to beat virtiofs on metadata-heavy workloads
-- **Machines**: snapshots, cloud-init / custom images, GUI apps
+- **Machines**: snapshots, cloud-init / custom images
+- **Linux GUI apps**: first a console window (virtio-gpu 2D, clipboard via
+  spice-vdagent), then per-app windows like WSLg (a compositor in the machine,
+  surfaces streamed to native windows). Rendering is CPU-only until there's GPU
+  acceleration: macOS 27's custom Virtio devices with shared memory may allow a
+  virtio-gpu (Venus → MoltenVK/KosmicKrisp) while keeping Rosetta; unproven.
+- **Games (experimental, later)**: Steam/Proton needs Vulkan and 32-bit x86
+  (FEX alongside Rosetta), so it depends on the GPU work above; for Windows games
+  today, CrossOver/Game Porting Toolkit is the better path
 - **Networking**: bridged mode (container IPs on the LAN) through the root helper,
   `.berth.local` names reachable from other devices, client source IP preservation
 - **Memory**: returning freed memory to macOS needs a VMM with free-page reporting

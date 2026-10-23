@@ -8,6 +8,7 @@
 //!   info memory\n           (replies with MemTotal/MemAvailable/PSI, see memory.rs)
 //!   k8s <action>\n          enable|disable|status|kubeconfig (k8s.rs)
 //!   machine <action>\n      then JSON args until EOF: create|start|stop|delete|list (machines.rs)
+//!   engine <action> [name]\n enable|disable podman|nerdctl, status (engines.rs)
 //!   touch\n                 followed by newline-separated paths until EOF: raise
 //!                           inotify events for files changed on the Mac
 //!
@@ -21,6 +22,7 @@ mod dns;
 mod docker;
 mod domains;
 mod engine;
+mod engines;
 mod hostnet;
 mod k8s;
 mod machines;
@@ -95,6 +97,11 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
         Some(("unix", path)) => splice(host, UnixStream::connect(path)?),
         Some(("k8s", action)) => k8s::handle(action, host),
         Some(("machine", action)) => machines::handle(action, host),
+        Some(("engine", args)) => engines::handle(args, host),
+        Some(("info", "nerdctl")) => {
+            serde_json::to_writer(&mut host, &engines::nerdctl_containers()).map_err(io::Error::other)?;
+            Ok(())
+        }
         Some(("info", "memory")) => {
             serde_json::to_writer(&mut host, &memory::read()?).map_err(io::Error::other)?;
             Ok(())

@@ -21,7 +21,7 @@ const BUILDX: &str = "v0.38.1";
 const KUBECTL: &str = "v1.37.1";
 
 /// Names linked into /usr/local/bin by the helper (see helper.rs).
-pub const SYSTEM_LINKS: [&str; 3] = ["docker", "docker-compose", "kubectl"];
+pub const SYSTEM_LINKS: [&str; 5] = ["docker", "docker-compose", "kubectl", "podman", "nerdctl"];
 
 pub fn bin_dir(paths: &Paths) -> PathBuf {
     paths.root.join("bin")
@@ -74,6 +74,18 @@ enum Checksum {
     /// The digest GitHub records for a release asset. (Buildx's provenance
     /// digests predate Docker's macOS code signing, so they don't match.)
     GitHubAsset { repo: &'static str, tag: &'static str, name: String },
+}
+
+/// Download `url` to `dest`, checking it against a known SHA-256.
+pub fn fetch_verified_sha256(dest: &Path, url: &str, sha256: &str) -> Result<()> {
+    let tmp = dest.with_extension("download");
+    curl(url, &tmp)?;
+    if !sha256_file(&tmp)?.eq_ignore_ascii_case(sha256) {
+        fs::remove_file(&tmp).ok();
+        bail!("checksum mismatch for {url}");
+    }
+    fs::rename(&tmp, dest)?;
+    Ok(())
 }
 
 fn fetch_verified(dest: &Path, url: &str, checksum: Checksum) -> Result<()> {

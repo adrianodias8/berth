@@ -11,6 +11,8 @@ struct SettingsView: View {
     @State private var helperMessage: String?
     @State private var httpsTrusted = TLSTrust.cached
     @State private var httpsMessage: String?
+    @State private var engines: [String: Bool] = [:]
+    @State private var engineMessage: String?
 
     private let hostCPUs = ProcessInfo.processInfo.activeProcessorCount
     private let hostMemoryGiB = Int(ProcessInfo.processInfo.physicalMemory >> 30)
@@ -63,6 +65,15 @@ struct SettingsView: View {
                 if let helperMessage { Text(helperMessage).font(.caption).foregroundStyle(.secondary) }
             }
 
+            SwiftUI.Section("Container engines") {
+                LabeledContent("Docker", value: "Always on")
+                Toggle("Podman", isOn: engineBinding("podman"))
+                Toggle("nerdctl (containerd)", isOn: engineBinding("nerdctl"))
+                Text(engineMessage ?? "Podman: `podman` on your Mac uses berth. nerdctl: `nerdctl` runs in the VM. Containers from every engine get ports, domains and IPs.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .task { await loadEngines() }
+
             SwiftUI.Section("HTTPS") {
                 LabeledContent("Container domains over HTTPS", value: httpsTrusted ? "On" : "Certificate not trusted")
                 HStack {
@@ -101,7 +112,29 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 520, height: 640)
+        .frame(width: 520, height: 720)
+    }
+
+    private func loadEngines() async {
+        let out = await Task.detached { Engine.run([BerthPaths.cli, "engine", "status"]).output }.value
+        var states: [String: Bool] = [:]
+        for line in out.split(separator: "\n") {
+            let parts = line.split(separator: " ", maxSplits: 1)
+            if parts.count == 2 { states[String(parts[0])] = parts[1].trimmingCharacters(in: .whitespaces).hasPrefix("enabled") }
+        }
+        engines = states
+    }
+
+    private func engineBinding(_ name: String) -> Binding<Bool> {
+        Binding(get: { engines[name] ?? false }, set: { on in
+            engines[name] = on
+            engineMessage = on ? "Setting up \(name)… (the first time installs it in the VM)" : nil
+            Task {
+                let result = await Task.detached { Engine.run([BerthPaths.cli, "engine", on ? "enable" : "disable", name]) }.value
+                engineMessage = result.code == 0 ? nil : result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                await loadEngines()
+            }
+        })
     }
 
     /// `berth tls trust|untrust`; macOS shows its own password prompt.

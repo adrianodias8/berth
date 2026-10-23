@@ -101,6 +101,20 @@ pub fn request_sync() {
 /// Keep the table and the guest's addresses/NAT in step with Docker.
 pub fn run(table: Shared) {
     let _ = TABLE_REF.set(table.clone());
+    thread::spawn(crate::engines::watch_nerdctl_events);
+    // Podman's events don't reach the Docker stream we follow below.
+    thread::spawn(|| loop {
+        if crate::engines::podman_enabled()
+            && let Ok(mut events) = docker::get_from(crate::engines::PODMAN_SOCKET, "/events")
+        {
+            let mut line = String::new();
+            while events.read_line(&mut line).is_ok_and(|n| n > 0) {
+                line.clear();
+                request_sync();
+            }
+        }
+        thread::sleep(Duration::from_secs(5));
+    });
     // Machines that autostart with the VM get their address a few seconds
     // after boot, without any Docker event to trigger a sync.
     thread::spawn(|| {
@@ -237,6 +251,7 @@ fn sync(table: &Shared) -> io::Result<()> {
     let containers = docker::containers()?;
     let mut subnets: Vec<String> =
         docker::networks()?.iter().flat_map(|n| n.ipv4_subnets().map(str::to_string)).collect();
+    subnets.extend(crate::engines::nerdctl_subnets());
     if crate::k8s::active() {
         subnets.extend(crate::k8s::SUBNETS.iter().map(|s| s.to_string()));
     }
@@ -342,9 +357,16 @@ fn apply(up: &Uplink, mapping: &BTreeMap<Ipv4Addr, Ipv4Addr>) -> io::Result<()> 
     // the host routes container subnets via this VM.
     let host_mask = !u32::MAX.checked_shr(u32::from(up.prefix)).unwrap_or(0);
     let host_net = format!("{}/{}", Ipv4Addr::from(u32::from(up.ip) & host_mask), up.prefix);
-    let rules: [&[&str]; 2] = [
+    // Podman (netavark) and nerdctl (CNI) bridges keep their own nftables
+    // rules, but a DROP in Docker's FORWARD chain still wins, so let their
+    // outbound traffic and its replies through here.
+    let rules: [&[&str]; 6] = [
         &["DOCKER-USER", "-m", "conntrack", "--ctstate", "DNAT", "-j", "ACCEPT"],
         &["DOCKER-USER", "-i", &up.ifname, "-s", &host_net, "-j", "ACCEPT"],
+        &["DOCKER-USER", "-i", "podman+", "-j", "ACCEPT"],
+        &["DOCKER-USER", "-o", "podman+", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
+        &["DOCKER-USER", "-i", "nerdctl+", "-j", "ACCEPT"],
+        &["DOCKER-USER", "-o", "nerdctl+", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
     ];
     for rule in rules {
         if !exec_quiet("iptables", &[&["-C"], rule].concat()) {

@@ -1,5 +1,6 @@
 //! Minimal Docker Engine API client over /run/docker.sock (HTTP/1.0, so no
-//! chunked encoding to deal with).
+//! chunked encoding to deal with). Podman's Docker-compatible API answers the
+//! same calls, so containers and networks are read from both engines.
 
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -8,6 +9,15 @@ use std::os::unix::net::UnixStream;
 use serde::Deserialize;
 
 const SOCKET: &str = "/run/docker.sock";
+
+/// Engine sockets to read: Docker always, Podman when its socket is enabled.
+fn sockets() -> Vec<&'static str> {
+    let mut sockets = vec![SOCKET];
+    if crate::engines::podman_enabled() {
+        sockets.push(crate::engines::PODMAN_SOCKET);
+    }
+    sockets
+}
 
 #[derive(Deserialize, Debug)]
 pub struct Container {
@@ -79,7 +89,11 @@ impl Container {
 
 /// Send a GET and return a reader positioned at the body.
 pub fn get(path: &str) -> io::Result<BufReader<UnixStream>> {
-    let mut stream = UnixStream::connect(SOCKET)?;
+    get_from(SOCKET, path)
+}
+
+pub fn get_from(socket: &str, path: &str) -> io::Result<BufReader<UnixStream>> {
+    let mut stream = UnixStream::connect(socket)?;
     write!(stream, "GET {path} HTTP/1.0\r\nHost: docker\r\n\r\n")?;
     let mut reader = BufReader::new(stream);
     let mut status = String::new();
@@ -96,21 +110,43 @@ pub fn get(path: &str) -> io::Result<BufReader<UnixStream>> {
     }
 }
 
+fn list<T: serde::de::DeserializeOwned>(path: &str) -> io::Result<Vec<T>> {
+    let mut all = Vec::new();
+    for (i, socket) in sockets().into_iter().enumerate() {
+        let read = || -> io::Result<Vec<T>> {
+            let mut body = String::new();
+            get_from(socket, path)?.read_to_string(&mut body)?;
+            serde_json::from_str(&body).map_err(io::Error::other)
+        };
+        match read() {
+            Ok(items) => all.extend(items),
+            // Docker is required; a Podman socket that's still starting isn't.
+            Err(err) if i == 0 => return Err(err),
+            Err(_) => {}
+        }
+    }
+    Ok(all)
+}
+
 pub fn containers() -> io::Result<Vec<Container>> {
-    let mut body = String::new();
-    get("/containers/json")?.read_to_string(&mut body)?;
-    serde_json::from_str(&body).map_err(io::Error::other)
+    let mut all: Vec<Container> = list("/containers/json")?;
+    all.extend(crate::engines::nerdctl_containers().into_iter().filter_map(|c| serde_json::from_value(c).ok()));
+    Ok(all)
 }
 
 pub fn networks() -> io::Result<Vec<Network>> {
-    let mut body = String::new();
-    get("/networks")?.read_to_string(&mut body)?;
-    serde_json::from_str(&body).map_err(io::Error::other)
+    list("/networks")
 }
 
-/// `GET /containers/{id}/json`, untyped.
+/// `GET /containers/{id}/json`, untyped, from whichever engine has it.
 pub fn inspect(id: &str) -> io::Result<serde_json::Value> {
-    let mut body = String::new();
-    get(&format!("/containers/{id}/json"))?.read_to_string(&mut body)?;
-    serde_json::from_str(&body).map_err(io::Error::other)
+    let mut last = io::Error::other("no engine");
+    for socket in sockets() {
+        let mut body = String::new();
+        match get_from(socket, &format!("/containers/{id}/json")).and_then(|mut r| r.read_to_string(&mut body)) {
+            Ok(_) => return serde_json::from_str(&body).map_err(io::Error::other),
+            Err(err) => last = err,
+        }
+    }
+    crate::engines::nerdctl_inspect(id).ok_or(last)
 }
