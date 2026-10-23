@@ -110,8 +110,11 @@ final class ExecSession: NSObject, TerminalViewDelegate, @unchecked Sendable {
     func rangeChanged(source: TerminalView, startY: Int, endY: Int) {}
 }
 
-/// A shell in the berth VM itself (`berth shell`).
+/// A shell via the berth CLI: the VM (`berth shell`) or a machine
+/// (`berth machine shell <name>`).
 struct MachineTerminal: NSViewRepresentable {
+    var args: [String] = ["shell"]
+
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> LocalProcessTerminalView {
@@ -120,10 +123,7 @@ struct MachineTerminal: NSViewRepresentable {
         configure(view)
         var env = ProcessInfo.processInfo.environment
         env["TERM"] = "xterm-256color"
-        view.startProcess(
-            executable: BerthPaths.cli, args: ["shell"],
-            environment: env.map { "\($0.key)=\($0.value)" }
-        )
+        view.startProcess(executable: BerthPaths.cli, args: args, environment: env.map { "\($0.key)=\($0.value)" })
         return view
     }
 
@@ -138,35 +138,5 @@ struct MachineTerminal: NSViewRepresentable {
         func processTerminated(source: TerminalView, exitCode: Int32?) {
             source.feed(text: "\r\n\u{1b}[2m[shell exited]\u{1b}[0m\r\n")
         }
-    }
-}
-
-struct MachineView: View {
-    @EnvironmentObject var engine: Engine
-    @State private var session = UUID()
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Image(systemName: "server.rack")
-                VStack(alignment: .leading) {
-                    Text("berth").font(.headline)
-                    Text("Debian 13 · \(engine.status.map { "\($0.cpus) CPUs, \($0.memory >> 30) GiB" } ?? engine.state.label)")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
-                if engine.isRunning {
-                    Button("New Shell") { session = UUID() }
-                }
-            }
-            .padding(12)
-            Divider()
-            if engine.isRunning {
-                MachineTerminal().id(session)
-            } else {
-                NotRunningView()
-            }
-        }
-        .navigationTitle("Machine")
     }
 }

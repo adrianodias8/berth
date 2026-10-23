@@ -5,7 +5,8 @@ enum Section: String, CaseIterable, Identifiable {
     case images = "Images"
     case volumes = "Volumes"
     case networks = "Networks"
-    case machine = "Machine"
+    case kubernetes = "Kubernetes"
+    case machine = "Machines"
     var id: String { rawValue }
 
     var icon: String {
@@ -14,6 +15,7 @@ enum Section: String, CaseIterable, Identifiable {
         case .images: "square.stack.3d.up"
         case .volumes: "externaldrive"
         case .networks: "network"
+        case .kubernetes: "helm"
         case .machine: "terminal"
         }
     }
@@ -35,6 +37,9 @@ struct MainWindow: View {
                         Label(s.rawValue, systemImage: s.icon).tag(s)
                     }
                 }
+                SwiftUI.Section("Kubernetes") {
+                    Label(Section.kubernetes.rawValue, systemImage: Section.kubernetes.icon).tag(Section.kubernetes)
+                }
                 SwiftUI.Section("Linux") {
                     Label(Section.machine.rawValue, systemImage: Section.machine.icon).tag(Section.machine)
                 }
@@ -49,7 +54,8 @@ struct MainWindow: View {
                     case .images: ImagesView()
                     case .volumes: VolumesView()
                     case .networks: NetworksView()
-                    case .machine: MachineView()
+                    case .kubernetes: KubernetesView()
+                    case .machine: MachinesView()
                     }
                 } else {
                     NotRunningView()
