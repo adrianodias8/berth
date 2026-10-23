@@ -19,6 +19,9 @@ struct NetworkInfo {
 /// forwarding dials it directly: virtio-net is several times faster than vsock.
 pub static GUEST_IP: Mutex<Option<std::net::Ipv4Addr>> = Mutex::new(None);
 
+/// Whether the guest reports Kubernetes' subnets, i.e. k3s is running.
+pub static K8S_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Last outcome, for `berth status`.
 static STATE: Mutex<Option<String>> = Mutex::new(None);
 static LAST: Mutex<Vec<Route>> = Mutex::new(Vec::new());
@@ -50,6 +53,7 @@ async fn sync_with(force: bool) {
     let wanted = match network_info().await {
         Ok(NetworkInfo { gateway: Some(gw), subnets }) => {
             *GUEST_IP.lock().unwrap() = gw.parse().ok();
+            K8S_ACTIVE.store(subnets.iter().any(|s| s == "10.43.0.0/16"), std::sync::atomic::Ordering::Relaxed);
             subnets.into_iter().map(|subnet| Route { subnet, gateway: gw.clone() }).collect::<Vec<_>>()
         }
         Ok(_) => return,

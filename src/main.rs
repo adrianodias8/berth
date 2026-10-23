@@ -2,6 +2,7 @@ mod cli_tools;
 mod context;
 mod daemon;
 mod helper;
+mod k8s;
 mod memory;
 mod paths;
 mod ports;
@@ -43,6 +44,11 @@ enum Cmd {
     Status,
     /// List container domain names and their addresses
     Domains,
+    /// Kubernetes (k3s, using berth's Docker): enable, disable or show status
+    K8s {
+        #[command(subcommand)]
+        action: K8sCmd,
+    },
     /// Open a shell in the VM, or run a command there
     Shell {
         #[arg(trailing_var_arg = true)]
@@ -66,6 +72,16 @@ enum Cmd {
     /// Run the VM in the foreground (used internally by `start`)
     #[command(hide = true)]
     Daemon,
+}
+
+#[derive(Subcommand)]
+enum K8sCmd {
+    /// Install and start a single-node cluster; adds the `berth` kubectl context
+    Enable,
+    /// Stop the cluster and remove its pods
+    Disable,
+    /// Show whether Kubernetes is running
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -111,6 +127,19 @@ fn main() -> Result<()> {
         Cmd::Stop => stop(&paths),
         Cmd::Status => status(&paths),
         Cmd::Domains => domains(&paths),
+        Cmd::K8s { action } => {
+            if current_status(&paths).is_none() {
+                bail!("berth is not running");
+            }
+            match action {
+                K8sCmd::Enable => k8s::enable(&paths),
+                K8sCmd::Disable => k8s::disable(&paths),
+                K8sCmd::Status => {
+                    println!("Kubernetes: {}", k8s::status(&paths)?);
+                    Ok(())
+                }
+            }
+        }
         Cmd::Shell { command } => shell(&paths, &command),
         Cmd::Delete { yes } => delete(&paths, yes),
         Cmd::Tls { action: TlsCmd::Trust } => tls::trust(&paths),
@@ -125,8 +154,12 @@ fn main() -> Result<()> {
 }
 
 fn request<T: serde::de::DeserializeOwned>(paths: &Paths, req: &Request) -> Result<T> {
+    request_with_timeout(paths, req, Duration::from_secs(10))
+}
+
+pub fn request_with_timeout<T: serde::de::DeserializeOwned>(paths: &Paths, req: &Request, timeout: Duration) -> Result<T> {
     let mut stream = UnixStream::connect(paths.control_socket())?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(timeout))?;
     writeln!(stream, "{}", serde_json::to_string(req)?)?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;

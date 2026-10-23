@@ -17,9 +17,11 @@ use crate::paths::Paths;
 const DOCKER: &str = "29.9.2";
 const COMPOSE: &str = "v5.6.1";
 const BUILDX: &str = "v0.38.1";
+/// Matches the k3s version in agent/src/k8s.rs.
+const KUBECTL: &str = "v1.37.1";
 
 /// Names linked into /usr/local/bin by the helper (see helper.rs).
-pub const SYSTEM_LINKS: [&str; 2] = ["docker", "docker-compose"];
+pub const SYSTEM_LINKS: [&str; 3] = ["docker", "docker-compose", "kubectl"];
 
 pub fn bin_dir(paths: &Paths) -> PathBuf {
     paths.root.join("bin")
@@ -30,9 +32,9 @@ pub fn ensure(paths: &Paths) -> Result<()> {
     let bin = bin_dir(paths);
     fs::create_dir_all(&bin)?;
     let stamp = bin.join(".versions");
-    let want = format!("{DOCKER} {COMPOSE} {BUILDX}\n");
+    let want = format!("{DOCKER} {COMPOSE} {BUILDX} {KUBECTL}\n");
     if fs::read_to_string(&stamp).ok().as_deref() != Some(want.as_str()) {
-        eprintln!("Downloading Docker CLI {DOCKER}, Compose {COMPOSE} and Buildx {BUILDX}...");
+        eprintln!("Downloading Docker CLI {DOCKER}, Compose {COMPOSE}, Buildx {BUILDX} and kubectl {KUBECTL}...");
         fetch_docker(&bin)?;
         fetch_verified(
             &bin.join("docker-compose"),
@@ -47,6 +49,8 @@ pub fn ensure(paths: &Paths) -> Result<()> {
             &format!("https://github.com/docker/buildx/releases/download/{BUILDX}/{asset}"),
             Checksum::GitHubAsset { repo: "docker/buildx", tag: BUILDX, name: asset.clone() },
         )?;
+        let kubectl = format!("https://dl.k8s.io/release/{KUBECTL}/bin/darwin/arm64/kubectl");
+        fetch_verified(&bin.join("kubectl"), &kubectl, Checksum::Sha256File(format!("{kubectl}.sha256")))?;
         fs::write(&stamp, want)?;
     }
     link_plugins(paths, &bin)

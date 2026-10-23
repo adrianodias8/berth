@@ -30,6 +30,12 @@ pub enum Request {
     Status,
     Stop,
     Domains,
+    K8s { action: String },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct K8sReply {
+    pub output: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -159,6 +165,12 @@ async fn handle_control(stream: UnixStream, cpus: usize, memory: u64) -> Result<
                 memory_used: crate::memory::GUEST_USED.load(std::sync::atomic::Ordering::Relaxed),
                 memory_allowed: crate::memory::TARGET.load(std::sync::atomic::Ordering::Relaxed),
             })?
+        }
+        Request::K8s { action } => {
+            let mut guest = guest_stream(&format!("k8s {action}")).await?;
+            let mut output = String::new();
+            guest.read_to_string(&mut output).await?;
+            serde_json::to_string(&K8sReply { output })?
         }
         Request::Domains => {
             let mut guest = guest_stream("info domains").await?;

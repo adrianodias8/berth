@@ -126,6 +126,10 @@ async fn sync() -> Result<()> {
             Some((bind, p.public?, proto))
         })
         .collect();
+    // The Kubernetes API, for the `berth` kubectl context.
+    if crate::routes::K8S_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        wanted.push(("127.0.0.1", crate::k8s::API_PORT, Proto::Tcp));
+    }
     wanted.sort();
     wanted.dedup();
 

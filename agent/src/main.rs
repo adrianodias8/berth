@@ -6,6 +6,7 @@
 //!   info domains\n          (replies with the domain table as JSON)
 //!   info network\n          (replies with the guest address and Docker subnets)
 //!   info memory\n           (replies with MemTotal/MemAvailable/PSI, see memory.rs)
+//!   k8s <action>\n          enable|disable|status|kubeconfig (k8s.rs)
 //!   touch\n                 followed by newline-separated paths until EOF: raise
 //!                           inotify events for files changed on the Mac
 //!
@@ -20,6 +21,7 @@ mod docker;
 mod domains;
 mod engine;
 mod hostnet;
+mod k8s;
 mod mdns;
 mod memory;
 mod web;
@@ -89,6 +91,7 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
             splice(host, guest)
         }
         Some(("unix", path)) => splice(host, UnixStream::connect(path)?),
+        Some(("k8s", action)) => k8s::handle(action, host),
         Some(("info", "memory")) => {
             serde_json::to_writer(&mut host, &memory::read()?).map_err(io::Error::other)?;
             Ok(())

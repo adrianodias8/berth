@@ -213,6 +213,9 @@ fn sync(table: &Shared) -> io::Result<()> {
     let containers = docker::containers()?;
     let mut subnets: Vec<String> =
         docker::networks()?.iter().flat_map(|n| n.ipv4_subnets().map(str::to_string)).collect();
+    if crate::k8s::active() {
+        subnets.extend(crate::k8s::SUBNETS.iter().map(|s| s.to_string()));
+    }
     subnets.sort();
     subnets.dedup();
 
