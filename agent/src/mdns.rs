@@ -178,7 +178,7 @@ impl Query {
 }
 
 /// Read a possibly compressed name; returns it and the offset after it.
-fn read_name(msg: &[u8], mut pos: usize) -> Option<(String, usize)> {
+pub(crate) fn read_name(msg: &[u8], mut pos: usize) -> Option<(String, usize)> {
     let mut labels = Vec::new();
     let mut end = None;
     for _ in 0..128 {

@@ -7,10 +7,13 @@
 //!   info network\n          (replies with the guest address and Docker subnets)
 //!
 //! A failed connect just closes the stream. The agent also runs the container
-//! domain controller (domains.rs) and its mDNS responder (mdns.rs).
+//! domain controller (domains.rs), its mDNS responder (mdns.rs), DNS for
+//! containers (dns.rs) and host.docker.internal forwarding (hostnet.rs).
 
+mod dns;
 mod docker;
 mod domains;
+mod hostnet;
 mod mdns;
 
 use std::io::{self, Read, Write};
@@ -28,9 +31,12 @@ static TABLE: OnceLock<domains::Shared> = OnceLock::new();
 
 fn main() {
     let table = TABLE.get_or_init(|| Arc::new(Default::default()));
-    let (t1, t2) = (table.clone(), table.clone());
+    hostnet::setup();
+    let (t1, t2, t3) = (table.clone(), table.clone(), table.clone());
     thread::spawn(move || domains::run(t1));
     thread::spawn(move || mdns::run(t2));
+    thread::spawn(move || dns::run(t3));
+    thread::spawn(hostnet::run);
 
     let listener = match vsock_listen(PORT) {
         Ok(fd) => fd,
@@ -98,7 +104,7 @@ fn read_header(stream: &mut UnixStream) -> io::Result<String> {
     Err(io::Error::new(io::ErrorKind::InvalidData, "header too long"))
 }
 
-trait Duplex: Read + Write + Send + 'static {
+pub(crate) trait Duplex: Read + Write + Send + 'static {
     fn try_clone_box(&self) -> io::Result<Box<dyn Duplex>>;
     fn shutdown_write(&self);
 }
@@ -122,7 +128,7 @@ impl Duplex for TcpStream {
 }
 
 /// Copy both directions until each side is done, propagating half-closes.
-fn splice(a: impl Duplex, b: impl Duplex) -> io::Result<()> {
+pub(crate) fn splice(a: impl Duplex, b: impl Duplex) -> io::Result<()> {
     let (mut a_read, mut b_write) = (a.try_clone_box()?, b.try_clone_box()?);
     let upstream = thread::spawn(move || {
         let _ = io::copy(&mut a_read, &mut b_write);

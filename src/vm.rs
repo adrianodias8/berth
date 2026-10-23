@@ -3,14 +3,15 @@
 
 use std::fs;
 use std::os::fd::{FromRawFd, OwnedFd};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
-use objc2::AllocAnyThread;
-use objc2_foundation::{NSArray, NSData, NSError, NSFileHandle, NSString, NSURL};
+use objc2::runtime::{Bool, ProtocolObject};
+use objc2::{AllocAnyThread, define_class, msg_send};
+use objc2_foundation::{NSArray, NSData, NSError, NSFileHandle, NSObject, NSObjectProtocol, NSString, NSURL};
 use objc2_virtualization::*;
 use tokio::sync::oneshot;
 
@@ -18,6 +19,68 @@ use crate::paths::Paths;
 
 /// Guest vsock port of berth-agent (agent/src/main.rs).
 pub const AGENT_VSOCK_PORT: u32 = 2400;
+/// Host vsock port the agent connects to for guest-to-Mac traffic
+/// (host.docker.internal); see daemon.rs.
+pub const HOST_VSOCK_PORT: u32 = 2401;
+
+/// Connections the guest opens to `HOST_VSOCK_PORT`, delivered to the daemon.
+pub static INCOMING: OnceLock<tokio::sync::mpsc::UnboundedSender<OwnedFd>> = OnceLock::new();
+
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements and this type has no Drop.
+    #[unsafe(super(NSObject))]
+    #[name = "BerthVsockListenerDelegate"]
+    struct ListenerDelegate;
+
+    unsafe impl NSObjectProtocol for ListenerDelegate {}
+
+    unsafe impl VZVirtioSocketListenerDelegate for ListenerDelegate {
+        #[unsafe(method(listener:shouldAcceptNewConnection:fromSocketDevice:))]
+        fn should_accept(
+            &self,
+            _listener: &VZVirtioSocketListener,
+            connection: &VZVirtioSocketConnection,
+            _device: &VZVirtioSocketDevice,
+        ) -> Bool {
+            // Dup as in connect_vsock: our copy outlives the connection object.
+            let fd = unsafe { libc::dup(connection.fileDescriptor()) };
+            if fd < 0 {
+                return Bool::NO;
+            }
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            Bool::new(INCOMING.get().is_some_and(|tx| tx.send(fd).is_ok()))
+        }
+    }
+);
+
+impl ListenerDelegate {
+    fn new() -> Retained<Self> {
+        let this = Self::alloc().set_ivars(());
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// Listener and its delegate; the listener only holds the delegate weakly.
+struct MainQueueListener(#[allow(dead_code)] Retained<VZVirtioSocketListener>, #[allow(dead_code)] Retained<ListenerDelegate>);
+unsafe impl Send for MainQueueListener {}
+static LISTENERS: Mutex<Vec<MainQueueListener>> = Mutex::new(Vec::new());
+
+/// Accept guest-initiated vsock connections on `port`. Main thread only.
+fn listen_vsock(vm: &VZVirtualMachine, port: u32) -> Result<()> {
+    let devices = unsafe { vm.socketDevices() };
+    let device = devices
+        .firstObject()
+        .and_then(|d| d.downcast::<VZVirtioSocketDevice>().ok())
+        .context("no vsock device")?;
+    let listener = unsafe { VZVirtioSocketListener::new() };
+    let delegate = ListenerDelegate::new();
+    unsafe {
+        listener.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+        device.setSocketListener_forPort(&listener, port);
+    }
+    LISTENERS.lock().unwrap().push(MainQueueListener(listener, delegate));
+    Ok(())
+}
 
 /// The VM, touched only from blocks on the main queue. Not a thread_local:
 /// after `dispatch_main()` the main queue is drained by a worker thread.
@@ -201,6 +264,7 @@ fn build_config(paths: &Paths, res: &Resources) -> Result<Retained<VZVirtualMach
 pub fn create_and_start(paths: &Paths, res: &Resources, on_started: impl Fn(Result<()>) + 'static) -> Result<()> {
     let config = build_config(paths, res)?;
     let vm = unsafe { VZVirtualMachine::initWithConfiguration(VZVirtualMachine::alloc(), &config) };
+    listen_vsock(&vm, HOST_VSOCK_PORT)?;
     let handler = RcBlock::new(move |err: *mut NSError| {
         on_started(match unsafe { err.as_ref() } {
             None => Ok(()),

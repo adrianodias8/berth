@@ -29,10 +29,15 @@ with published ports and container domain names on the Mac.
   `redis-cli -h cache.shop.berth.local`, `ping`).
 - Direct container IPs from the Mac (`curl 172.17.0.2`, `ping`), for every Docker
   bridge network, once the route helper is installed (below)
+- `host.docker.internal` from containers reaches the Mac, including servers bound
+  only to `localhost` (`127.0.0.1` or `::1`). Also answered: `gateway.docker.internal`,
+  `host.berth.internal`, `docker.for.mac.host.internal`, `docker.for.mac.localhost`.
+- Containers resolve `*.berth.local` names too, and use the Mac's DNS for
+  everything else, so VPN and split-DNS settings apply inside containers
 - Memory balloon, so the VM's RAM size is a ceiling, not a reservation
 
-Not yet: HTTPS and port-less HTTP for apps not on port 80, UDP published ports,
-`host.docker.internal`, Linux machines, GUI. See the roadmap below.
+Not yet: HTTPS and port-less HTTP for apps not on port 80, UDP published ports and
+UDP to `host.docker.internal`, Linux machines, GUI. See the roadmap below.
 
 ## Build
 
@@ -107,6 +112,18 @@ and DNATs it to the container with iptables. Addresses are a hash of the contain
 name, so they stay stable across restarts. When a container stops, the agent
 removes the address and sends an mDNS goodbye so the Mac drops the cached name.
 
+`host.docker.internal` runs the other way, guest to Mac:
+
+```
+container ── DNS 198.19.248.253 (agent) ── host.docker.internal = 198.19.248.254
+container ── TCP 198.19.248.254:3000 ── iptables REDIRECT ── agent ══ vsock:2401 ══ berth daemon ── 127.0.0.1:3000 (or [::1])
+```
+
+The agent sets Docker's `dns` to its own server (keeping any other `daemon.json`
+settings) and relays names it doesn't own to the guest's resolver, which forwards
+to the Mac. The daemon only ever connects to the Mac's loopback, on the port the
+container asked for.
+
 - `src/vm.rs`: VM configuration (EFI, virtio disk, NAT, virtiofs, Rosetta, vsock,
   balloon) and helpers that run calls on the main dispatch queue, where the VM lives
 - `src/daemon.rs`: background process; control socket, socket bridges, shutdown
@@ -116,6 +133,8 @@ removes the address and sends an mDNS goodbye so the Mac drops the cached name.
   refreshed into `~/.berth/guest/` on every start
   - `domains.rs`: Docker watcher, service IPs, guest addresses and NAT
   - `mdns.rs`: multicast DNS responder
+  - `dns.rs`: DNS server for containers
+  - `hostnet.rs`: `host.docker.internal` forwarding to the Mac
 - `src/provision.rs`: image download and checksum, disk clone, SSH key, cloud-init seed
 - `guest/user-data.yaml`: guest provisioning (Docker, mounts, Rosetta binfmt, agent unit)
 
@@ -125,11 +144,11 @@ Logs are in `~/.berth/log/` (`daemon.log`, `console.log`).
 
 1. ✅ VM + Docker socket
 2. ✅ Port forwarding for published ports (TCP), Rust guest agent, container
-   domain names, direct container IPs. Next: HTTPS with a local CA and port-less
-   HTTP for any port, `host.docker.internal`, UDP published ports
+   domain names, direct container IPs, `host.docker.internal`. Next: HTTPS with a
+   local CA and port-less HTTP for any port, UDP
 3. Custom kernel with direct boot for sub-second
    start; userspace networking and file sharing tuned for throughput
-4. Linux machines (`berth create ubuntu`), menu-bar app, Kubernetes
+4. Menu-bar app and management window, Linux machines (`berth create ubuntu`), Kubernetes
 
 ## Compatibility notes
 

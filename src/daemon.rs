@@ -92,6 +92,7 @@ async fn serve(paths: Paths, cpus: usize, memory: u64) -> Result<()> {
     bridge(UnixListener::bind(paths.docker_socket())?, DOCKER_TARGET, "docker");
     bridge(UnixListener::bind(paths.ssh_socket())?, SSH_TARGET, "ssh");
     tokio::spawn(ports::run());
+    tokio::spawn(serve_host_connections());
 
     let cleanup_paths = Paths::new();
     tokio::spawn(async move {
@@ -187,7 +188,51 @@ fn bridge(listener: UnixListener, target: &'static str, name: &'static str) {
     });
 }
 
-/// A peer hanging up mid-stream; routine for proxied connections.
+/// Guest-to-Mac connections (host.docker.internal). The agent sends
+/// `tcp <port>\n`; we connect to that port on the Mac's loopback, so servers
+/// bound to localhost are reachable too. Only loopback ports, nothing else.
+async fn serve_host_connections() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    if vm::INCOMING.set(tx).is_err() {
+        return;
+    }
+    while let Some(fd) = rx.recv().await {
+        tokio::spawn(async move {
+            if let Err(err) = host_connection(fd).await
+                && !is_disconnect(&err)
+            {
+                eprintln!("host connection: {err:#}");
+            }
+        });
+    }
+}
+
+async fn host_connection(fd: std::os::fd::OwnedFd) -> Result<()> {
+    let std = StdUnixStream::from(fd);
+    std.set_nonblocking(true)?;
+    let mut reader = BufReader::new(UnixStream::from_std(std)?);
+    let mut header = String::new();
+    reader.read_line(&mut header).await?;
+    let port: u16 = header
+        .trim()
+        .strip_prefix("tcp ")
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("bad header {header:?}"))?;
+    // Many dev servers bind only one of the loopback addresses.
+    let mut mac = match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+        Ok(s) => s,
+        Err(_) => tokio::net::TcpStream::connect(("::1", port)).await?,
+    };
+    mac.set_nodelay(true)?;
+    // The BufReader may hold bytes the guest sent right after the header.
+    let buffered = reader.buffer().to_vec();
+    let mut guest = reader.into_inner();
+    mac.write_all(&buffered).await?;
+    tokio::io::copy_bidirectional(&mut guest, &mut mac).await?;
+    Ok(())
+}
+
+/// A peer hanging up or refusing; routine for proxied connections.
 pub fn is_disconnect(err: &anyhow::Error) -> bool {
     use std::io::ErrorKind::*;
     err.downcast_ref::<std::io::Error>()

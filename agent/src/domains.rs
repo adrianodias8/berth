@@ -344,6 +344,7 @@ mod tests {
                 entry("foo.local", false, true, 3),
             ],
             guest_ip: Some(Ipv4Addr::new(10, 0, 0, 9)),
+            ..Default::default()
         };
         let ip = |n| t.lookup(n).map(|ip| ip.octets()[3]);
         assert_eq!(ip("web.berth.local"), Some(1));
