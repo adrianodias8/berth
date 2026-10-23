@@ -113,14 +113,36 @@ fn fetch_base_image(paths: &Paths) -> Result<std::path::PathBuf> {
     Ok(raw)
 }
 
-/// Clone the base image (APFS clonefile, so instant and space-free) and grow it.
-/// The file stays sparse; cloud-init grows the root partition on first boot.
+/// Make the VM disk from the base image. On macOS 26+ it is an ASIF image:
+/// Apple's sparse format that gives space back when the guest discards
+/// blocks, so deleting images and containers frees disk space on the Mac (a
+/// raw sparse file mostly doesn't). Elsewhere a raw copy, cloned instantly by
+/// APFS. Either way it grows to DISK_SIZE; cloud-init grows the partition.
 fn create_disk(base: &Path, disk: &Path) -> Result<()> {
-    let tmp = disk.with_extension("raw.tmp");
+    if asif_supported() {
+        let tmp = disk.with_extension("asif");
+        let _ = fs::remove_file(&tmp);
+        run(Command::new("diskutil").args(["image", "create", "from", "--format", "ASIF"]).arg(base).arg(&tmp).stdout(std::process::Stdio::null()))?;
+        run(Command::new("diskutil")
+            .args(["image", "resize", "--image-only", "--size", &format!("{}G", DISK_SIZE >> 30)])
+            .arg(&tmp)
+            .stdout(std::process::Stdio::null()))?;
+        fs::rename(&tmp, disk)?;
+        return Ok(());
+    }
+    let tmp = disk.with_extension("tmp");
     fs::copy(base, &tmp).context("copying base image")?;
     fs::OpenOptions::new().write(true).open(&tmp)?.set_len(DISK_SIZE)?;
     fs::rename(&tmp, disk)?;
     Ok(())
+}
+
+/// ASIF images (and `diskutil image`) arrived in macOS 26.
+fn asif_supported() -> bool {
+    output(Command::new("sw_vers").arg("-productVersion"))
+        .ok()
+        .and_then(|v| v.trim().split('.').next()?.parse::<u32>().ok())
+        .is_some_and(|major| major >= 26)
 }
 
 fn write_seed_iso(paths: &Paths) -> Result<()> {

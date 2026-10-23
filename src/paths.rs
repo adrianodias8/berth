@@ -41,8 +41,11 @@ impl Paths {
         self.root.join("config.json")
     }
 
+    /// The VM disk: `disk.img` (ASIF on macOS 26+, see provision.rs), or a
+    /// `disk.raw` from before that.
     pub fn disk(&self) -> PathBuf {
-        self.data().join("disk.raw")
+        let (img, raw) = (self.data().join("disk.img"), self.data().join("disk.raw"));
+        if raw.exists() && !img.exists() { raw } else { img }
     }
     pub fn seed_iso(&self) -> PathBuf {
         self.data().join("seed.iso")
