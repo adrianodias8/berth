@@ -102,6 +102,41 @@ impl Resources {
         let memory = (host_memory / 2).clamp(2 << 30, 16 << 30);
         Self { cpus, memory }
     }
+
+    /// Host defaults, overridden by `cpus` / `memory_mib` in ~/.berth/config.json
+    /// (written by the app's settings). Values are clamped to what VZ allows.
+    pub fn load(paths: &Paths) -> Self {
+        #[derive(serde::Deserialize, Default)]
+        struct Config {
+            cpus: Option<usize>,
+            memory_mib: Option<u64>,
+        }
+        let mut res = Self::default_for_host();
+        let config: Config = std::fs::read(paths.config())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let (min_cpus, max_cpus) = unsafe {
+            (
+                VZVirtualMachineConfiguration::minimumAllowedCPUCount(),
+                VZVirtualMachineConfiguration::maximumAllowedCPUCount(),
+            )
+        };
+        let (min_mem, max_mem) = unsafe {
+            (
+                VZVirtualMachineConfiguration::minimumAllowedMemorySize(),
+                VZVirtualMachineConfiguration::maximumAllowedMemorySize(),
+            )
+        };
+        if let Some(cpus) = config.cpus {
+            res.cpus = cpus.clamp(min_cpus.max(1), max_cpus);
+        }
+        if let Some(mib) = config.memory_mib {
+            // VZ requires a multiple of 1 MiB; keep it within the host too.
+            res.memory = (mib << 20).clamp(min_mem.max(1 << 30), max_mem.min(host_memory_bytes()));
+        }
+        res
+    }
 }
 
 fn host_memory_bytes() -> u64 {

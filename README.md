@@ -36,8 +36,11 @@ with published ports and container domain names on the Mac.
   everything else, so VPN and split-DNS settings apply inside containers
 - Memory balloon, so the VM's RAM size is a ceiling, not a reservation
 
+- **Berth.app**: a native SwiftUI app with a menu-bar item and a management window
+  (see below)
+
 Not yet: HTTPS and port-less HTTP for apps not on port 80, UDP published ports and
-UDP to `host.docker.internal`, Linux machines, GUI. See the roadmap below.
+UDP to `host.docker.internal`, Linux machines. See the roadmap below.
 
 ## Build
 
@@ -49,6 +52,37 @@ rustup target add aarch64-unknown-linux-musl   # for the guest agent
 
 The binary needs the `com.apple.security.virtualization` entitlement, which the
 script adds. `cargo run -- <args>` also signs before running.
+
+The app (needs Xcode):
+
+```sh
+./scripts/build-app.sh    # builds everything into target/Berth.app
+open target/Berth.app     # or copy it to /Applications
+```
+
+## The app
+
+Berth.app embeds the `berth` CLI (`Contents/Helpers/berth`) and talks to the
+daemon's control socket and Docker's API over unix sockets; it adds no services of
+its own. Closing the window keeps it in the menu bar.
+
+- **Menu bar**: status, start/stop, running containers with start/stop and open-in-browser
+- **Containers**: grouped by Compose project; start/stop/restart/delete, open in
+  browser, copy domain/IP. Per container:
+  - **Info**: image, domain, IPs, published ports, labels
+  - **Logs**: live, follow mode
+  - **Terminal**: interactive shell over Docker's exec API (bash if present, else sh)
+  - **Files**: browse, view and download files
+  - **Stats**: live CPU and memory charts
+- **Images** (with pull and progress), **Volumes**, **Networks** (subnets, container
+  counts, IP routing status)
+- **Machine**: a shell in the VM
+- **Settings**: CPUs and memory (written to `~/.berth/config.json`, applied on restart),
+  start on app launch, open at login, install the IP route helper
+
+Launch arguments pick the starting screen, e.g.
+`open target/Berth.app --args -openSection Images` or
+`--args -openContainer web -openTab Logs`.
 
 ## Use
 
@@ -137,6 +171,7 @@ container asked for.
   - `hostnet.rs`: `host.docker.internal` forwarding to the Mac
 - `src/provision.rs`: image download and checksum, disk clone, SSH key, cloud-init seed
 - `guest/user-data.yaml`: guest provisioning (Docker, mounts, Rosetta binfmt, agent unit)
+- `app/`: the SwiftUI app (SwiftTerm for terminals, Swift Charts for stats)
 
 Logs are in `~/.berth/log/` (`daemon.log`, `console.log`).
 
@@ -148,7 +183,7 @@ Logs are in `~/.berth/log/` (`daemon.log`, `console.log`).
    local CA and port-less HTTP for any port, UDP
 3. Custom kernel with direct boot for sub-second
    start; userspace networking and file sharing tuned for throughput
-4. Menu-bar app and management window, Linux machines (`berth create ubuntu`), Kubernetes
+4. ✅ Menu-bar app and management window. Next: Linux machines (`berth create ubuntu`), Kubernetes
 
 ## Compatibility notes
 

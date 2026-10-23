@@ -36,6 +36,11 @@ impl Paths {
         self.guest().join("berth-agent")
     }
 
+    /// User settings (`cpus`, `memory_mib`), read at VM start.
+    pub fn config(&self) -> PathBuf {
+        self.root.join("config.json")
+    }
+
     pub fn disk(&self) -> PathBuf {
         self.data().join("disk.raw")
     }

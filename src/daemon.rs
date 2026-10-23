@@ -63,7 +63,7 @@ pub fn run(paths: Paths) -> Result<()> {
         let _ = std::fs::remove_file(sock);
     }
 
-    let res = Resources::default_for_host();
+    let res = Resources::load(&paths);
     eprintln!("starting VM: {} CPUs, {} MiB", res.cpus, res.memory >> 20);
     let (cpus, memory) = (res.cpus, res.memory);
     vm::create_and_start(&paths, &res, |result| match result {
