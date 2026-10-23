@@ -31,6 +31,12 @@ pub enum Request {
     Stop,
     Domains,
     K8s { action: String },
+    Machine { action: String, args: Vec<String> },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MachineReply {
+    pub output: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -171,6 +177,14 @@ async fn handle_control(stream: UnixStream, cpus: usize, memory: u64) -> Result<
             let mut output = String::new();
             guest.read_to_string(&mut output).await?;
             serde_json::to_string(&K8sReply { output })?
+        }
+        Request::Machine { action, args } => {
+            let mut guest = guest_stream(&format!("machine {action}")).await?;
+            guest.write_all(serde_json::to_string(&args)?.as_bytes()).await?;
+            guest.shutdown().await?;
+            let mut output = String::new();
+            guest.read_to_string(&mut output).await?;
+            serde_json::to_string(&MachineReply { output })?
         }
         Request::Domains => {
             let mut guest = guest_stream("info domains").await?;

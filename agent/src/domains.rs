@@ -83,8 +83,32 @@ impl Table {
 
 pub type Shared = Arc<RwLock<Table>>;
 
+static TABLE_REF: std::sync::OnceLock<Shared> = std::sync::OnceLock::new();
+
+/// Re-sync outside the Docker event stream (machines start and stop without
+/// Docker events).
+pub fn request_sync() {
+    if let Some(table) = TABLE_REF.get() {
+        let table = table.clone();
+        thread::spawn(move || {
+            if let Err(err) = sync(&table) {
+                eprintln!("berth-agent: domains: {err}");
+            }
+        });
+    }
+}
+
 /// Keep the table and the guest's addresses/NAT in step with Docker.
 pub fn run(table: Shared) {
+    let _ = TABLE_REF.set(table.clone());
+    // Machines that autostart with the VM get their address a few seconds
+    // after boot, without any Docker event to trigger a sync.
+    thread::spawn(|| {
+        for delay in [10, 20, 30] {
+            thread::sleep(Duration::from_secs(delay));
+            request_sync();
+        }
+    });
     let mut synced = false;
     loop {
         // Failures before the first sync are just dockerd still starting.
@@ -241,6 +265,24 @@ fn sync(table: &Shared) -> io::Result<()> {
         for (domain, wildcard, subdomains_only) in names_for(c) {
             entries.push(Entry { domain, wildcard, subdomains_only, ip: svc, container: name.to_string() });
         }
+    }
+
+    // Linux machines get domains too, pointing at their veth address.
+    for (name, target) in crate::machines::running_addresses() {
+        let start = fnv(&name) as usize % pool.len().max(1);
+        let Some(svc) = (0..pool.len()).map(|i| pool[(start + i) % pool.len()]).find(|ip| !taken.contains(ip)) else {
+            continue;
+        };
+        taken.insert(svc);
+        mapping.insert(svc, target);
+        services.insert(svc, Service { id: format!("machine:{name}"), name: name.clone(), ip: target });
+        entries.push(Entry {
+            domain: format!("{name}.{SUFFIX}"),
+            wildcard: true,
+            subdomains_only: false,
+            ip: svc,
+            container: name,
+        });
     }
 
     apply(&up, &mapping)?;

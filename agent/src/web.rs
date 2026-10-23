@@ -59,6 +59,12 @@ fn handle(mut conn: TcpStream, https: bool, table: &Shared) -> std::io::Result<(
     let Some(service) = table.read().unwrap().services.get(dst.ip()).cloned() else { return Ok(()) };
     conn.set_nodelay(true)?;
 
+    // Linux machines aren't Docker containers: no detection or TLS, just the
+    // port that was asked for.
+    if service.id.starts_with("machine:") {
+        return crate::splice(conn, TcpStream::connect((service.ip, dst.port()))?);
+    }
+
     if https {
         if listening_ports(&service).contains(&443) {
             let upstream = TcpStream::connect((service.ip, 443))?;

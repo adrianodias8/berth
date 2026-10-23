@@ -3,6 +3,7 @@ mod context;
 mod daemon;
 mod helper;
 mod k8s;
+mod machines;
 mod memory;
 mod paths;
 mod ports;
@@ -44,6 +45,11 @@ enum Cmd {
     Status,
     /// List container domain names and their addresses
     Domains,
+    /// Linux machines: full distros with systemd, your user and home folder
+    Machine {
+        #[command(subcommand)]
+        action: MachineCmd,
+    },
     /// Kubernetes (k3s, using berth's Docker): enable, disable or show status
     K8s {
         #[command(subcommand)]
@@ -72,6 +78,29 @@ enum Cmd {
     /// Run the VM in the foreground (used internally by `start`)
     #[command(hide = true)]
     Daemon,
+}
+
+#[derive(Subcommand)]
+enum MachineCmd {
+    /// Create and start a machine
+    Create {
+        name: String,
+        /// distro[:release] from images.linuxcontainers.org, e.g. debian:trixie, fedora:44, alpine
+        #[arg(long, default_value = "")]
+        distro: String,
+    },
+    /// List machines
+    List,
+    /// Open a shell in a machine, or run a command there
+    Shell {
+        name: String,
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+    Start { name: String },
+    Stop { name: String },
+    /// Delete a machine and its files
+    Delete { name: String },
 }
 
 #[derive(Subcommand)]
@@ -127,6 +156,22 @@ fn main() -> Result<()> {
         Cmd::Stop => stop(&paths),
         Cmd::Status => status(&paths),
         Cmd::Domains => domains(&paths),
+        Cmd::Machine { action } => {
+            if current_status(&paths).is_none() {
+                bail!("berth is not running");
+            }
+            match action {
+                MachineCmd::Create { name, distro } => machines::create(&paths, &name, &distro),
+                MachineCmd::List => machines::list(&paths),
+                MachineCmd::Shell { name, command } => {
+                    let remote = machines::shell_command(&name, &command)?;
+                    ssh(&paths, &remote, command.is_empty())
+                }
+                MachineCmd::Start { name } => machines::simple(&paths, "start", &name),
+                MachineCmd::Stop { name } => machines::simple(&paths, "stop", &name),
+                MachineCmd::Delete { name } => machines::simple(&paths, "delete", &name),
+            }
+        }
         Cmd::K8s { action } => {
             if current_status(&paths).is_none() {
                 bail!("berth is not running");
@@ -324,6 +369,11 @@ fn shell(paths: &Paths, command: &[String]) -> Result<()> {
     if current_status(paths).is_none() {
         bail!("berth is not running");
     }
+    ssh(paths, command, command.is_empty())
+}
+
+/// SSH into the VM, optionally running `command`; `tty` for interactive use.
+fn ssh(paths: &Paths, command: &[String], tty: bool) -> Result<()> {
     // SSH rides the daemon's vsock bridge, so it needs no guest IP address.
     let user = std::env::var("USER")?;
     let proxy = format!("ProxyCommand=nc -U {}", paths.ssh_socket().display());
@@ -333,11 +383,10 @@ fn shell(paths: &Paths, command: &[String]) -> Result<()> {
         .args(["-o", &proxy, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"])
         .args(["-o", "LogLevel=ERROR"])
         .arg(format!("{user}@berth"));
-    if command.is_empty() {
+    if tty {
         ssh.arg("-t");
-    } else {
-        ssh.args(command);
     }
+    ssh.args(command);
     Err(ssh.exec().into())
 }
 
