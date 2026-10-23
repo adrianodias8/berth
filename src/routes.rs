@@ -29,7 +29,20 @@ pub fn state() -> String {
     })
 }
 
+/// Re-assert routes every so often even without Docker events: the helper may
+/// have been installed or restarted (dropping its routes) since the last sync.
+pub async fn run_periodic() {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        sync_with(true).await;
+    }
+}
+
 pub async fn sync() {
+    sync_with(false).await;
+}
+
+async fn sync_with(force: bool) {
     let wanted = match network_info().await {
         Ok(NetworkInfo { gateway: Some(gw), subnets }) => {
             subnets.into_iter().map(|subnet| Route { subnet, gateway: gw.clone() }).collect::<Vec<_>>()
@@ -40,7 +53,7 @@ pub async fn sync() {
             return;
         }
     };
-    if *LAST.lock().unwrap() == wanted && STATE.lock().unwrap().is_some() {
+    if !force && *LAST.lock().unwrap() == wanted && STATE.lock().unwrap().is_some() {
         return;
     }
     let result = tokio::task::spawn_blocking({
@@ -54,13 +67,7 @@ pub async fn sync() {
     let state = match result {
         Ok(None) => return,
         Ok(Some(Ok(reply))) => {
-            for err in &reply.errors {
-                eprintln!("routes: {err}");
-            }
             let active: Vec<&str> = reply.active.iter().map(|r| r.subnet.as_str()).collect();
-            if !reply.active.is_empty() {
-                eprintln!("routes: active {}", active.join(", "));
-            }
             match (active.is_empty(), reply.errors.is_empty()) {
                 (_, true) => format!("on ({})", active.join(", ")),
                 (true, false) => format!("blocked: {}", reply.errors.join("; ")),
@@ -70,6 +77,10 @@ pub async fn sync() {
         Ok(Some(Err(err))) => format!("helper error: {err:#}"),
         Err(err) => format!("helper error: {err}"),
     };
+    // Periodic re-syncs repeat themselves; only log changes.
+    if STATE.lock().unwrap().as_deref() != Some(state.as_str()) {
+        eprintln!("routes: {state}");
+    }
     *LAST.lock().unwrap() = wanted;
     *STATE.lock().unwrap() = Some(state);
 }

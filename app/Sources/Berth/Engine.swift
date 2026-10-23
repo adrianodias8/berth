@@ -29,10 +29,22 @@ struct BerthStatus: Decodable, Equatable {
     let memory: UInt64
     let ports: [String]?
     let containerIps: String?
+    /// Guest memory in use and what the VM currently holds; the rest of
+    /// `memory` has been returned to macOS.
+    let memoryUsed: UInt64?
+    let memoryAllowed: UInt64?
 
     enum CodingKeys: String, CodingKey {
         case pid, vm, docker, cpus, memory, ports
         case containerIps = "container_ips"
+        case memoryUsed = "memory_used"
+        case memoryAllowed = "memory_allowed"
+    }
+
+    /// e.g. "1.2 GiB used" for compact displays.
+    var memorySummary: String? {
+        guard let used = memoryUsed, used > 0 else { return nil }
+        return String(format: "%.1f GiB used", Double(used) / 1_073_741_824)
     }
 }
 

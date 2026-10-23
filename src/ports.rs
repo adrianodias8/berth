@@ -145,7 +145,7 @@ async fn forward(listener: TcpListener, port: u16) {
             let _ = client.set_nodelay(true);
             let result = async {
                 let mut guest = guest_stream(&target).await?;
-                tokio::io::copy_bidirectional(&mut client, &mut guest).await?;
+                tokio::io::copy_bidirectional_with_sizes(&mut client, &mut guest, crate::BUF, crate::BUF).await?;
                 anyhow::Ok(())
             };
             if let Err(err) = result.await

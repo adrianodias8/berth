@@ -1,6 +1,7 @@
 mod context;
 mod daemon;
 mod helper;
+mod memory;
 mod paths;
 mod ports;
 mod provision;
@@ -18,6 +19,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use daemon::{Domain, Request, Status};
+
+/// Copy buffer for proxied connections; tokio's 8 KiB default caps throughput.
+pub const BUF: usize = 256 * 1024;
 use paths::Paths;
 
 #[derive(Parser)]
@@ -87,6 +91,8 @@ enum HelperCmd {
 }
 
 fn main() -> Result<()> {
+    // Die quietly on a closed pipe (`berth status | head`) instead of panicking.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let command = Cli::parse().command;
     // The route helper runs under launchd as root with no HOME and needs no
     // berth paths, so handle it before touching them.
@@ -234,6 +240,13 @@ fn status(paths: &Paths) -> Result<()> {
         Some(s) => {
             println!("VM:      {} (pid {}, {} CPUs, {} GiB max)", s.vm, s.pid, s.cpus, s.memory >> 30);
             println!("Docker:  {}", ready(s.docker));
+            if s.memory_allowed > 0 {
+                println!(
+                    "Memory:  {:.1} GiB in use, VM holding up to {:.1} GiB (rest returned to macOS)",
+                    s.memory_used as f64 / (1u64 << 30) as f64,
+                    s.memory_allowed as f64 / (1u64 << 30) as f64
+                );
+            }
             println!("Socket:  {}", paths.docker_socket().display());
             if !s.ports.is_empty() {
                 println!("Ports:   {}", s.ports.join(", "));

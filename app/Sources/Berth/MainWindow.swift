@@ -21,6 +21,8 @@ enum Section: String, CaseIterable, Identifiable {
 
 struct MainWindow: View {
     @EnvironmentObject var engine: Engine
+    @AppStorage("onboarded") private var onboarded = false
+    @State private var showOnboarding = false
     // `-openSection Images` etc. on the command line (NSArgumentDomain) picks
     // the starting screen; handy for scripted screenshots.
     @State private var section = Section(rawValue: UserDefaults.standard.string(forKey: "openSection") ?? "") ?? .containers
@@ -55,6 +57,9 @@ struct MainWindow: View {
             }
             .overlay(alignment: .bottom) { ErrorBanner() }
         }
+        .sheet(isPresented: $showOnboarding) { OnboardingView() }
+        .onAppear { if !onboarded { showOnboarding = true } }
+        .onChange(of: onboarded) { if !onboarded { showOnboarding = true } }
     }
 }
 
@@ -67,7 +72,7 @@ struct EngineBadge: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(engine.state.label).font(.callout)
                 if let s = engine.status {
-                    Text("\(s.cpus) CPUs · \(s.memory >> 30) GiB").font(.caption2).foregroundStyle(.secondary)
+                    Text(s.memorySummary ?? "\(s.cpus) CPUs · \(s.memory >> 30) GiB").font(.caption2).foregroundStyle(.secondary)
                 }
             }
             Spacer()

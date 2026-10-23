@@ -361,6 +361,19 @@ pub async fn force_stop() -> Result<()> {
     rx.await?.map_err(|e| anyhow!(e))
 }
 
+fn balloon(vm: &VZVirtualMachine) -> Option<Retained<VZVirtioTraditionalMemoryBalloonDevice>> {
+    unsafe { vm.memoryBalloonDevices() }
+        .firstObject()
+        .and_then(|d| d.downcast::<VZVirtioTraditionalMemoryBalloonDevice>().ok())
+}
+
+/// Let the guest hold `bytes` of memory; the rest goes back to macOS.
+pub async fn set_balloon_target(bytes: u64) -> Result<()> {
+    on_main(move |vm| balloon(vm).map(|b| unsafe { b.setTargetVirtualMachineMemorySize(bytes) }))
+        .await?
+        .context("no balloon device")
+}
+
 /// Open a vsock connection to `port` in the guest. The returned fd is a
 /// duplicate owned by the caller; the VZ connection object is released.
 pub async fn connect_vsock(port: u32) -> Result<OwnedFd> {

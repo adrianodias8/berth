@@ -52,6 +52,9 @@ struct MenuBarContent: View {
                 Circle().fill(engine.state.color).frame(width: 8, height: 8)
                 Text("Berth").font(.headline)
                 Text(engine.state.label).foregroundStyle(.secondary)
+                if let memory = engine.status?.memorySummary {
+                    Text("· \(memory)").foregroundStyle(.secondary)
+                }
                 Spacer()
                 if engine.isRunning {
                     Button("Stop") { engine.stop() }

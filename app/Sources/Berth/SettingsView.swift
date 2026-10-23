@@ -3,6 +3,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject var engine: Engine
+    @Environment(\.openWindow) private var openWindow
     @State private var config = BerthConfig.load()
     @State private var saved = BerthConfig.load()
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
@@ -77,6 +78,19 @@ struct SettingsView: View {
                 if let httpsMessage { Text(httpsMessage).font(.caption).foregroundStyle(.secondary) }
             }
 
+            SwiftUI.Section("Setup") {
+                HStack {
+                    Text("Run the first-run setup again (engine, networking, HTTPS).")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Run Setup…") {
+                        UserDefaults.standard.set(false, forKey: "onboarded")
+                        openWindow(id: "main")
+                        NSApp.activate(ignoringOtherApps: true)
+                    }
+                }
+            }
+
             SwiftUI.Section("Docker") {
                 LabeledContent("Socket") { Text(BerthPaths.dockerSocket).textSelection(.enabled).font(.caption.monospaced()) }
                 LabeledContent("CLI") { Text("docker context use berth").textSelection(.enabled).font(.caption.monospaced()) }
@@ -103,7 +117,7 @@ struct SettingsView: View {
         }
     }
 
-    private var helperInstalled: Bool { FileManager.default.fileExists(atPath: "/Library/LaunchDaemons/dev.berth.helper.plist") }
+    private var helperInstalled: Bool { Setup.helperInstalled }
 
     private var cpusBinding: Binding<Int> {
         Binding(get: { config.cpus ?? engine.status?.cpus ?? hostCPUs }, set: { config.cpus = $0 })
@@ -127,18 +141,13 @@ struct SettingsView: View {
         }
     }
 
-    /// The helper must be installed as root; macOS shows its admin prompt.
     private func installHelper() {
-        let cli = BerthPaths.cli.replacingOccurrences(of: "'", with: "'\\''")
-        let script = "do shell script \"SUDO_UID=\(getuid()) '\(cli)' helper install\" with administrator privileges "
-            + "with prompt \"Berth needs to install a helper so container IPs are reachable from your Mac.\""
-        // NSAppleScript belongs on the main thread; the admin prompt is modal anyway.
-        var error: NSDictionary?
-        let output = NSAppleScript(source: script)?.executeAndReturnError(&error).stringValue
-        if let error {
-            helperMessage = (error[NSAppleScript.errorMessage] as? String) ?? "Install failed"
-        } else {
-            helperMessage = output ?? "Installed."
+        helperMessage = "Waiting for authorization…"
+        switch Setup.installPrivileged() {
+        case .done: helperMessage = "Installed."
+        case .skipped: helperMessage = nil
+        case let .failed(message): helperMessage = message
+        default: break
         }
     }
 }

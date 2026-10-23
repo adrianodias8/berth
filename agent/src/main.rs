@@ -5,6 +5,7 @@
 //!   unix /run/docker.sock\n
 //!   info domains\n          (replies with the domain table as JSON)
 //!   info network\n          (replies with the guest address and Docker subnets)
+//!   info memory\n           (replies with MemTotal/MemAvailable/PSI, see memory.rs)
 //!
 //! A failed connect just closes the stream. The agent also runs the container
 //! domain controller (domains.rs), its mDNS responder (mdns.rs), DNS for
@@ -16,11 +17,12 @@ mod docker;
 mod domains;
 mod hostnet;
 mod mdns;
+mod memory;
 mod web;
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -36,6 +38,8 @@ fn main() {
     hostnet::setup();
     let (t1, t2, t3) = (table.clone(), table.clone(), table.clone());
     web::run(table.clone());
+    thread::spawn(memory::watch_pressure);
+    thread::spawn(memory::ensure_kernel_args);
     thread::spawn(move || domains::run(t1));
     thread::spawn(move || mdns::run(t2));
     thread::spawn(move || dns::run(t3));
@@ -74,6 +78,10 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
             splice(host, guest)
         }
         Some(("unix", path)) => splice(host, UnixStream::connect(path)?),
+        Some(("info", "memory")) => {
+            serde_json::to_writer(&mut host, &memory::read()?).map_err(io::Error::other)?;
+            Ok(())
+        }
         Some(("info", "network")) => {
             let table = TABLE.get().unwrap().read().unwrap();
             let info = domains::NetworkInfo { gateway: table.guest_ip, subnets: table.subnets.clone() };
@@ -107,7 +115,7 @@ fn read_header(stream: &mut UnixStream) -> io::Result<String> {
     Err(io::Error::new(io::ErrorKind::InvalidData, "header too long"))
 }
 
-pub(crate) trait Duplex: Read + Write + Send + 'static {
+pub(crate) trait Duplex: Read + Write + AsRawFd + Send + 'static {
     fn try_clone_box(&self) -> io::Result<Box<dyn Duplex>>;
     fn shutdown_write(&self);
 }
@@ -134,14 +142,93 @@ impl Duplex for TcpStream {
 pub(crate) fn splice(a: impl Duplex, b: impl Duplex) -> io::Result<()> {
     let (mut a_read, mut b_write) = (a.try_clone_box()?, b.try_clone_box()?);
     let upstream = thread::spawn(move || {
-        let _ = io::copy(&mut a_read, &mut b_write);
+        let _ = pump(&mut *a_read, &mut *b_write);
         b_write.shutdown_write();
     });
     let (mut b_read, mut a_write) = (b, a);
-    let _ = io::copy(&mut b_read, &mut a_write);
+    let _ = pump(&mut b_read, &mut a_write);
     a_write.shutdown_write();
     let _ = upstream.join();
     Ok(())
+}
+
+const PIPE_SIZE: usize = 1 << 20;
+
+/// Move bytes from `from` to `to` until EOF. Uses splice(2) through a pipe so
+/// the data never enters userspace; sockets that can't splice (vsock) fall
+/// back to a large-buffer copy.
+fn pump(from: &mut dyn Duplex, to: &mut dyn Duplex) -> io::Result<u64> {
+    // vsock has no splice support; checking first matters for the write side,
+    // where a failure would strand data already moved into the pipe.
+    if is_vsock(from.as_raw_fd()) || is_vsock(to.as_raw_fd()) {
+        return copy_buffered(from, to);
+    }
+    match splice_all(from.as_raw_fd(), to.as_raw_fd()) {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => copy_buffered(from, to),
+        other => other,
+    }
+}
+
+fn is_vsock(fd: RawFd) -> bool {
+    let mut domain: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    let rc = unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_DOMAIN, (&raw mut domain).cast(), &mut len) };
+    rc == 0 && domain == libc::AF_VSOCK
+}
+
+fn splice_all(from: RawFd, to: RawFd) -> io::Result<u64> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (pr, pw) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    unsafe { libc::fcntl(pw.as_raw_fd(), libc::F_SETPIPE_SZ, PIPE_SIZE as libc::c_int) };
+    let flags = libc::SPLICE_F_MOVE;
+    let mut total = 0u64;
+    loop {
+        let n = unsafe { libc::splice(from, std::ptr::null_mut(), pw.as_raw_fd(), std::ptr::null_mut(), PIPE_SIZE, flags) };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // Nothing moved yet: let the caller fall back to copying.
+            return Err(err);
+        }
+        if n == 0 {
+            return Ok(total);
+        }
+        let mut left = n as usize;
+        while left > 0 {
+            let m = unsafe { libc::splice(pr.as_raw_fd(), std::ptr::null_mut(), to, std::ptr::null_mut(), left, flags) };
+            if m < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                // Data is stuck in the pipe; this connection is done either way.
+                // Not EINVAL-as-is, so the caller won't fall back mid-stream.
+                return Err(io::Error::other(err));
+            }
+            left -= m as usize;
+        }
+        total += n as u64;
+    }
+}
+
+fn copy_buffered(from: &mut dyn Duplex, to: &mut dyn Duplex) -> io::Result<u64> {
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => return Ok(total),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        to.write_all(&buf[..n])?;
+        total += n as u64;
+    }
 }
 
 fn vsock_listen(port: u32) -> io::Result<OwnedFd> {

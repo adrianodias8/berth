@@ -25,6 +25,11 @@ packages:
   - docker.io
 
 write_files:
+  # Don't zero pages on allocation: the memory balloon allocates the pages it
+  # takes back, and zeroing them would make macOS back them with real memory.
+  - path: /etc/default/grub.d/90-berth.cfg
+    content: |
+      GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT init_on_alloc=0"
   # Run x86-64 Linux binaries through Rosetta.
   - path: /etc/binfmt.d/rosetta.conf
     content: |
@@ -51,6 +56,7 @@ write_files:
       WantedBy=multi-user.target
 
 runcmd:
+  - [update-grub]
   - [systemctl, daemon-reload]
   - [systemctl, restart, systemd-binfmt]
   - [usermod, -aG, docker, "@USER@"]

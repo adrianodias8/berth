@@ -5,10 +5,12 @@
 #
 # Runs each engine alone (the other is stopped), with the same workloads:
 # startup, idle CPU/memory, memory returned after a workload, bind-mount file
-# I/O, and port-forward / domain throughput. Host memory is the physical
-# footprint macOS charges to the engine's VM processes (`footprint`), i.e. what
-# Activity Monitor shows; GUIs are not counted. Results go to stdout as
-# Markdown and to bench/results/<date>.md.
+# I/O, and port-forward / domain throughput. Host memory is measured
+# system-wide (anonymous + wired + compressed pages from vm_stat) relative to
+# a baseline with both engines stopped: per-process `footprint` misses guest
+# memory that a custom VM monitor (OrbStack's) keeps outside its process
+# accounting. Other apps add some noise. Results go to stdout as Markdown and
+# to bench/results/<date>.md.
 set -u
 root="$(cd "$(dirname "$0")/.." && pwd)"
 BERTH="${BERTH:-$root/target/release/berth}"
@@ -42,15 +44,23 @@ engine_pids() {
     fi | sort -u
 }
 
-footprint_mb() {
+# System-wide memory in use, MB (averaged over 3 samples).
+sys_mb() {
     local total=0
-    for pid in $(engine_pids "$1"); do
-        local mb
-        mb=$(footprint -p "$pid" 2>/dev/null | awk '/Footprint:/ {for (i=1;i<=NF;i++) if ($i=="Footprint:") {v=$(i+1); u=$(i+2); if (u=="GB") v*=1024; if (u=="KB") v/=1024; print int(v)}}' | head -1)
-        total=$((total + ${mb:-0}))
+    for _ in 1 2 3; do
+        total=$((total + $(vm_stat | awk '
+            /page size of/ { ps = $8 }
+            /Anonymous pages/ { a = $3 }
+            /Pages wired down/ { w = $4 }
+            /occupied by compressor/ { c = $5 }
+            END { gsub("\\.", "", a); gsub("\\.", "", w); gsub("\\.", "", c); printf "%d", (a + w + c) * ps / 1048576 }')))
+        sleep 1
     done
-    echo "$total"
+    echo $((total / 3))
 }
+
+# Engine memory: system-wide use above the stopped baseline.
+mem_mb() { echo $(($(sys_mb) - BASE)); }
 
 cpu_seconds() {
     local total=0
@@ -88,7 +98,9 @@ bench() {
     CTX=$(ctx_of "$e")
     : > "$out.$e"
     log "== $e"
-    for other in berth orbstack; do [ "$other" != "$e" ] && stop_engine "$other"; done
+    for other in berth orbstack; do stop_engine "$other"; done
+    sleep 10
+    BASE=$(sys_mb)
 
     # Startup, from stopped to Docker answering.
     local starts=()
@@ -110,27 +122,27 @@ bench() {
     sleep 30
     local c0 c1; c0=$(cpu_seconds "$e"); sleep 60; c1=$(cpu_seconds "$e")
     row "Idle CPU (VM processes, avg over 60 s)" "$(python3 -c "print(f'{($c1-$c0)/60*100:.2f}')") %" "" "$e"
-    row "Idle host memory (footprint)" "$(footprint_mb "$e") MB" "" "$e"
+    row "Idle host memory (system-wide, over stopped)" "+$(mem_mb) MB" "" "$e"
 
     # Anonymous memory: fill 4 GiB, exit, watch it come back.
     log "memory: 4 GiB anonymous"
     d run -d --name bench-mem alpine sh -c 'head -c 4294967296 /dev/zero | tail; sleep 5' >/dev/null
     local peak=0
     for _ in $(seq 1 40); do
-        local f; f=$(footprint_mb "$e"); [ "$f" -gt "$peak" ] && peak=$f
+        local f; f=$(mem_mb); [ "$f" -gt "$peak" ] && peak=$f
         [ "$(d inspect -f '{{.State.Running}}' bench-mem 2>/dev/null)" = true ] || break
         sleep 1
     done
     d rm -f bench-mem >/dev/null 2>&1
-    local a0; a0=$(footprint_mb "$e"); sleep 30; local a30; a30=$(footprint_mb "$e"); sleep 30
-    local a60; a60=$(footprint_mb "$e"); sleep 60; local a120; a120=$(footprint_mb "$e")
-    row "4 GiB anonymous: peak / after exit / +30 s / +60 s / +120 s" "$peak / $a0 / $a30 / $a60 / $a120 MB" "" "$e"
+    local a0; a0=$(mem_mb); sleep 30; local a30; a30=$(mem_mb); sleep 30
+    local a60; a60=$(mem_mb); sleep 60; local a120; a120=$(mem_mb)
+    row "4 GiB anonymous: peak / after exit / +30 s / +60 s / +120 s" "+$peak / +$a0 / +$a30 / +$a60 / +$a120 MB" "" "$e"
 
     # Page cache: write and read a 4 GiB file inside the container, delete it.
     log "memory: 4 GiB page cache"
     d run --rm alpine sh -c 'dd if=/dev/zero of=/tmp/f bs=1M count=4096 2>/dev/null; cat /tmp/f >/dev/null; rm /tmp/f' >/dev/null
-    local p0; p0=$(footprint_mb "$e"); sleep 60; local p60; p60=$(footprint_mb "$e"); sleep 60; local p120; p120=$(footprint_mb "$e")
-    row "4 GiB page cache: after / +60 s / +120 s" "$p0 / $p60 / $p120 MB" "" "$e"
+    local p0; p0=$(mem_mb); sleep 60; local p60; p60=$(mem_mb); sleep 60; local p120; p120=$(mem_mb)
+    row "4 GiB page cache: after / +60 s / +120 s" "+$p0 / +$p60 / +$p120 MB" "" "$e"
 
     # Bind-mount file I/O on a home directory path.
     prepare_files

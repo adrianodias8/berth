@@ -53,6 +53,13 @@ pub struct Status {
     /// Direct container IP routing, human-readable.
     #[serde(default)]
     pub container_ips: String,
+    /// Memory the guest is using (excluding reclaimable cache).
+    #[serde(default)]
+    pub memory_used: u64,
+    /// Memory the VM may currently hold (balloon target); the rest is returned
+    /// to macOS.
+    #[serde(default)]
+    pub memory_allowed: u64,
 }
 
 static STOPPING: AtomicBool = AtomicBool::new(false);
@@ -93,6 +100,8 @@ async fn serve(paths: Paths, cpus: usize, memory: u64) -> Result<()> {
     bridge(UnixListener::bind(paths.docker_socket())?, DOCKER_TARGET, "docker");
     bridge(UnixListener::bind(paths.ssh_socket())?, SSH_TARGET, "ssh");
     tokio::spawn(ports::run());
+    tokio::spawn(crate::memory::run(memory));
+    tokio::spawn(crate::routes::run_periodic());
     tokio::spawn(serve_host_connections());
 
     let cleanup_paths = Paths::new();
@@ -146,6 +155,8 @@ async fn handle_control(stream: UnixStream, cpus: usize, memory: u64) -> Result<
                 memory,
                 ports: ports::forwarded(),
                 container_ips: crate::routes::state(),
+                memory_used: crate::memory::GUEST_USED.load(std::sync::atomic::Ordering::Relaxed),
+                memory_allowed: crate::memory::TARGET.load(std::sync::atomic::Ordering::Relaxed),
             })?
         }
         Request::Domains => {
@@ -173,7 +184,7 @@ fn bridge(listener: UnixListener, target: &'static str, name: &'static str) {
                     tokio::spawn(async move {
                         let result = async {
                             let mut guest = guest_stream(target).await?;
-                            tokio::io::copy_bidirectional(&mut client, &mut guest).await?;
+                            tokio::io::copy_bidirectional_with_sizes(&mut client, &mut guest, crate::BUF, crate::BUF).await?;
                             anyhow::Ok(())
                         };
                         if let Err(err) = result.await
@@ -195,11 +206,14 @@ fn bridge(listener: UnixListener, target: &'static str, name: &'static str) {
 ///                               the Mac's loopback, nothing else
 ///   https <container-ip> <port> HTTPS for a container domain: terminate TLS
 ///                               here and proxy plain HTTP to the container
+///   memory-pressure             the guest is stalling on memory: deflate the
+///                               balloon now (memory.rs)
 async fn serve_host_connections() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     if vm::INCOMING.set(tx).is_err() {
         return;
     }
+    let max_memory = vm::Resources::load(&Paths::new()).memory;
     let tls = match crate::tls::Authority::load_or_create(&Paths::new()).and_then(|ca| Arc::new(ca).acceptor()) {
         Ok(acceptor) => Some(acceptor),
         Err(err) => {
@@ -210,7 +224,7 @@ async fn serve_host_connections() {
     while let Some(fd) = rx.recv().await {
         let tls = tls.clone();
         tokio::spawn(async move {
-            if let Err(err) = host_connection(fd, tls).await
+            if let Err(err) = host_connection(fd, tls, max_memory).await
                 && !is_disconnect(&err)
             {
                 eprintln!("host connection: {err:#}");
@@ -219,7 +233,7 @@ async fn serve_host_connections() {
     }
 }
 
-async fn host_connection(fd: std::os::fd::OwnedFd, tls: Option<tokio_rustls::TlsAcceptor>) -> Result<()> {
+async fn host_connection(fd: std::os::fd::OwnedFd, tls: Option<tokio_rustls::TlsAcceptor>, max_memory: u64) -> Result<()> {
     let std = StdUnixStream::from(fd);
     std.set_nonblocking(true)?;
     let mut guest = UnixStream::from_std(std)?;
@@ -244,7 +258,7 @@ async fn host_connection(fd: std::os::fd::OwnedFd, tls: Option<tokio_rustls::Tls
                 Err(_) => tokio::net::TcpStream::connect(("::1", port)).await?,
             };
             mac.set_nodelay(true)?;
-            tokio::io::copy_bidirectional(&mut guest, &mut mac).await?;
+            tokio::io::copy_bidirectional_with_sizes(&mut guest, &mut mac, crate::BUF, crate::BUF).await?;
         }
         ["https", ip, port] => {
             let ip: std::net::Ipv4Addr = ip.parse()?;
@@ -256,7 +270,7 @@ async fn host_connection(fd: std::os::fd::OwnedFd, tls: Option<tokio_rustls::Tls
             let upstream = if port == 0 { None } else { guest_stream(&format!("tcp {ip}:{port}")).await.ok() };
             match upstream {
                 Some(mut upstream) => {
-                    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+                    tokio::io::copy_bidirectional_with_sizes(&mut client, &mut upstream, crate::BUF, crate::BUF).await?;
                 }
                 None => {
                     let body = "berth: no web server found in this container\n";
@@ -269,6 +283,7 @@ async fn host_connection(fd: std::os::fd::OwnedFd, tls: Option<tokio_rustls::Tls
                 }
             }
         }
+        ["memory-pressure"] => crate::memory::on_pressure(max_memory).await,
         _ => anyhow::bail!("bad header {header:?}"),
     }
     Ok(())
