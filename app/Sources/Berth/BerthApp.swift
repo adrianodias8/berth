@@ -69,14 +69,16 @@ struct MenuBarContent: View {
                 } else {
                     Text("\(running.count) of \(engine.containers.count) containers running")
                         .font(.caption).foregroundStyle(.secondary)
+                    // An explicit height: a ScrollView has no intrinsic height and
+                    // collapses to nothing inside a menu-bar popover.
                     ScrollView {
                         VStack(alignment: .leading, spacing: 4) {
                             ForEach(engine.containers) { c in
-                                MenuContainerRow(container: c)
+                                MenuContainerRow(container: c).frame(height: 22)
                             }
                         }
                     }
-                    .frame(maxHeight: 260)
+                    .frame(height: min(CGFloat(engine.containers.count) * 26, 260))
                 }
             }
 
