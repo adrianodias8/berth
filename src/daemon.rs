@@ -99,6 +99,7 @@ async fn serve(paths: Paths, cpus: usize, memory: u64) -> Result<()> {
     let control = UnixListener::bind(paths.control_socket())?;
     bridge(UnixListener::bind(paths.docker_socket())?, DOCKER_TARGET, "docker");
     bridge(UnixListener::bind(paths.ssh_socket())?, SSH_TARGET, "ssh");
+    crate::watch::start();
     tokio::spawn(ports::run());
     tokio::spawn(crate::memory::run(memory));
     tokio::spawn(crate::routes::run_periodic());

@@ -9,6 +9,7 @@ block2 = "0.6.2"
 clap = { version = "4.6.7", features = ["derive"] }
 dispatch2 = "0.3.1"
 libc = "0.2.191"
+notify = "8.2.0"
 objc2 = "0.6.5"
 objc2-foundation = "0.3.2"
 objc2-virtualization = "0.3.2"

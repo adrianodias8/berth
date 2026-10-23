@@ -27,6 +27,16 @@ const EVENTS_PATH: &str = "/events?filters=%7B%22type%22%3A%5B%22container%22%2C
 struct Container {
     #[serde(rename = "Ports", default)]
     ports: Vec<Port>,
+    #[serde(rename = "Mounts", default)]
+    mounts: Vec<Mount>,
+}
+
+#[derive(Deserialize)]
+struct Mount {
+    #[serde(rename = "Type", default)]
+    kind: String,
+    #[serde(rename = "Source", default)]
+    source: String,
 }
 
 #[derive(Deserialize)]
@@ -85,6 +95,11 @@ async fn sync() -> Result<()> {
     let mut body = String::new();
     docker_get("/containers/json").await?.read_to_string(&mut body).await?;
     let containers: Vec<Container> = serde_json::from_str(&body)?;
+
+    // Same event stream drives file-change forwarding for bind mounts.
+    let home = crate::paths::Paths::new().home;
+    let sources = containers.iter().flat_map(|c| &c.mounts).filter(|m| m.kind == "bind").map(|m| m.source.as_str());
+    crate::watch::set_roots(crate::watch::bind_roots(sources, &home));
 
     let mut wanted: Vec<Key> = containers
         .iter()

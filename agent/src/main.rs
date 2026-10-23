@@ -6,6 +6,8 @@
 //!   info domains\n          (replies with the domain table as JSON)
 //!   info network\n          (replies with the guest address and Docker subnets)
 //!   info memory\n           (replies with MemTotal/MemAvailable/PSI, see memory.rs)
+//!   touch\n                 followed by newline-separated paths until EOF: raise
+//!                           inotify events for files changed on the Mac
 //!
 //! A failed connect just closes the stream. The agent also runs the container
 //! domain controller (domains.rs), its mDNS responder (mdns.rs), DNS for
@@ -74,6 +76,9 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
     // vsock fds support the same read/write/shutdown calls as unix sockets.
     let mut host = UnixStream::from(fd);
     let header = read_header(&mut host)?;
+    if header == "touch" {
+        return touch_paths(host);
+    }
     match header.split_once(' ') {
         Some(("tcp", addr)) => {
             let guest = TcpStream::connect(addr)?;
@@ -99,6 +104,24 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
         }
         _ => Err(io::Error::new(io::ErrorKind::InvalidData, format!("bad header {header:?}"))),
     }
+}
+
+/// chmod each path to its current mode: a no-op that still raises IN_ATTRIB
+/// for inotify watchers in the guest and refreshes virtiofs's cached
+/// attributes. Missing paths (deleted on the Mac) are skipped; the host also
+/// sends their parent directory.
+fn touch_paths(mut host: UnixStream) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut list = String::new();
+    host.read_to_string(&mut list)?;
+    for path in list.lines().filter(|l| !l.is_empty()) {
+        if let Ok(meta) = std::fs::symlink_metadata(path)
+            && !meta.file_type().is_symlink()
+        {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(meta.permissions().mode()));
+        }
+    }
+    Ok(())
 }
 
 /// Read up to and including '\n', one byte at a time so nothing past the

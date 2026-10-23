@@ -45,6 +45,13 @@ with published ports and container domain names on the Mac.
   (`dev.orbstack.http-port` is read too). Containers that serve 443 themselves are
   passed through untouched. Trust the local CA once: `berth tls trust`.
 
+- **File change notifications** on bind mounts: edits and new files on the Mac
+  reach watchers in containers (Vite, webpack, nodemon, `fs.watch`), so hot reload
+  works. Deletions are picked up on the watcher's next rescan.
+- **Own Docker CLIs**: berth downloads the official `docker` 29.9.2, Compose and
+  Buildx into `~/.berth/bin` and links them wherever none work (so removing another
+  Docker app doesn't break `docker`). The VM runs Docker's own engine (docker-ce 29).
+
 Not yet: per-domain `@port` routing hints in domain labels, UDP published ports and
 UDP to `host.docker.internal`, Linux machines. See the roadmap below.
 

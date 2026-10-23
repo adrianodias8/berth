@@ -9,6 +9,7 @@ mod provision;
 mod routes;
 mod tls;
 mod vm;
+mod watch;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
