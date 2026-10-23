@@ -316,6 +316,8 @@ fn delete(paths: &Paths, yes: bool) -> Result<()> {
         stop(paths)?;
     }
     std::fs::remove_dir_all(paths.data()).ok();
+    // The exported kernel belongs to the deleted VM.
+    std::fs::remove_dir_all(paths.guest().join("boot")).ok();
     println!("Deleted {}", paths.data().display());
     Ok(())
 }

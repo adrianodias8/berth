@@ -24,7 +24,7 @@ apt-get install -y -q $opts docker-ce docker-ce-cli containerd.io docker-buildx-
 systemctl enable --now docker
 "#;
 
-fn installed(package: &str) -> bool {
+pub fn installed(package: &str) -> bool {
     Command::new("dpkg-query")
         .args(["-W", "-f=${Status}", package])
         .output()
@@ -35,6 +35,14 @@ pub fn ensure_docker_ce() {
     if installed("docker-ce") {
         return;
     }
+    install();
+    // Settings that need the new engine (see hostnet::configure_docker).
+    if let Err(err) = crate::hostnet::configure_docker() {
+        eprintln!("berth-agent: engine: docker config: {err}");
+    }
+}
+
+fn install() {
     eprintln!("berth-agent: engine: installing Docker Engine (docker-ce)");
     match Command::new("sh").args(["-c", SCRIPT]).output() {
         Ok(out) if out.status.success() => eprintln!("berth-agent: engine: docker-ce installed"),

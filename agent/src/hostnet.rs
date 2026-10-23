@@ -49,29 +49,38 @@ pub fn setup() {
             }
         }
     }
-    if let Err(err) = configure_docker_dns() {
-        eprintln!("berth-agent: hostnet: docker dns: {err}");
+    if let Err(err) = configure_docker() {
+        eprintln!("berth-agent: hostnet: docker config: {err}");
     }
 }
 
-/// Point Docker at our DNS server, keeping any other daemon.json settings.
-/// Restarts dockerd only when the file actually changes (once per VM).
-fn configure_docker_dns() -> io::Result<()> {
+/// Our daemon.json settings, keeping any others. Restarts dockerd only when
+/// the file actually changes. Also called by engine.rs once docker-ce is in.
+///
+/// - dns: our DNS server (host.docker.internal, *.berth.local).
+/// - allow-direct-routing: Docker 28+ drops packets addressed to container
+///   IPs from outside the bridge (raw PREROUTING); the Mac routes container
+///   subnets to us on purpose. Only written for docker-ce: docker.io 26
+///   refuses to start on unknown keys.
+pub fn configure_docker() -> io::Result<()> {
     let mut config: serde_json::Map<String, serde_json::Value> = match std::fs::read(DOCKER_CONFIG) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other)?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => Default::default(),
         Err(e) => return Err(e),
     };
-    let dns = serde_json::json!([DNS_IP.to_string()]);
-    if config.get("dns") == Some(&dns) {
+    let before = config.clone();
+    config.insert("dns".into(), serde_json::json!([DNS_IP.to_string()]));
+    if crate::engine::installed("docker-ce") {
+        config.insert("allow-direct-routing".into(), serde_json::Value::Bool(true));
+    }
+    if config == before {
         return Ok(());
     }
-    config.insert("dns".into(), dns);
     std::fs::create_dir_all("/etc/docker")?;
     let tmp = format!("{DOCKER_CONFIG}.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&config).map_err(io::Error::other)?)?;
     std::fs::rename(&tmp, DOCKER_CONFIG)?;
-    eprintln!("berth-agent: hostnet: set Docker DNS to {DNS_IP}, restarting dockerd");
+    eprintln!("berth-agent: hostnet: updated {DOCKER_CONFIG}, restarting dockerd");
     quiet("systemctl", &["restart", "docker"]);
     Ok(())
 }
