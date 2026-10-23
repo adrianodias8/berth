@@ -11,6 +11,8 @@ const SOCKET: &str = "/run/docker.sock";
 
 #[derive(Deserialize, Debug)]
 pub struct Container {
+    #[serde(rename = "Id")]
+    pub id: String,
     #[serde(rename = "Names", default)]
     pub names: Vec<String>,
     #[serde(rename = "Labels", default)]
@@ -103,5 +105,12 @@ pub fn containers() -> io::Result<Vec<Container>> {
 pub fn networks() -> io::Result<Vec<Network>> {
     let mut body = String::new();
     get("/networks")?.read_to_string(&mut body)?;
+    serde_json::from_str(&body).map_err(io::Error::other)
+}
+
+/// `GET /containers/{id}/json`, untyped.
+pub fn inspect(id: &str) -> io::Result<serde_json::Value> {
+    let mut body = String::new();
+    get(&format!("/containers/{id}/json"))?.read_to_string(&mut body)?;
     serde_json::from_str(&body).map_err(io::Error::other)
 }

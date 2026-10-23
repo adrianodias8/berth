@@ -8,13 +8,15 @@
 //!
 //! A failed connect just closes the stream. The agent also runs the container
 //! domain controller (domains.rs), its mDNS responder (mdns.rs), DNS for
-//! containers (dns.rs) and host.docker.internal forwarding (hostnet.rs).
+//! containers (dns.rs), host.docker.internal forwarding (hostnet.rs) and web
+//! access to domains: port detection and HTTPS (web.rs).
 
 mod dns;
 mod docker;
 mod domains;
 mod hostnet;
 mod mdns;
+mod web;
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
@@ -33,6 +35,7 @@ fn main() {
     let table = TABLE.get_or_init(|| Arc::new(Default::default()));
     hostnet::setup();
     let (t1, t2, t3) = (table.clone(), table.clone(), table.clone());
+    web::run(table.clone());
     thread::spawn(move || domains::run(t1));
     thread::spawn(move || mdns::run(t2));
     thread::spawn(move || dns::run(t3));

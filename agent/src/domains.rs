@@ -41,6 +41,15 @@ pub struct Table {
     pub guest_ip: Option<Ipv4Addr>,
     /// Docker bridge subnets, for the host to route container IPs via us.
     pub subnets: Vec<String>,
+    /// Which container each service IP stands for (web.rs).
+    pub services: BTreeMap<Ipv4Addr, Service>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Service {
+    pub id: String,
+    pub name: String,
+    pub ip: Ipv4Addr,
 }
 
 /// What the host needs to route container IPs to this VM.
@@ -212,6 +221,7 @@ fn sync(table: &Shared) -> io::Result<()> {
     let mut taken = BTreeSet::new();
     let mut mapping = BTreeMap::new();
     let mut entries = Vec::new();
+    let mut services = BTreeMap::new();
     let mut sorted: Vec<&Container> = containers.iter().filter(|c| c.ip().is_some()).collect();
     sorted.sort_by(|a, b| a.name().cmp(&b.name()));
     for c in sorted {
@@ -224,6 +234,7 @@ fn sync(table: &Shared) -> io::Result<()> {
         };
         taken.insert(svc);
         mapping.insert(svc, target);
+        services.insert(svc, Service { id: c.id.clone(), name: name.to_string(), ip: target });
         for (domain, wildcard, subdomains_only) in names_for(c) {
             entries.push(Entry { domain, wildcard, subdomains_only, ip: svc, container: name.to_string() });
         }
@@ -242,6 +253,7 @@ fn sync(table: &Shared) -> io::Result<()> {
         t.entries = entries;
         t.guest_ip = Some(up.ip);
         t.subnets = subnets;
+        t.services = services;
         gone
     };
     if let Err(err) = crate::mdns::goodbye(&gone, up.ip) {
@@ -266,11 +278,18 @@ fn apply(up: &Uplink, mapping: &BTreeMap<Ipv4Addr, Ipv4Addr>) -> io::Result<()> 
         exec("iptables", &["-t", "nat", "-I", "PREROUTING", "1", "-j", NAT_CHAIN]);
     }
     exec("iptables", &["-t", "nat", "-F", NAT_CHAIN]);
+    let (http, https) = (crate::web::HTTP_PORT.to_string(), crate::web::HTTPS_PORT.to_string());
     for (svc, target) in mapping {
-        exec(
-            "iptables",
-            &["-t", "nat", "-A", NAT_CHAIN, "-d", &format!("{svc}/32"), "-j", "DNAT", "--to-destination", &target.to_string()],
-        );
+        let svc = format!("{svc}/32");
+        // Web ports go through the agent first (port detection, HTTPS); the
+        // rest goes straight to the container.
+        for (port, to) in [("80", &http), ("443", &https)] {
+            exec(
+                "iptables",
+                &["-t", "nat", "-A", NAT_CHAIN, "-d", &svc, "-p", "tcp", "--dport", port, "-j", "REDIRECT", "--to-ports", to],
+            );
+        }
+        exec("iptables", &["-t", "nat", "-A", NAT_CHAIN, "-d", &svc, "-j", "DNAT", "--to-destination", &target.to_string()]);
     }
     // Docker's FORWARD policy drops new connections to unpublished container
     // ports. Let through anything we (or Docker) DNATed, and traffic from the

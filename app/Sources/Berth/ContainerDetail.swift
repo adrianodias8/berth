@@ -84,7 +84,7 @@ struct ContainerInfo: View {
                 }
                 ForEach(domains) { d in
                     LabeledContent("Domain") {
-                        Link(d.domain, destination: URL(string: "http://\(d.domain)")!)
+                        Link(d.domain, destination: URL(string: "\(TLSTrust.scheme)://\(d.domain)")!)
                     }
                 }
                 ForEach(container.ipAddresses, id: \.self) { ip in

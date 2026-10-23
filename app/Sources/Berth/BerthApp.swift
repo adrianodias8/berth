@@ -134,11 +134,32 @@ struct MenuContainerRow: View {
 /// Where a running container's web UI most likely is: its domain if it
 /// exposes port 80, else the first published port on localhost.
 func webURL(for container: Container) -> URL? {
-    if (container.ports ?? []).contains(where: { $0.privatePort == 80 && $0.type == "tcp" }) {
-        return URL(string: "http://\(container.domain)")
-    }
-    if let port = container.publishedPorts.first?.publicPort {
-        return URL(string: "http://localhost:\(port)")
+    // The domain works for any web port (berth detects it), so prefer it
+    // whenever the container exposes something.
+    if !(container.ports ?? []).isEmpty {
+        return URL(string: "\(TLSTrust.scheme)://\(container.domain)")
     }
     return nil
+}
+
+/// Whether macOS trusts berth's local CA, i.e. https:// domains work in browsers.
+enum TLSTrust {
+    static var caPath: String { BerthPaths.root.appendingPathComponent("tls/ca.crt").path }
+
+    nonisolated(unsafe) static var cached: Bool = check()
+
+    static var scheme: String { cached ? "https" : "http" }
+
+    static func check() -> Bool {
+        guard FileManager.default.fileExists(atPath: caPath) else { return false }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = ["verify-cert", "-q", "-p", "basic", "-c", caPath]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return false }
+        process.waitUntilExit()
+        cached = process.terminationStatus == 0
+        return cached
+    }
 }

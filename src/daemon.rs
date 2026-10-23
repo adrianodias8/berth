@@ -3,6 +3,7 @@
 //! other threads serves the control socket and the Docker socket.
 
 use std::os::unix::net::UnixStream as StdUnixStream;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -188,17 +189,28 @@ fn bridge(listener: UnixListener, target: &'static str, name: &'static str) {
     });
 }
 
-/// Guest-to-Mac connections (host.docker.internal). The agent sends
-/// `tcp <port>\n`; we connect to that port on the Mac's loopback, so servers
-/// bound to localhost are reachable too. Only loopback ports, nothing else.
+/// Guest-to-Mac connections over vsock. The agent sends one header line:
+///
+///   tcp <port>                  host.docker.internal: connect to that port on
+///                               the Mac's loopback, nothing else
+///   https <container-ip> <port> HTTPS for a container domain: terminate TLS
+///                               here and proxy plain HTTP to the container
 async fn serve_host_connections() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     if vm::INCOMING.set(tx).is_err() {
         return;
     }
+    let tls = match crate::tls::Authority::load_or_create(&Paths::new()).and_then(|ca| Arc::new(ca).acceptor()) {
+        Ok(acceptor) => Some(acceptor),
+        Err(err) => {
+            eprintln!("tls: HTTPS for container domains disabled: {err:#}");
+            None
+        }
+    };
     while let Some(fd) = rx.recv().await {
+        let tls = tls.clone();
         tokio::spawn(async move {
-            if let Err(err) = host_connection(fd).await
+            if let Err(err) = host_connection(fd, tls).await
                 && !is_disconnect(&err)
             {
                 eprintln!("host connection: {err:#}");
@@ -207,28 +219,58 @@ async fn serve_host_connections() {
     }
 }
 
-async fn host_connection(fd: std::os::fd::OwnedFd) -> Result<()> {
+async fn host_connection(fd: std::os::fd::OwnedFd, tls: Option<tokio_rustls::TlsAcceptor>) -> Result<()> {
     let std = StdUnixStream::from(fd);
     std.set_nonblocking(true)?;
-    let mut reader = BufReader::new(UnixStream::from_std(std)?);
-    let mut header = String::new();
-    reader.read_line(&mut header).await?;
-    let port: u16 = header
-        .trim()
-        .strip_prefix("tcp ")
-        .and_then(|p| p.parse().ok())
-        .ok_or_else(|| anyhow::anyhow!("bad header {header:?}"))?;
-    // Many dev servers bind only one of the loopback addresses.
-    let mut mac = match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
-        Ok(s) => s,
-        Err(_) => tokio::net::TcpStream::connect(("::1", port)).await?,
-    };
-    mac.set_nodelay(true)?;
-    // The BufReader may hold bytes the guest sent right after the header.
-    let buffered = reader.buffer().to_vec();
-    let mut guest = reader.into_inner();
-    mac.write_all(&buffered).await?;
-    tokio::io::copy_bidirectional(&mut guest, &mut mac).await?;
+    let mut guest = UnixStream::from_std(std)?;
+    // Byte at a time: whatever follows the header (e.g. a TLS ClientHello)
+    // must stay in the stream.
+    let mut header = Vec::new();
+    loop {
+        let byte = guest.read_u8().await?;
+        if byte == b'\n' || header.len() > 256 {
+            break;
+        }
+        header.push(byte);
+    }
+    let header = String::from_utf8_lossy(&header).into_owned();
+    let parts: Vec<&str> = header.split_whitespace().collect();
+    match parts.as_slice() {
+        ["tcp", port] => {
+            let port: u16 = port.parse()?;
+            // Many dev servers bind only one of the loopback addresses.
+            let mut mac = match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(s) => s,
+                Err(_) => tokio::net::TcpStream::connect(("::1", port)).await?,
+            };
+            mac.set_nodelay(true)?;
+            tokio::io::copy_bidirectional(&mut guest, &mut mac).await?;
+        }
+        ["https", ip, port] => {
+            let ip: std::net::Ipv4Addr = ip.parse()?;
+            let port: u16 = port.parse()?;
+            let tls = tls.ok_or_else(|| anyhow::anyhow!("TLS unavailable"))?;
+            // Failed handshakes (e.g. a non-.local name, for which we never
+            // issue) are the client's problem, not worth logging.
+            let Ok(mut client) = tls.accept(guest).await else { return Ok(()) };
+            let upstream = if port == 0 { None } else { guest_stream(&format!("tcp {ip}:{port}")).await.ok() };
+            match upstream {
+                Some(mut upstream) => {
+                    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+                }
+                None => {
+                    let body = "berth: no web server found in this container\n";
+                    let response = format!(
+                        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    client.write_all(response.as_bytes()).await?;
+                    client.shutdown().await?;
+                }
+            }
+        }
+        _ => anyhow::bail!("bad header {header:?}"),
+    }
     Ok(())
 }
 

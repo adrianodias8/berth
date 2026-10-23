@@ -8,6 +8,8 @@ struct SettingsView: View {
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @AppStorage("autoStart") private var autoStart = true
     @State private var helperMessage: String?
+    @State private var httpsTrusted = TLSTrust.cached
+    @State private var httpsMessage: String?
 
     private let hostCPUs = ProcessInfo.processInfo.activeProcessorCount
     private let hostMemoryGiB = Int(ProcessInfo.processInfo.physicalMemory >> 30)
@@ -60,6 +62,21 @@ struct SettingsView: View {
                 if let helperMessage { Text(helperMessage).font(.caption).foregroundStyle(.secondary) }
             }
 
+            SwiftUI.Section("HTTPS") {
+                LabeledContent("Container domains over HTTPS", value: httpsTrusted ? "On" : "Certificate not trusted")
+                HStack {
+                    Text("berth's local certificate authority only covers .local names. Trusting it asks for your password.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    if httpsTrusted {
+                        Button("Remove Trust") { runTLS("untrust") }
+                    } else {
+                        Button("Trust Certificate…") { runTLS("trust") }
+                    }
+                }
+                if let httpsMessage { Text(httpsMessage).font(.caption).foregroundStyle(.secondary) }
+            }
+
             SwiftUI.Section("Docker") {
                 LabeledContent("Socket") { Text(BerthPaths.dockerSocket).textSelection(.enabled).font(.caption.monospaced()) }
                 LabeledContent("CLI") { Text("docker context use berth").textSelection(.enabled).font(.caption.monospaced()) }
@@ -70,7 +87,20 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 520, height: 560)
+        .frame(width: 520, height: 640)
+    }
+
+    /// `berth tls trust|untrust`; macOS shows its own password prompt.
+    private func runTLS(_ action: String) {
+        httpsMessage = action == "trust" ? "Waiting for authorization…" : nil
+        Task.detached {
+            let result = Engine.run([BerthPaths.cli, "tls", action])
+            let trusted = TLSTrust.check()
+            await MainActor.run {
+                httpsTrusted = trusted
+                httpsMessage = result.code == 0 ? nil : result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
     }
 
     private var helperInstalled: Bool { FileManager.default.fileExists(atPath: "/Library/LaunchDaemons/dev.berth.helper.plist") }

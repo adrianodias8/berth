@@ -39,7 +39,13 @@ with published ports and container domain names on the Mac.
 - **Berth.app**: a native SwiftUI app with a menu-bar item and a management window
   (see below)
 
-Not yet: HTTPS and port-less HTTP for apps not on port 80, UDP published ports and
+- **HTTPS and port-less URLs** for container domains: `http://` and `https://<name>.berth.local`
+  reach the container's web server on whatever port it listens on (detected; port
+  80 first, then common dev ports). Override with the `dev.berth.http-port` label
+  (`dev.orbstack.http-port` is read too). Containers that serve 443 themselves are
+  passed through untouched. Trust the local CA once: `berth tls trust`.
+
+Not yet: per-domain `@port` routing hints in domain labels, UDP published ports and
 UDP to `host.docker.internal`, Linux machines. See the roadmap below.
 
 ## Build
@@ -78,7 +84,8 @@ its own. Closing the window keeps it in the menu bar.
   counts, IP routing status)
 - **Machine**: a shell in the VM
 - **Settings**: CPUs and memory (written to `~/.berth/config.json`, applied on restart),
-  start on app launch, open at login, install the IP route helper
+  start on app launch, open at login, install the IP route helper, trust the HTTPS
+  certificate
 
 Launch arguments pick the starting screen, e.g.
 `open target/Berth.app --args -openSection Images` or
@@ -91,6 +98,7 @@ berth start               # first start downloads Debian and installs Docker (a 
 docker context use berth  # or: docker --context berth ps
 berth status
 berth domains             # container names and addresses
+berth tls trust           # trust the local CA for https://*.berth.local (one-time, asks for password)
 berth shell               # SSH into the VM; `berth shell uname -a` runs a command
 berth stop
 berth delete --yes        # wipe the VM disk (containers, images, volumes)
@@ -158,6 +166,20 @@ settings) and relays names it doesn't own to the guest's resolver, which forward
 to the Mac. The daemon only ever connects to the Mac's loopback, on the port the
 container asked for.
 
+Web access to domains goes through the agent and, for HTTPS, the host:
+
+```
+http://web.berth.local  ── service IP:80  ── REDIRECT ── agent: detect web port ── container:3000
+https://web.berth.local ── service IP:443 ── REDIRECT ── agent ══ vsock ══ daemon: TLS ══ agent ── container:3000
+```
+
+The agent finds the web port from the container's listening sockets
+(`/proc/<pid>/net/tcp*`, skipping loopback-only ones), probes them with an HTTP
+request, and caches the answer until the container restarts. The daemon holds
+berth's CA (`~/.berth/tls`) and issues a 30-day certificate per name on first use.
+The CA carries an X.509 name constraint permitting only `.local`, and the daemon
+refuses any other name, so trusting it cannot be abused for real sites.
+
 - `src/vm.rs`: VM configuration (EFI, virtio disk, NAT, virtiofs, Rosetta, vsock,
   balloon) and helpers that run calls on the main dispatch queue, where the VM lives
 - `src/daemon.rs`: background process; control socket, socket bridges, shutdown
@@ -169,6 +191,8 @@ container asked for.
   - `mdns.rs`: multicast DNS responder
   - `dns.rs`: DNS server for containers
   - `hostnet.rs`: `host.docker.internal` forwarding to the Mac
+  - `web.rs`: web port detection, HTTP/HTTPS entry for domains
+- `src/tls.rs`: the local CA, per-name certificates, keychain trust
 - `src/provision.rs`: image download and checksum, disk clone, SSH key, cloud-init seed
 - `guest/user-data.yaml`: guest provisioning (Docker, mounts, Rosetta binfmt, agent unit)
 - `app/`: the SwiftUI app (SwiftTerm for terminals, Swift Charts for stats)
@@ -179,8 +203,8 @@ Logs are in `~/.berth/log/` (`daemon.log`, `console.log`).
 
 1. ✅ VM + Docker socket
 2. ✅ Port forwarding for published ports (TCP), Rust guest agent, container
-   domain names, direct container IPs, `host.docker.internal`. Next: HTTPS with a
-   local CA and port-less HTTP for any port, UDP
+   domain names, direct container IPs, `host.docker.internal`, HTTPS and port
+   detection for domains. Next: UDP
 3. Custom kernel with direct boot for sub-second
    start; userspace networking and file sharing tuned for throughput
 4. ✅ Menu-bar app and management window. Next: Linux machines (`berth create ubuntu`), Kubernetes

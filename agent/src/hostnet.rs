@@ -24,8 +24,8 @@ pub const HOST_NAMES: [&str; 5] = [
 ];
 const REDIRECT_PORT: u16 = 2401;
 /// Must match `HOST_VSOCK_PORT` on the host.
-const HOST_VSOCK_PORT: u32 = 2401;
-const VMADDR_CID_HOST: u32 = 2;
+pub(crate) const HOST_VSOCK_PORT: u32 = 2401;
+pub(crate) const VMADDR_CID_HOST: u32 = 2;
 const SO_ORIGINAL_DST: libc::c_int = 80;
 const DOCKER_CONFIG: &str = "/etc/docker/daemon.json";
 
@@ -107,7 +107,7 @@ fn forward(conn: TcpStream) -> io::Result<()> {
     crate::splice(conn, host)
 }
 
-fn original_dst(conn: &TcpStream) -> io::Result<SocketAddrV4> {
+pub(crate) fn original_dst(conn: &TcpStream) -> io::Result<SocketAddrV4> {
     let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     let mut len = size_of::<libc::sockaddr_in>() as libc::socklen_t;
     let rc = unsafe {
@@ -119,7 +119,7 @@ fn original_dst(conn: &TcpStream) -> io::Result<SocketAddrV4> {
     Ok(SocketAddrV4::new(Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)), u16::from_be(addr.sin_port)))
 }
 
-fn vsock_connect(cid: u32, port: u32) -> io::Result<OwnedFd> {
+pub(crate) fn vsock_connect(cid: u32, port: u32) -> io::Result<OwnedFd> {
     unsafe {
         let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
         if fd < 0 {

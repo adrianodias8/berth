@@ -5,6 +5,7 @@ mod paths;
 mod ports;
 mod provision;
 mod routes;
+mod tls;
 mod vm;
 
 use std::io::{BufRead, BufReader, Write};
@@ -46,6 +47,11 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// HTTPS for container domains: trust or remove berth's local CA
+    Tls {
+        #[command(subcommand)]
+        action: TlsCmd,
+    },
     /// Manage the privileged route helper that makes container IPs reachable
     Helper {
         #[command(subcommand)]
@@ -54,6 +60,16 @@ enum Cmd {
     /// Run the VM in the foreground (used internally by `start`)
     #[command(hide = true)]
     Daemon,
+}
+
+#[derive(Subcommand)]
+enum TlsCmd {
+    /// Trust the berth CA in your login keychain (asks for your password)
+    Trust,
+    /// Remove the berth CA from your keychain
+    Untrust,
+    /// Show whether the CA is trusted
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -89,6 +105,12 @@ fn main() -> Result<()> {
         Cmd::Domains => domains(&paths),
         Cmd::Shell { command } => shell(&paths, &command),
         Cmd::Delete { yes } => delete(&paths, yes),
+        Cmd::Tls { action: TlsCmd::Trust } => tls::trust(&paths),
+        Cmd::Tls { action: TlsCmd::Untrust } => tls::untrust(&paths),
+        Cmd::Tls { action: TlsCmd::Status } => {
+            println!("{}", https_state(&paths));
+            Ok(())
+        }
         Cmd::Daemon => daemon::run(paths),
         Cmd::Helper { .. } => unreachable!(),
     }
@@ -194,6 +216,14 @@ fn stop(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
+fn https_state(paths: &Paths) -> String {
+    if tls::is_trusted(paths) {
+        "on (https://<container>.berth.local)".into()
+    } else {
+        "certificate not trusted yet (run: berth tls trust)".into()
+    }
+}
+
 fn ready(ok: bool) -> &'static str {
     if ok { "ready" } else { "not ready" }
 }
@@ -209,6 +239,7 @@ fn status(paths: &Paths) -> Result<()> {
                 println!("Ports:   {}", s.ports.join(", "));
             }
             println!("IPs:     {}", s.container_ips);
+            println!("HTTPS:   {}", https_state(paths));
         }
     }
     Ok(())
