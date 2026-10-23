@@ -149,15 +149,36 @@ fn login_keychain(paths: &Paths) -> String {
     paths.home.join("Library/Keychains/login.keychain-db").to_string_lossy().into_owned()
 }
 
-/// Whether macOS currently trusts the CA for TLS.
+/// Whether macOS trusts our CA for TLS: this exact certificate is in the
+/// keychain and has user trust settings. (`security verify-cert` can't answer
+/// this: it also demands Certificate Transparency, which only applies to
+/// publicly trusted CAs, so it fails even when browsers accept our certs.)
 pub fn is_trusted(paths: &Paths) -> bool {
     let cert = ca_cert_path(paths);
-    cert.exists()
-        && Command::new("security")
-            .args(["verify-cert", "-q", "-p", "basic", "-c"])
-            .arg(&cert)
-            .status()
-            .is_ok_and(|s| s.success())
+    let Ok(ours) = Command::new("openssl").args(["x509", "-noout", "-fingerprint", "-sha1", "-in"]).arg(&cert).output() else {
+        return false;
+    };
+    // "SHA1 Fingerprint=AA:BB:..." -> "AABB..."
+    let ours: String = String::from_utf8_lossy(&ours.stdout)
+        .split('=')
+        .nth(1)
+        .unwrap_or("")
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .collect::<String>()
+        .to_uppercase();
+    if ours.is_empty() {
+        return false;
+    }
+    let in_keychain = Command::new("security")
+        .args(["find-certificate", "-a", "-Z", "-c", CA_NAME, &login_keychain(paths)])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).to_uppercase().contains(&format!("SHA-1 HASH: {ours}")));
+    let has_trust = Command::new("security")
+        .arg("dump-trust-settings")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(CA_NAME));
+    in_keychain && has_trust
 }
 
 pub fn trust(paths: &Paths) -> Result<()> {

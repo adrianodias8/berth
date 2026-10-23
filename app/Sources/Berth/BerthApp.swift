@@ -162,15 +162,15 @@ enum TLSTrust {
         return cached
     }
 
+    /// Our CA has user trust settings in the keychain. (A verify-cert style
+    /// evaluation of the CA alone fails on Certificate Transparency, which
+    /// doesn't apply to locally trusted roots.)
     private static func evaluate() -> Bool {
-        guard FileManager.default.fileExists(atPath: caPath) else { return false }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = ["verify-cert", "-q", "-p", "basic", "-c", caPath]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return false }
-        process.waitUntilExit()
-        return process.terminationStatus == 0
+        guard let pem = try? String(contentsOfFile: caPath, encoding: .utf8) else { return false }
+        let base64 = pem.components(separatedBy: .newlines).filter { !$0.hasPrefix("-----") }.joined()
+        guard let der = Data(base64Encoded: base64),
+              let cert = SecCertificateCreateWithData(nil, der as CFData) else { return false }
+        var settings: CFArray?
+        return SecTrustSettingsCopyTrustSettings(cert, .user, &settings) == errSecSuccess
     }
 }
