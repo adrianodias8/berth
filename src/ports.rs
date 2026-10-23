@@ -14,8 +14,14 @@ use tokio::task::JoinHandle;
 
 use crate::daemon::{DOCKER_TARGET, guest_stream, is_disconnect};
 
-/// Host listen address and port.
-type Key = (&'static str, u16);
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Proto {
+    Tcp,
+    Udp,
+}
+
+/// Host listen address, port and protocol.
+type Key = (&'static str, u16, Proto);
 
 static FORWARDS: Mutex<BTreeMap<Key, JoinHandle<()>>> = Mutex::new(BTreeMap::new());
 
@@ -59,10 +65,11 @@ pub fn forwarded() -> Vec<String> {
         .collect()
 }
 
-fn display((bind, port): Key) -> String {
+fn display((bind, port, proto): Key) -> String {
+    let suffix = if proto == Proto::Udp { "/udp" } else { "" };
     match bind {
-        "::" => format!("*:{port}"),
-        _ => format!("{bind}:{port}"),
+        "::" => format!("*:{port}{suffix}"),
+        _ => format!("{bind}:{port}{suffix}"),
     }
 }
 
@@ -104,8 +111,20 @@ async fn sync() -> Result<()> {
     let mut wanted: Vec<Key> = containers
         .iter()
         .flat_map(|c| &c.ports)
-        .filter(|p| p.kind == "tcp")
-        .filter_map(|p| Some((bind_address(&p.ip)?, p.public?)))
+        .filter_map(|p| {
+            let proto = match p.kind.as_str() {
+                "tcp" => Proto::Tcp,
+                "udp" => Proto::Udp,
+                _ => return None,
+            };
+            let bind = bind_address(&p.ip)?;
+            // UDP is relayed to the guest's NAT address, which only reaches
+            // ports Docker binds on all guest interfaces.
+            if proto == Proto::Udp && bind != "::" {
+                return None;
+            }
+            Some((bind, p.public?, proto))
+        })
         .collect();
     wanted.sort();
     wanted.dedup();
@@ -125,19 +144,25 @@ async fn sync() -> Result<()> {
         }
         // Bind synchronously so a conflict is reported now and retried on the
         // next event instead of failing silently in a task.
-        let std = match std::net::TcpListener::bind((key.0, key.1)) {
-            Ok(l) => l,
-            Err(err) => {
-                eprintln!("ports: cannot listen on {}: {err}", display(key));
-                continue;
-            }
+        let task = match key.2 {
+            Proto::Tcp => std::net::TcpListener::bind((key.0, key.1)).and_then(|std| {
+                std.set_nonblocking(true)?;
+                // Ports Docker binds on all guest interfaces can be reached on
+                // the guest's NAT address; loopback-only ones only via the agent.
+                Ok(tokio::spawn(forward(TcpListener::from_std(std)?, key.1, key.0 == "::")))
+            }),
+            Proto::Udp => std::net::UdpSocket::bind((key.0, key.1)).and_then(|std| {
+                std.set_nonblocking(true)?;
+                Ok(tokio::spawn(forward_udp(tokio::net::UdpSocket::from_std(std)?, key.1)))
+            }),
         };
-        std.set_nonblocking(true)?;
-        let listener = TcpListener::from_std(std)?;
-        eprintln!("ports: forwarding {}", display(key));
-        // Ports Docker binds on all guest interfaces can be reached on the
-        // guest's NAT address; loopback-only ones only through the agent.
-        forwards.insert(key, tokio::spawn(forward(listener, key.1, key.0 == "::")));
+        match task {
+            Ok(task) => {
+                eprintln!("ports: forwarding {}", display(key));
+                forwards.insert(key, task);
+            }
+            Err(err) => eprintln!("ports: cannot listen on {}: {err}", display(key)),
+        }
     }
     Ok(())
 }
@@ -150,6 +175,66 @@ fn bind_address(ip: &str) -> Option<&'static str> {
         "127.0.0.1" | "::1" => Some("127.0.0.1"),
         // Bound to a specific guest address; nothing sensible on the host.
         _ => None,
+    }
+}
+
+/// UDP relay: one upstream socket per client address, connected to the
+/// guest's NAT address, dropped after a minute without traffic.
+async fn forward_udp(socket: tokio::net::UdpSocket, port: u16) {
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    const IDLE: Duration = Duration::from_secs(60);
+    // Reply tasks hold the listening socket; they must die with this task
+    // (dropped on abort when the port goes away), or the port stays bound.
+    struct AbortOnDrop(JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    type Session = (Arc<tokio::net::UdpSocket>, Arc<Mutex<std::time::Instant>>, AbortOnDrop);
+
+    let socket = Arc::new(socket);
+    let mut sessions: HashMap<SocketAddr, Session> = HashMap::new();
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let Ok((n, client)) = socket.recv_from(&mut buf).await else { continue };
+        sessions.retain(|_, (_, last, _)| last.lock().unwrap().elapsed() < IDLE);
+        let session = match sessions.get(&client) {
+            Some((upstream, last, _)) => {
+                *last.lock().unwrap() = std::time::Instant::now();
+                upstream.clone()
+            }
+            None => {
+                let Some(ip) = *crate::routes::GUEST_IP.lock().unwrap() else { continue };
+                let Ok(upstream) = tokio::net::UdpSocket::bind("0.0.0.0:0").await else { continue };
+                if upstream.connect((ip, port)).await.is_err() {
+                    continue;
+                }
+                let upstream = Arc::new(upstream);
+                let last = Arc::new(Mutex::new(std::time::Instant::now()));
+                // Replies back to this client until the session goes idle.
+                let (reply_up, reply_down, reply_last) = (upstream.clone(), socket.clone(), last.clone());
+                let replies = tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    loop {
+                        match tokio::time::timeout(IDLE, reply_up.recv(&mut buf)).await {
+                            Ok(Ok(n)) => {
+                                *reply_last.lock().unwrap() = std::time::Instant::now();
+                                let _ = reply_down.send_to(&buf[..n], client).await;
+                            }
+                            _ if reply_last.lock().unwrap().elapsed() < IDLE => continue,
+                            _ => break,
+                        }
+                    }
+                });
+                sessions.insert(client, (upstream.clone(), last, AbortOnDrop(replies)));
+                upstream
+            }
+        };
+        let _ = session.send(&buf[..n]).await;
     }
 }
 
