@@ -103,8 +103,7 @@ pub fn install() -> Result<()> {
         bail!("run sudo from your own account, not from a root shell");
     }
 
-    // Replace any running copy; "No such process" on a first install is fine.
-    let _ = Command::new("launchctl").args(["bootout", &format!("system/{LABEL}")]).output();
+    unload();
     std::fs::create_dir_all(Path::new(BINARY).parent().unwrap())?;
     // Root runs this binary, so it must not stay writable by the user: copy it
     // to a root-owned location rather than pointing launchd at the build tree.
@@ -137,9 +136,19 @@ pub fn install() -> Result<()> {
     );
     std::fs::write(PLIST, plist)?;
     std::fs::set_permissions(PLIST, std::fs::Permissions::from_mode(0o644))?;
-    let status = Command::new("launchctl").args(["bootstrap", "system", PLIST]).status()?;
-    if !status.success() {
-        bail!("launchctl bootstrap failed ({status})");
+    // launchd can still be tearing down the old job; retry briefly on EIO.
+    let mut last = String::new();
+    let loaded = (0..10).any(|_| {
+        match Command::new("launchctl").args(["bootstrap", "system", PLIST]).output() {
+            Ok(out) if out.status.success() => return true,
+            Ok(out) => last = String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            Err(err) => last = err.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        false
+    });
+    if !loaded {
+        bail!("launchctl bootstrap failed: {last}");
     }
     for _ in 0..20 {
         if Path::new(SOCKET).exists() {
@@ -152,12 +161,28 @@ pub fn install() -> Result<()> {
     bail!("helper did not start; see /var/log/dev.berth.helper.log")
 }
 
+/// Stop and unload the helper if loaded, waiting until launchd has let go of
+/// it: `bootout` returns before teardown finishes, and bootstrapping again too
+/// early fails with "Input/output error".
+fn unload() {
+    let target = format!("system/{LABEL}");
+    // "No such process" on a first install is fine.
+    let _ = Command::new("launchctl").args(["bootout", &target]).output();
+    for _ in 0..20 {
+        let loaded = Command::new("launchctl").args(["print", &target]).output().is_ok_and(|o| o.status.success());
+        if !loaded {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
 pub fn uninstall() -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         bail!("run with sudo: sudo berth helper uninstall");
     }
     // Stopping the helper removes the routes it installed.
-    let _ = Command::new("launchctl").args(["bootout", &format!("system/{LABEL}")]).output();
+    unload();
     for path in [PLIST, BINARY, SOCKET] {
         let _ = std::fs::remove_file(path);
     }
