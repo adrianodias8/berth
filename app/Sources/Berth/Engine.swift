@@ -41,6 +41,9 @@ struct BerthStatus: Decodable, Equatable {
         case memoryAllowed = "memory_allowed"
     }
 
+    /// The root helper predates abilities this berth needs; reinstall it.
+    var helperOutdated: Bool { containerIps?.contains("outdated") ?? false }
+
     /// e.g. "1.2 GiB used" for compact displays.
     var memorySummary: String? {
         guard let used = memoryUsed, used > 0 else { return nil }

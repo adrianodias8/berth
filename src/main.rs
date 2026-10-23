@@ -1,3 +1,4 @@
+mod cli_tools;
 mod context;
 mod daemon;
 mod helper;
@@ -136,6 +137,11 @@ fn current_status(paths: &Paths) -> Option<Status> {
 }
 
 fn start(paths: &Paths) -> Result<()> {
+    // Cheap once downloaded; also repairs plugin links if another app went away.
+    if let Err(err) = cli_tools::ensure(paths) {
+        // Not fatal: an existing docker CLI (or a later start) covers it.
+        eprintln!("Could not install the Docker CLIs: {err:#}");
+    }
     if let Some(status) = current_status(paths) {
         println!("berth is already running (VM {}, docker {})", status.vm, ready(status.docker));
         use_docker_context(paths);

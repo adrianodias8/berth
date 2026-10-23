@@ -65,12 +65,17 @@ async fn sync_with(force: bool) {
         let wanted = wanted.clone();
         // Also (re)point /var/run/docker.sock at us, once per change, as OrbStack
         // does for its socket.
-        let socket = crate::paths::Paths::new().docker_socket().to_string_lossy().into_owned();
-        move || helper::set_routes(wanted, Some(socket))
+        let paths = crate::paths::Paths::new();
+        let socket = paths.docker_socket().to_string_lossy().into_owned();
+        let cli = crate::cli_tools::bin_dir(&paths).to_string_lossy().into_owned();
+        move || helper::set_routes(wanted, Some(socket), Some(cli))
     })
     .await;
     let state = match result {
         Ok(None) => return,
+        Ok(Some(Ok(reply))) if reply.version < helper::VERSION => {
+            "helper outdated (reinstall: Berth Settings, or sudo berth helper install)".to_string()
+        }
         Ok(Some(Ok(reply))) => {
             let active: Vec<&str> = reply.active.iter().map(|r| r.subnet.as_str()).collect();
             match (active.is_empty(), reply.errors.is_empty()) {
@@ -93,7 +98,7 @@ async fn sync_with(force: bool) {
 /// Withdraw all routes; called on shutdown so none outlive the VM.
 pub fn clear() {
     if !LAST.lock().unwrap().is_empty() {
-        let _ = helper::set_routes(Vec::new(), None);
+        let _ = helper::set_routes(Vec::new(), None, None);
     }
 }
 

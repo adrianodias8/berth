@@ -58,7 +58,7 @@ struct SettingsView: View {
                     Text("Direct container IPs use a small root helper that manages routes for Docker subnets.")
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
-                    Button(helperInstalled ? "Reinstall Helper…" : "Install Helper…") { installHelper() }
+                    Button(engine.status?.helperOutdated == true ? "Update Helper…" : helperInstalled ? "Reinstall Helper…" : "Install Helper…") { installHelper() }
                 }
                 if let helperMessage { Text(helperMessage).font(.caption).foregroundStyle(.secondary) }
             }

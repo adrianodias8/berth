@@ -96,7 +96,7 @@ struct OnboardingView: View {
             let result: Step.State
             switch step.kind {
             case .engine: result = await startEngine()
-            case .privileged: result = Setup.installPrivileged()
+            case .privileged: result = Setup.installPrivileged(force: engine.status?.helperOutdated ?? false)
             case .https: result = await Setup.trustCertificate()
             }
             set(step.kind, result)

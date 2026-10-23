@@ -36,9 +36,16 @@ pub struct Route {
     pub gateway: String,
 }
 
+/// Bumped when the helper gains abilities, so berth can ask for a reinstall.
+pub const VERSION: u32 = 2;
+
 #[derive(Serialize, Deserialize)]
 pub struct SetRoutes {
     pub routes: Vec<Route>,
+    /// The user's ~/.berth/bin: link docker/docker-compose in /usr/local/bin
+    /// to it where those are missing or dangling.
+    #[serde(default)]
+    pub cli_dir: Option<String>,
     /// Point /var/run/docker.sock here. Must be the user's
     /// ~/.berth/run/docker.sock; None leaves the link alone.
     #[serde(default)]
@@ -52,6 +59,9 @@ const DEFAULT_DOCKER_SOCKET: &str = "/var/run/docker.sock";
 pub struct Reply {
     pub active: Vec<Route>,
     pub errors: Vec<String>,
+    /// 0 from helpers that predate versioning.
+    #[serde(default)]
+    pub version: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -248,6 +258,12 @@ fn handle(stream: UnixStream, uid: u32, installed: &mut BTreeSet<Route>) -> Resu
     {
         reply.errors.push(format!("{DEFAULT_DOCKER_SOCKET}: {err:#}"));
     }
+    if let Some(dir) = &request.cli_dir
+        && let Err(err) = link_cli_tools(dir, uid)
+    {
+        reply.errors.push(format!("CLI links: {err:#}"));
+    }
+    reply.version = VERSION;
     let mut stream = stream;
     writeln!(stream, "{}", serde_json::to_string(&reply)?)?;
     Ok(())
@@ -308,6 +324,32 @@ fn link_docker_socket(target: &str, uid: u32) -> Result<()> {
     std::os::unix::fs::symlink(&expected, &tmp)?;
     std::fs::rename(&tmp, DEFAULT_DOCKER_SOCKET)?;
     eprintln!("berth-helper: {DEFAULT_DOCKER_SOCKET} -> {}", expected.display());
+    Ok(())
+}
+
+/// Link /usr/local/bin/{docker,docker-compose} to the user's berth copies,
+/// only where missing or dangling: a working CLI from another app stays.
+fn link_cli_tools(dir: &str, uid: u32) -> Result<()> {
+    let home = home_of(uid).context("no home directory for the helper's user")?;
+    let expected = home.join(".berth/bin");
+    if Path::new(dir) != expected {
+        bail!("refusing to link to {dir}");
+    }
+    std::fs::create_dir_all("/usr/local/bin")?;
+    for name in crate::cli_tools::SYSTEM_LINKS {
+        let link = Path::new("/usr/local/bin").join(name);
+        let target = expected.join(name);
+        if !target.exists() {
+            continue;
+        }
+        let present = std::fs::symlink_metadata(&link).is_ok();
+        if present && !crate::cli_tools::is_dangling(&link) {
+            continue;
+        }
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&target, &link)?;
+        eprintln!("berth-helper: {} -> {}", link.display(), target.display());
+    }
     Ok(())
 }
 
@@ -392,14 +434,14 @@ fn parse_netstat_dest(dest: &str) -> Option<Cidr> {
 
 /// Ask the helper to make exactly `routes` active and, if given, point the
 /// default Docker socket at ours. None if the helper isn't installed.
-pub fn set_routes(routes: Vec<Route>, docker_socket: Option<String>) -> Option<Result<Reply>> {
+pub fn set_routes(routes: Vec<Route>, docker_socket: Option<String>, cli_dir: Option<String>) -> Option<Result<Reply>> {
     if !Path::new(SOCKET).exists() {
         return None;
     }
     Some((|| {
         let mut stream = UnixStream::connect(SOCKET)?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
-        writeln!(stream, "{}", serde_json::to_string(&SetRoutes { routes, docker_socket })?)?;
+        writeln!(stream, "{}", serde_json::to_string(&SetRoutes { routes, cli_dir, docker_socket })?)?;
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line)?;
         Ok(serde_json::from_str(&line)?)

@@ -55,7 +55,12 @@ struct MainWindow: View {
                     NotRunningView()
                 }
             }
-            .overlay(alignment: .bottom) { ErrorBanner() }
+            .overlay(alignment: .bottom) {
+                VStack(spacing: 0) {
+                    HelperUpdateBanner()
+                    ErrorBanner()
+                }
+            }
         }
         .sheet(isPresented: $showOnboarding) { OnboardingView() }
         .onAppear { if !onboarded { showOnboarding = true } }
@@ -117,6 +122,28 @@ struct NotRunningView: View {
         .multilineTextAlignment(.center)
         .padding(40)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// After an update that needs new helper abilities: one click, one prompt.
+struct HelperUpdateBanner: View {
+    @EnvironmentObject var engine: Engine
+    @State private var message: String?
+
+    var body: some View {
+        if engine.status?.helperOutdated == true {
+            HStack {
+                Image(systemName: "arrow.up.circle.fill").foregroundStyle(.blue)
+                Text(message ?? "Berth's networking helper needs an update.")
+                Spacer()
+                Button("Update") {
+                    if case let .failed(error) = Setup.installPrivileged(force: true) { message = error }
+                }
+            }
+            .padding(10)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+            .padding([.horizontal, .top], 12)
+        }
     }
 }
 
