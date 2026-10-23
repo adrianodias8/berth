@@ -146,11 +146,20 @@ func webURL(for container: Container) -> URL? {
 enum TLSTrust {
     static var caPath: String { BerthPaths.root.appendingPathComponent("tls/ca.crt").path }
 
-    nonisolated(unsafe) static var cached: Bool = check()
+    // Initialized from `evaluate()`, which must not touch `cached`: assigning a
+    // lazy static from inside its own initializer deadlocks dispatch_once.
+    nonisolated(unsafe) static var cached: Bool = evaluate()
 
     static var scheme: String { cached ? "https" : "http" }
 
+    /// Re-check and remember the result.
+    @discardableResult
     static func check() -> Bool {
+        cached = evaluate()
+        return cached
+    }
+
+    private static func evaluate() -> Bool {
         guard FileManager.default.fileExists(atPath: caPath) else { return false }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
@@ -159,7 +168,6 @@ enum TLSTrust {
         process.standardError = FileHandle.nullDevice
         guard (try? process.run()) != nil else { return false }
         process.waitUntilExit()
-        cached = process.terminationStatus == 0
-        return cached
+        return process.terminationStatus == 0
     }
 }
