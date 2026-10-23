@@ -15,6 +15,10 @@ struct NetworkInfo {
     subnets: Vec<String>,
 }
 
+/// The guest's address on the NAT network, learned on each sync. Port
+/// forwarding dials it directly: virtio-net is several times faster than vsock.
+pub static GUEST_IP: Mutex<Option<std::net::Ipv4Addr>> = Mutex::new(None);
+
 /// Last outcome, for `berth status`.
 static STATE: Mutex<Option<String>> = Mutex::new(None);
 static LAST: Mutex<Vec<Route>> = Mutex::new(Vec::new());
@@ -45,6 +49,7 @@ pub async fn sync() {
 async fn sync_with(force: bool) {
     let wanted = match network_info().await {
         Ok(NetworkInfo { gateway: Some(gw), subnets }) => {
+            *GUEST_IP.lock().unwrap() = gw.parse().ok();
             subnets.into_iter().map(|subnet| Route { subnet, gateway: gw.clone() }).collect::<Vec<_>>()
         }
         Ok(_) => return,

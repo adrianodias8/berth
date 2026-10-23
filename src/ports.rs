@@ -120,7 +120,9 @@ async fn sync() -> Result<()> {
         std.set_nonblocking(true)?;
         let listener = TcpListener::from_std(std)?;
         eprintln!("ports: forwarding {}", display(key));
-        forwards.insert(key, tokio::spawn(forward(listener, key.1)));
+        // Ports Docker binds on all guest interfaces can be reached on the
+        // guest's NAT address; loopback-only ones only through the agent.
+        forwards.insert(key, tokio::spawn(forward(listener, key.1, key.0 == "::")));
     }
     Ok(())
 }
@@ -136,7 +138,7 @@ fn bind_address(ip: &str) -> Option<&'static str> {
     }
 }
 
-async fn forward(listener: TcpListener, port: u16) {
+async fn forward(listener: TcpListener, port: u16, direct: bool) {
     let target = format!("tcp 127.0.0.1:{port}");
     loop {
         let Ok((mut client, _)) = listener.accept().await else { continue };
@@ -144,6 +146,14 @@ async fn forward(listener: TcpListener, port: u16) {
         tokio::spawn(async move {
             let _ = client.set_nodelay(true);
             let result = async {
+                let guest_ip = if direct { *crate::routes::GUEST_IP.lock().unwrap() } else { None };
+                if let Some(ip) = guest_ip
+                    && let Ok(mut guest) = tokio::net::TcpStream::connect((ip, port)).await
+                {
+                    guest.set_nodelay(true)?;
+                    tokio::io::copy_bidirectional_with_sizes(&mut client, &mut guest, crate::BUF, crate::BUF).await?;
+                    return anyhow::Ok(());
+                }
                 let mut guest = guest_stream(&target).await?;
                 tokio::io::copy_bidirectional_with_sizes(&mut client, &mut guest, crate::BUF, crate::BUF).await?;
                 anyhow::Ok(())
