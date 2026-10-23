@@ -1,3 +1,4 @@
+mod context;
 mod daemon;
 mod helper;
 mod paths;
@@ -17,8 +18,6 @@ use clap::{Parser, Subcommand};
 
 use daemon::{Domain, Request, Status};
 use paths::Paths;
-
-const DOCKER_CONTEXT: &str = "berth";
 
 #[derive(Parser)]
 #[command(name = "berth", version, about = "Run Docker containers in a lightweight Linux VM on macOS")]
@@ -111,6 +110,7 @@ fn current_status(paths: &Paths) -> Option<Status> {
 fn start(paths: &Paths) -> Result<()> {
     if let Some(status) = current_status(paths) {
         println!("berth is already running (VM {}, docker {})", status.vm, ready(status.docker));
+        use_docker_context(paths);
         return Ok(());
     }
     let first_boot = !paths.disk().exists();
@@ -157,30 +157,19 @@ fn start(paths: &Paths) -> Result<()> {
         std::io::stdout().flush()?;
     }
     println!(" ready in {:.0?}", started.elapsed());
-    ensure_docker_context(paths);
+    use_docker_context(paths);
     Ok(())
 }
 
-fn ensure_docker_context(paths: &Paths) {
-    let exists = Command::new("docker")
-        .args(["context", "inspect", DOCKER_CONTEXT])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if !exists {
-        let host = format!("host=unix://{}", paths.docker_socket().display());
-        let created = Command::new("docker")
-            .args(["context", "create", DOCKER_CONTEXT, "--description", "berth", "--docker", &host])
-            .stdout(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        if !created {
-            eprintln!("Could not create docker context '{DOCKER_CONTEXT}'.");
-        }
+/// Make `berth` the docker CLI's current context, as OrbStack does on start.
+fn use_docker_context(paths: &Paths) {
+    match context::use_berth(paths) {
+        Ok(()) => println!("Docker context '{}' is now current ({})", context::NAME, paths.docker_socket().display()),
+        Err(err) => eprintln!(
+            "Could not switch the docker context: {err:#}\nUse: docker context use {}",
+            context::NAME
+        ),
     }
-    println!("Docker socket: {}", paths.docker_socket().display());
-    println!("Use it with:   docker context use {DOCKER_CONTEXT}   (or: docker --context {DOCKER_CONTEXT} ...)");
 }
 
 fn stop(paths: &Paths) -> Result<()> {

@@ -45,7 +45,10 @@ pub async fn sync() {
     }
     let result = tokio::task::spawn_blocking({
         let wanted = wanted.clone();
-        move || helper::set_routes(wanted)
+        // Also (re)point /var/run/docker.sock at us, once per change, as OrbStack
+        // does for its socket.
+        let socket = crate::paths::Paths::new().docker_socket().to_string_lossy().into_owned();
+        move || helper::set_routes(wanted, Some(socket))
     })
     .await;
     let state = match result {
@@ -74,7 +77,7 @@ pub async fn sync() {
 /// Withdraw all routes; called on shutdown so none outlive the VM.
 pub fn clear() {
     if !LAST.lock().unwrap().is_empty() {
-        let _ = helper::set_routes(Vec::new());
+        let _ = helper::set_routes(Vec::new(), None);
     }
 }
 

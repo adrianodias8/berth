@@ -1,8 +1,9 @@
 //! Privileged route helper. Container subnets live inside the VM; for the Mac
 //! to reach container IPs directly it needs a route per subnet via the guest,
 //! and routes need root. This runs as a LaunchDaemon installed once with
-//! `sudo berth helper install`. It does one thing: keep a set of routes for
-//! private subnets via a VM on a vmnet bridge, requested by one user.
+//! `sudo berth helper install`. It keeps a set of routes for private subnets
+//! via a VM on a vmnet bridge, and points /var/run/docker.sock at the user's
+//! berth socket, for one user.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
@@ -38,7 +39,14 @@ pub struct Route {
 #[derive(Serialize, Deserialize)]
 pub struct SetRoutes {
     pub routes: Vec<Route>,
+    /// Point /var/run/docker.sock here. Must be the user's
+    /// ~/.berth/run/docker.sock; None leaves the link alone.
+    #[serde(default)]
+    pub docker_socket: Option<String>,
 }
+
+/// The system-wide default Docker socket that context-unaware tools use.
+const DEFAULT_DOCKER_SOCKET: &str = "/var/run/docker.sock";
 
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct Reply {
@@ -209,7 +217,12 @@ fn handle(stream: UnixStream, uid: u32, installed: &mut BTreeSet<Route>) -> Resu
     let mut line = String::new();
     BufReader::new(&stream).read_line(&mut line)?;
     let request: SetRoutes = serde_json::from_str(&line)?;
-    let reply = reconcile(&request.routes, installed);
+    let mut reply = reconcile(&request.routes, installed);
+    if let Some(target) = &request.docker_socket
+        && let Err(err) = link_docker_socket(target, uid)
+    {
+        reply.errors.push(format!("{DEFAULT_DOCKER_SOCKET}: {err:#}"));
+    }
     let mut stream = stream;
     writeln!(stream, "{}", serde_json::to_string(&reply)?)?;
     Ok(())
@@ -246,6 +259,40 @@ fn reconcile(wanted: &[Route], installed: &mut BTreeSet<Route>) -> Reply {
     }
     reply.active = installed.iter().cloned().collect();
     reply
+}
+
+/// Point /var/run/docker.sock at `target`, which may only be the authorized
+/// user's berth socket. Only an existing symlink is replaced (that is how
+/// OrbStack and Docker Desktop install theirs); a real socket is left alone.
+/// Not undone when berth stops: like OrbStack, the last one started wins.
+fn link_docker_socket(target: &str, uid: u32) -> Result<()> {
+    let home = home_of(uid).context("no home directory for the helper's user")?;
+    let expected = home.join(".berth/run/docker.sock");
+    if Path::new(target) != expected {
+        bail!("refusing to link to {target}");
+    }
+    match std::fs::symlink_metadata(DEFAULT_DOCKER_SOCKET) {
+        Ok(meta) if !meta.file_type().is_symlink() => bail!("is not a symlink; leaving it alone"),
+        Ok(_) if std::fs::read_link(DEFAULT_DOCKER_SOCKET)? == expected => return Ok(()),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let tmp = format!("{DEFAULT_DOCKER_SOCKET}.berth-tmp");
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(&expected, &tmp)?;
+    std::fs::rename(&tmp, DEFAULT_DOCKER_SOCKET)?;
+    eprintln!("berth-helper: {DEFAULT_DOCKER_SOCKET} -> {}", expected.display());
+    Ok(())
+}
+
+fn home_of(uid: u32) -> Option<std::path::PathBuf> {
+    let pw = unsafe { libc::getpwuid(uid) };
+    if pw.is_null() {
+        return None;
+    }
+    let dir = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) };
+    Some(std::path::PathBuf::from(dir.to_string_lossy().into_owned()))
 }
 
 fn delete_route(route: &Route) {
@@ -318,15 +365,16 @@ fn parse_netstat_dest(dest: &str) -> Option<Cidr> {
     Some(Cidr { net: u32::from(Ipv4Addr::from(full)) & mask(len), len })
 }
 
-/// Ask the helper to make exactly `routes` active. None if it isn't installed.
-pub fn set_routes(routes: Vec<Route>) -> Option<Result<Reply>> {
+/// Ask the helper to make exactly `routes` active and, if given, point the
+/// default Docker socket at ours. None if the helper isn't installed.
+pub fn set_routes(routes: Vec<Route>, docker_socket: Option<String>) -> Option<Result<Reply>> {
     if !Path::new(SOCKET).exists() {
         return None;
     }
     Some((|| {
         let mut stream = UnixStream::connect(SOCKET)?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
-        writeln!(stream, "{}", serde_json::to_string(&SetRoutes { routes })?)?;
+        writeln!(stream, "{}", serde_json::to_string(&SetRoutes { routes, docker_socket })?)?;
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line)?;
         Ok(serde_json::from_str(&line)?)

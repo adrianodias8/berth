@@ -14,6 +14,7 @@ objc2-foundation = "0.3.2"
 objc2-virtualization = "0.3.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "signal"] }
 
 [workspace]
