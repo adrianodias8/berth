@@ -19,6 +19,7 @@ const AGENT: &[u8] = include_bytes!(env!("BERTH_AGENT"));
 /// Make sure everything the VM needs exists. Cheap when already provisioned.
 pub fn ensure(paths: &Paths) -> Result<()> {
     paths.create_dirs()?;
+    exclude_from_backups(paths);
     if !paths.disk().exists() {
         let raw = fetch_base_image(paths)?;
         create_disk(&raw, &paths.disk())?;
@@ -48,6 +49,23 @@ fn install_agent(paths: &Paths) -> Result<()> {
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
     fs::rename(&tmp, &dest)?;
     Ok(())
+}
+
+/// Keep the VM disk and image cache out of Time Machine: a large sparse disk
+/// image is rewritten constantly, and backing it up bloats (or, on HFS+
+/// destinations, breaks) backups. A "sticky" exclusion needs no root and
+/// follows the folder.
+fn exclude_from_backups(paths: &Paths) {
+    for dir in [paths.data(), paths.cache()] {
+        let excluded = Command::new("tmutil")
+            .arg("isexcluded")
+            .arg(&dir)
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("[Excluded]"));
+        if !excluded {
+            let _ = Command::new("tmutil").arg("addexclusion").arg(&dir).output();
+        }
+    }
 }
 
 /// Download, verify and unpack the Debian cloud image. Returns the raw disk path.
