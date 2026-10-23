@@ -32,6 +32,9 @@ pub struct Entry {
     pub subdomains_only: bool,
     pub ip: Ipv4Addr,
     pub container: String,
+    /// Claimed by a `dev.berth.domains` label (images can set labels too),
+    /// so it never takes a name berth itself gave another container.
+    pub from_label: bool,
 }
 
 #[derive(Default)]
@@ -76,7 +79,7 @@ impl Table {
                     && name.as_bytes()[name.len() - e.domain.len() - 1] == b'.';
                 exact || sub
             })
-            .max_by_key(|e| e.domain.len())
+            .max_by_key(|e| (e.domain.len(), !e.from_label))
             .map(|e| e.ip)
     }
 }
@@ -85,17 +88,38 @@ pub type Shared = Arc<RwLock<Table>>;
 
 static TABLE_REF: std::sync::OnceLock<Shared> = std::sync::OnceLock::new();
 
-/// Re-sync outside the Docker event stream (machines start and stop without
-/// Docker events).
+/// Syncs run one at a time: overlapping ones duplicate iptables rules and
+/// can apply a stale snapshot last.
+static SYNC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// A sync is queued; further requests until it starts are covered by it.
+static SYNC_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask for a sync soon. Requests that arrive while one is queued collapse
+/// into it, so a burst of events costs one sync.
 pub fn request_sync() {
-    if let Some(table) = TABLE_REF.get() {
-        let table = table.clone();
-        thread::spawn(move || {
-            if let Err(err) = sync(&table) {
-                eprintln!("berth-agent: domains: {err}");
-            }
-        });
+    use std::sync::atomic::Ordering::SeqCst;
+    let Some(table) = TABLE_REF.get() else { return };
+    if SYNC_PENDING.swap(true, SeqCst) {
+        return;
     }
+    let table = table.clone();
+    let spawned = thread::Builder::new().spawn(move || {
+        // Let the rest of a burst (create, connect, start) arrive.
+        thread::sleep(Duration::from_millis(100));
+        let _guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SYNC_PENDING.store(false, SeqCst);
+        if let Err(err) = sync_now(&table) {
+            eprintln!("berth-agent: domains: {err}");
+        }
+    });
+    if spawned.is_err() {
+        SYNC_PENDING.store(false, SeqCst);
+    }
+}
+
+fn sync(table: &Shared) -> io::Result<()> {
+    let _guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    sync_now(table)
 }
 
 /// Keep the table and the guest's addresses/NAT in step with Docker.
@@ -136,7 +160,9 @@ pub fn run(table: Shared) {
 }
 
 fn watch(table: &Shared, synced: &mut bool) -> io::Result<()> {
-    let filters = r#"{"type":["container","network"]}"#;
+    // Only events that change addresses: healthchecks and execs produce a
+    // stream of others (exec_start, health_status, ...).
+    let filters = r#"{"type":["container","network"],"event":["start","die","destroy","rename","connect","disconnect"]}"#;
     let mut events = docker::get(&format!("/events?filters={}", percent_encode(filters)))?;
     sync(table)?;
     *synced = true;
@@ -146,9 +172,7 @@ fn watch(table: &Shared, synced: &mut bool) -> io::Result<()> {
         if events.read_line(&mut line)? == 0 {
             return Err(io::Error::other("docker event stream ended"));
         }
-        // Events come in bursts (create, connect, start); settle briefly.
-        thread::sleep(Duration::from_millis(100));
-        sync(table)?;
+        request_sync();
     }
 }
 
@@ -218,15 +242,15 @@ fn pool(up: &Uplink) -> Vec<Ipv4Addr> {
         .collect()
 }
 
-fn names_for(c: &Container) -> Vec<(String, bool, bool)> {
+fn names_for(c: &Container) -> Vec<(String, bool, bool, bool)> {
     let mut names = Vec::new();
     if let Some(name) = c.name() {
-        names.push((format!("{}.{SUFFIX}", name.to_ascii_lowercase()), true, false));
+        names.push((format!("{}.{SUFFIX}", name.to_ascii_lowercase()), true, false, false));
     }
     if let (Some(service), Some(project)) =
         (c.labels.get("com.docker.compose.service"), c.labels.get("com.docker.compose.project"))
     {
-        names.push((format!("{service}.{project}.{SUFFIX}").to_ascii_lowercase(), true, false));
+        names.push((format!("{service}.{project}.{SUFFIX}").to_ascii_lowercase(), true, false, false));
     }
     for label in DOMAIN_LABELS {
         for domain in c.labels.get(label).into_iter().flat_map(|v| v.split(',')) {
@@ -238,14 +262,14 @@ fn names_for(c: &Container) -> Vec<(String, bool, bool)> {
                 None => (domain, false),
             };
             if domain.ends_with(".local") {
-                names.push((domain, false, subs));
+                names.push((domain, false, subs, true));
             }
         }
     }
     names
 }
 
-fn sync(table: &Shared) -> io::Result<()> {
+fn sync_now(table: &Shared) -> io::Result<()> {
     let up = uplink()?;
     let pool = pool(&up);
     let containers = docker::containers()?;
@@ -277,8 +301,8 @@ fn sync(table: &Shared) -> io::Result<()> {
         taken.insert(svc);
         mapping.insert(svc, target);
         services.insert(svc, Service { id: c.id.clone(), name: name.to_string(), ip: target });
-        for (domain, wildcard, subdomains_only) in names_for(c) {
-            entries.push(Entry { domain, wildcard, subdomains_only, ip: svc, container: name.to_string() });
+        for (domain, wildcard, subdomains_only, from_label) in names_for(c) {
+            entries.push(Entry { domain, wildcard, subdomains_only, ip: svc, container: name.to_string(), from_label });
         }
     }
 
@@ -297,6 +321,7 @@ fn sync(table: &Shared) -> io::Result<()> {
             subdomains_only: false,
             ip: svc,
             container: name,
+            from_label: false,
         });
     }
 
@@ -376,8 +401,19 @@ fn apply(up: &Uplink, mapping: &BTreeMap<Ipv4Addr, Ipv4Addr>) -> io::Result<()> 
     Ok(())
 }
 
+/// iptables waits for the xtables lock (dockerd holds it at times) instead
+/// of failing.
+fn command(cmd: &str, args: &[&str]) -> Command {
+    let mut c = Command::new(cmd);
+    if cmd == "iptables" {
+        c.arg("-w");
+    }
+    c.args(args);
+    c
+}
+
 fn exec(cmd: &str, args: &[&str]) -> bool {
-    match Command::new(cmd).args(args).output() {
+    match command(cmd, args).output() {
         Ok(out) if out.status.success() => true,
         Ok(out) => {
             eprintln!("berth-agent: {cmd} {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
@@ -391,7 +427,7 @@ fn exec(cmd: &str, args: &[&str]) -> bool {
 }
 
 fn exec_quiet(cmd: &str, args: &[&str]) -> bool {
-    Command::new(cmd).args(args).output().is_ok_and(|o| o.status.success())
+    command(cmd, args).output().is_ok_and(|o| o.status.success())
 }
 
 fn fnv(s: &str) -> u32 {
@@ -418,7 +454,16 @@ mod tests {
             subdomains_only,
             ip: Ipv4Addr::new(10, 0, 0, last),
             container: "c".into(),
+            from_label: false,
         }
+    }
+
+    #[test]
+    fn labels_dont_take_generated_names() {
+        let mut claim = entry("web.berth.local", false, false, 9);
+        claim.from_label = true;
+        let table = Table { entries: vec![entry("web.berth.local", true, false, 1), claim], ..Default::default() };
+        assert_eq!(table.lookup("web.berth.local"), Some(Ipv4Addr::new(10, 0, 0, 1)));
     }
 
     #[test]

@@ -239,12 +239,12 @@ Informed by OrbStack users' most-requested features (public issue tracker and
 discussions) and the limits above:
 
 - **berth's own file sharing as the default** (macOS 27): a virtio-fs server on
-  the new custom Virtio device API (`src/virtiofs.rs`, `src/fuse.rs`), today
-  behind `BERTH_EXPERIMENTAL_FS=1`. It beats Apple's share on reads (1.8x),
-  parallel work (1.5–2.3x) and large files, handles ownership like OrbStack,
-  and ties on single-process creates. Left: mounting it at the home path in
-  place of Apple's, wider testing, and fewer round trips per file to close the
-  remaining gap to OrbStack on writes
+  the new custom Virtio device API plus a polling guest driver, today behind
+  `BERTH_EXPERIMENTAL_FS=1` (`docs/file-sharing.md`). It matches OrbStack on
+  small-file extraction (2.3 s for 20k files, Apple's share 7.8 s) and handles
+  ownership like OrbStack. Left: path handling hardened against symlink races,
+  building and loading the module automatically, mounting it at the home path
+  in place of Apple's, and wider testing (`docs/KNOWN_ISSUES.md`)
 - **Machines**: snapshots, cloud-init / custom images
 - **Linux GUI apps**: first a console window (virtio-gpu 2D, clipboard via
   spice-vdagent), then per-app windows like WSLg (a compositor in the machine,
@@ -260,6 +260,19 @@ discussions) and the limits above:
   (Hypervisor.framework / libkrun); worth it only if it keeps Rosetta working
 - **Distribution**: signed and notarized releases with auto-update; data location
   setting
+
+## Documentation
+
+- `CONTRIBUTING.md`: setting up, the clean-room rule, layout, testing
+- `docs/LEARNINGS.md`: platform quirks, measurements and dead ends found so far
+- `docs/file-sharing.md`: berth's own file sharing and its polling guest driver
+- `docs/KNOWN_ISSUES.md`: open review findings
+- `bench/results/`: benchmark runs against OrbStack
+
+## License
+
+MIT (`LICENSE`), except the guest kernel module in `guest/kmod/`, which is
+derived from Linux and is GPL-2.0.
 
 ## Compatibility notes
 

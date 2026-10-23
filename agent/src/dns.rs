@@ -16,6 +16,9 @@ const TYPE_A: u16 = 1;
 const RCODE_NXDOMAIN: u16 = 3;
 const RCODE_SERVFAIL: u16 = 2;
 const TTL: u32 = 30;
+/// Relayed queries in flight at once; past this they get SERVFAIL, so a
+/// container flooding random names can't exhaust the agent's threads.
+const MAX_RELAYS: usize = 64;
 
 pub fn run(table: Shared) {
     let socket = loop {
@@ -28,21 +31,35 @@ pub fn run(table: Shared) {
             }
         }
     };
+    let relays = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut buf = [0u8; 4096];
     loop {
         let Ok((len, src)) = socket.recv_from(&mut buf) else { continue };
         let query = buf[..len].to_vec();
-        match answer_locally(&query, &table) {
-            Some(reply) => {
-                let _ = socket.send_to(&reply, src);
-            }
-            None => {
-                let socket = socket.try_clone().expect("clone dns socket");
-                std::thread::spawn(move || {
-                    let reply = relay(&query).unwrap_or_else(|_| error_reply(&query, RCODE_SERVFAIL));
-                    let _ = socket.send_to(&reply, src);
-                });
-            }
+        if len < 12 {
+            continue; // not even a header
+        }
+        if let Some(reply) = answer_locally(&query, &table) {
+            let _ = socket.send_to(&reply, src);
+            continue;
+        }
+        use std::sync::atomic::Ordering::SeqCst;
+        let spawned = (relays.fetch_add(1, SeqCst) < MAX_RELAYS)
+            .then(|| socket.try_clone().ok())
+            .flatten()
+            .and_then(|out| {
+                let (relays, query) = (relays.clone(), query.clone());
+                std::thread::Builder::new()
+                    .spawn(move || {
+                        let reply = relay(&query).unwrap_or_else(|_| error_reply(&query, RCODE_SERVFAIL));
+                        let _ = out.send_to(&reply, src);
+                        relays.fetch_sub(1, SeqCst);
+                    })
+                    .ok()
+            });
+        if spawned.is_none() {
+            relays.fetch_sub(1, SeqCst);
+            let _ = socket.send_to(&error_reply(&query, RCODE_SERVFAIL), src);
         }
     }
 }
@@ -54,7 +71,9 @@ fn answer_locally(query: &[u8], table: &Shared) -> Option<Vec<u8>> {
         return None;
     }
     let (name, end) = read_name(query, 12)?;
-    let qtype = u16::from_be_bytes([*query.get(end)?, *query.get(end + 1)?]);
+    // Type and class must both be there: `reply` copies the whole question.
+    let fixed = query.get(end..end + 4)?;
+    let qtype = u16::from_be_bytes([fixed[0], fixed[1]]);
     let name = name.to_ascii_lowercase();
     let ip = if HOST_NAMES.contains(&name.as_str()) {
         Some(HOST_IP)
@@ -95,7 +114,7 @@ fn reply(query: &[u8], question_end: usize, ip: Option<Ipv4Addr>) -> Vec<u8> {
 
 fn error_reply(query: &[u8], rcode: u16) -> Vec<u8> {
     let mut out = query.to_vec();
-    if out.len() >= 4 {
+    if out.len() >= 12 {
         out[2] = 0x80 | (out[2] & 0x01);
         out[3] = 0x80 | rcode as u8;
         // Keep the question, drop any answer/authority/additional counts.
@@ -158,6 +177,17 @@ mod tests {
         assert_eq!(r[3] & 0x0f, 0, "NOERROR");
         assert_eq!(&r[6..8], &[0, 1], "one answer");
         assert_eq!(&r[r.len() - 4..], &HOST_IP.octets());
+    }
+
+    #[test]
+    fn truncated_queries_dont_panic() {
+        let full = query("host.docker.internal", TYPE_A);
+        for len in 0..full.len() {
+            let _ = answer_locally(&full[..len], &table());
+            let _ = error_reply(&full[..len], RCODE_SERVFAIL);
+        }
+        // Missing the class field: not answered locally (relayed instead).
+        assert!(answer_locally(&full[..full.len() - 2], &table()).is_none());
     }
 
     #[test]

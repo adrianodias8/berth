@@ -237,27 +237,30 @@ pub fn serve(uid: u32) -> Result<()> {
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        if let Err(err) = handle(stream, uid, &mut installed.lock().unwrap()) {
+        if let Err(err) = handle(stream, uid, &installed) {
             eprintln!("berth-helper: {err:#}");
         }
     }
     Ok(())
 }
 
-fn handle(stream: UnixStream, uid: u32, installed: &mut BTreeSet<Route>) -> Result<()> {
+fn handle(stream: UnixStream, uid: u32, installed: &std::sync::Mutex<BTreeSet<Route>>) -> Result<()> {
     let (mut peer_uid, mut peer_gid) = (0, 0);
     if unsafe { libc::getpeereid(std::os::fd::AsRawFd::as_raw_fd(&stream), &mut peer_uid, &mut peer_gid) } != 0
         || (peer_uid != uid && peer_uid != 0)
     {
         bail!("rejected request from uid {peer_uid}");
     }
+    // A client that never finishes its line must not stall everyone else,
+    // nor the shutdown path, which needs the route lock taken below.
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     let mut line = String::new();
-    BufReader::new(&stream).read_line(&mut line)?;
+    std::io::Read::take(BufReader::new(&stream), 256 * 1024).read_line(&mut line)?;
     if let Ok(bind) = serde_json::from_str::<BindRequest>(&line) {
         return send_bound(&stream, &bind);
     }
     let request: SetRoutes = serde_json::from_str(&line)?;
-    let mut reply = reconcile(&request.routes, installed);
+    let mut reply = reconcile(&request.routes, &mut installed.lock().unwrap());
     if let Some(target) = &request.docker_socket
         && let Err(err) = link_docker_socket(target, uid)
     {
@@ -437,8 +440,6 @@ fn parse_netstat_dest(dest: &str) -> Option<Cidr> {
     Some(Cidr { net: u32::from(Ipv4Addr::from(full)) & mask(len), len })
 }
 
-/// Ask the helper to make exactly `routes` active and, if given, point the
-/// default Docker socket at ours. None if the helper isn't installed.
 /// A request for a listening socket on a privileged loopback port.
 #[derive(Serialize, Deserialize)]
 struct BindRequest {
@@ -469,7 +470,8 @@ fn send_bound(stream: &UnixStream, req: &BindRequest) -> Result<()> {
     };
     let mut byte = *b"\n";
     let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
-    let mut control = [0u8; 64];
+    // u64s: the control buffer is accessed as a cmsghdr, which must be aligned.
+    let mut control = [0u64; 8];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
@@ -490,7 +492,7 @@ fn send_bound(stream: &UnixStream, req: &BindRequest) -> Result<()> {
 }
 
 /// A socket bound by the helper on a privileged loopback port, for a port
-/// forward. The TCP one is bound but not yet listening.
+/// forward (a TCP one is already listening, with std's backlog).
 pub fn bind_privileged(bind: std::net::IpAddr, port: u16, udp: bool) -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::{AsRawFd, FromRawFd};
     if !Path::new(SOCKET).exists() {
@@ -501,20 +503,27 @@ pub fn bind_privileged(bind: std::net::IpAddr, port: u16, udp: bool) -> Result<s
     writeln!(stream, "{}", serde_json::to_string(&BindRequest { bind, port, udp })?)?;
     let mut buf = [0u8; 256];
     let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
-    let mut control = [0u8; 64];
+    let mut control = [0u64; 8];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len() as _;
+    msg.msg_controllen = std::mem::size_of_val(&control) as _;
     let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
     if n < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        if !cmsg.is_null() && (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+        if msg.msg_flags & libc::MSG_CTRUNC == 0
+            && !cmsg.is_null()
+            && (*cmsg).cmsg_level == libc::SOL_SOCKET
+            && (*cmsg).cmsg_type == libc::SCM_RIGHTS
+            && (*cmsg).cmsg_len as usize >= libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize
+        {
             let fd = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<i32>());
+            // macOS has no MSG_CMSG_CLOEXEC.
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             return Ok(std::os::fd::OwnedFd::from_raw_fd(fd));
         }
     }
@@ -522,6 +531,8 @@ pub fn bind_privileged(bind: std::net::IpAddr, port: u16, udp: bool) -> Result<s
     bail!("{}", text.trim().strip_prefix("error: ").unwrap_or("helper did not bind (outdated helper?)"))
 }
 
+/// Ask the helper to make exactly `routes` active and, if given, point the
+/// default Docker socket at ours. None if the helper isn't installed.
 pub fn set_routes(routes: Vec<Route>, docker_socket: Option<String>, cli_dir: Option<String>) -> Option<Result<Reply>> {
     if !Path::new(SOCKET).exists() {
         return None;

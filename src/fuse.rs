@@ -121,8 +121,13 @@ fn io_errno(e: &std::io::Error) -> i32 {
     e.raw_os_error().map_or(lerr::EIO, linux_errno)
 }
 
-/// Linux open(2) flags → macOS.
+/// Linux open(2) flags → macOS. The guest is arm64, whose O_DIRECTORY,
+/// O_NOFOLLOW, O_DIRECT and O_LARGEFILE differ from the generic values
+/// (arch/arm64/include/uapi/asm/fcntl.h); O_DIRECT and O_LARGEFILE have no
+/// macOS meaning and are dropped.
 fn mac_open_flags(linux: u32) -> i32 {
+    const O_DSYNC: u32 = 0o10000;
+    const O_SYNC: u32 = 0o4000000 | O_DSYNC;
     let mut flags = (linux & 3) as i32; // O_RDONLY/O_WRONLY/O_RDWR match
     for (l, m) in [
         (0o100, libc::O_CREAT),
@@ -130,12 +135,17 @@ fn mac_open_flags(linux: u32) -> i32 {
         (0o1000, libc::O_TRUNC),
         (0o2000, libc::O_APPEND),
         (0o4000, libc::O_NONBLOCK),
-        (0o200000, libc::O_DIRECTORY),
-        (0o400000, libc::O_NOFOLLOW),
+        (0o40000, libc::O_DIRECTORY),
+        (0o100000, libc::O_NOFOLLOW),
     ] {
         if linux & l != 0 {
             flags |= m;
         }
+    }
+    if linux & O_SYNC == O_SYNC {
+        flags |= libc::O_SYNC;
+    } else if linux & O_DSYNC != 0 {
+        flags |= libc::O_DSYNC;
     }
     flags | libc::O_CLOEXEC
 }
@@ -405,7 +415,7 @@ impl Server {
             // Nothing to flush (writes go straight to the file); ENOSYS makes
             // the kernel stop sending FLUSH on every close.
             op::FLUSH => Err(lerr::ENOSYS),
-            op::FSYNC => self.fsync(r.u64().unwrap_or(0)),
+            op::FSYNC => self.fsync(nodeid, r.u64().unwrap_or(0)),
             op::FSYNCDIR => Ok(Vec::new()),
             op::STATFS => self.statfs(),
             op::OPENDIR => self.opendir(nodeid),
@@ -491,6 +501,15 @@ impl Server {
     fn vanished(&self, nodeid: u64) -> bool {
         self.path(nodeid).is_err()
             || self.path(nodeid).is_ok_and(|p| fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound))
+    }
+
+    /// The node `ino` no longer has the name `path`.
+    fn forget_name(&self, ino: u64, path: &Path) {
+        if let Some(node) = self.nodes.lock().unwrap().get_mut(&ino)
+            && node.path == path
+        {
+            node.path = PathBuf::new();
+        }
     }
 
     /// The node's path and its cached open file, if any.
@@ -600,7 +619,13 @@ impl Server {
     }
 
     fn getattr(&self, nodeid: u64) -> Reply {
-        let m = fs::symlink_metadata(self.path(nodeid)?).map_err(|e| io_errno(&e))?;
+        // The open file when there is one: also right after the name was
+        // removed or replaced, while the guest still has it open.
+        let m = match self.path_and_file(nodeid)? {
+            (_, Some(file)) => file.metadata(),
+            (path, None) => fs::symlink_metadata(path),
+        }
+        .map_err(|e| io_errno(&e))?;
         Ok(self.attr_reply(nodeid, &m))
     }
 
@@ -727,20 +752,33 @@ impl Server {
 
     fn remove(&self, parent: u64, name: &[u8], dir: bool) -> Reply {
         let path = self.child(parent, name)?;
+        let ino = fs::symlink_metadata(&path).map(|m| m.ino()).ok();
         if dir { fs::remove_dir(&path) } else { fs::remove_file(&path) }.map_err(|e| io_errno(&e))?;
         crate::watch::guest_removed(&path);
+        // A removed file may still be open in the guest: keep its node (and
+        // open file) but never reopen the name, which may get a new file.
+        if let Some(ino) = ino {
+            self.forget_name(ino, &path);
+        }
         Ok(Vec::new())
     }
 
     fn rename(&self, olddir: u64, old: &[u8], newdir: u64, new: &[u8]) -> Reply {
         let (from, to) = (self.child(olddir, old)?, self.child(newdir, new)?);
+        let replaced = fs::symlink_metadata(&to).map(|m| m.ino()).ok();
         fs::rename(&from, &to).map_err(|e| io_errno(&e))?;
         crate::watch::guest_removed(&from);
         if let Ok(m) = fs::symlink_metadata(&to) {
             crate::watch::guest_wrote(&to, &m);
         }
+        // Whatever the new name replaced is now nameless: it must never be
+        // reopened by that path (it would be the moved file).
+        if let Some(ino) = replaced {
+            self.forget_name(ino, &to);
+        }
+        let mut nodes = self.nodes.lock().unwrap();
         // Path-keyed nodes under the old name move with it.
-        for node in self.nodes.lock().unwrap().values_mut() {
+        for node in nodes.values_mut() {
             if let Ok(rest) = node.path.strip_prefix(&from) {
                 node.path = if rest.as_os_str().is_empty() { to.clone() } else { to.join(rest) };
             }
@@ -833,6 +871,15 @@ impl Server {
         Ok(self.cache_file(nodeid, &path, file))
     }
 
+    /// Replace the node's cached file with one opened read-write.
+    fn reopen_writable(&self, nodeid: u64) -> Result<Arc<fs::File>, i32> {
+        let path = self.path(nodeid)?;
+        let file = Arc::new(Self::open_file(&path, 2, 0)?);
+        let old = self.nodes.lock().unwrap().get_mut(&nodeid).and_then(|n| n.file.replace(file.clone()));
+        drop(old);
+        Ok(file)
+    }
+
     /// Keep `file` as the node's open file, unless another thread got there
     /// first (then that one is returned), closing the oldest past the cap.
     fn cache_file(&self, nodeid: u64, path: &Path, file: Arc<fs::File>) -> Arc<fs::File> {
@@ -847,7 +894,8 @@ impl Server {
         let mut evicted = Vec::new();
         while cached.len() > MAX_CACHED_FILES {
             let Some(old) = cached.pop_front() else { break };
-            if let Some(f) = nodes.get_mut(&old).and_then(|n| n.file.take()) {
+            // A nameless node's file can't be reopened: keep it.
+            if let Some(f) = nodes.get_mut(&old).filter(|n| !n.path.as_os_str().is_empty()).and_then(|n| n.file.take()) {
                 evicted.push(f);
             }
         }
@@ -873,8 +921,16 @@ impl Server {
     }
 
     fn write(&self, nodeid: u64, fh: u64, offset: u64, data: &[u8]) -> Reply {
-        let f = self.file_for(nodeid, fh)?;
-        f.write_all_at(data, offset).map_err(|e| io_errno(&e))?;
+        let mut f = self.file_for(nodeid, fh)?;
+        if let Err(err) = f.write_all_at(data, offset) {
+            // The node's file was opened read-only (the file was read-only
+            // then, and has been made writable since): reopen it.
+            if fh != 0 || err.raw_os_error() != Some(libc::EBADF) {
+                return Err(io_errno(&err));
+            }
+            f = self.reopen_writable(nodeid)?;
+            f.write_all_at(data, offset).map_err(|e| io_errno(&e))?;
+        }
         if let (Ok(path), Ok(m)) = (self.path(nodeid), f.metadata()) {
             crate::watch::guest_wrote(&path, &m);
         }
@@ -883,10 +939,9 @@ impl Server {
         Ok(out.0)
     }
 
-    fn fsync(&self, fh: u64) -> Reply {
-        if let Some(f) = self.handle_file(fh) {
-            f.sync_data().map_err(|e| io_errno(&e))?;
-        }
+    fn fsync(&self, nodeid: u64, fh: u64) -> Reply {
+        // With no-open, fh is 0 and the data went through the node's file.
+        self.file_for(nodeid, fh)?.sync_data().map_err(|e| io_errno(&e))?;
         Ok(Vec::new())
     }
 
@@ -1263,6 +1318,44 @@ mod tests {
     }
 
     #[test]
+    fn replaced_and_removed_files_stay_themselves() {
+        let dir = tempdir("orphan");
+        fs::write(dir.join("config.json"), "old").unwrap();
+        fs::write(dir.join("tmp"), "new").unwrap();
+        let s = Server::new(dir.clone(), CachePolicy::default());
+        let mut init = Out::default();
+        init.u32(7).u32(41).u32(131072).u32(FUSE_NO_OPEN_SUPPORT);
+        reply(&s, op::INIT, 0, &init.0);
+        let node = |n: &str| {
+            let (_, body) = reply(&s, op::LOOKUP, FUSE_ROOT_ID, &name(n));
+            u64::from_le_bytes(body[0..8].try_into().unwrap())
+        };
+        let read = |nodeid: u64| {
+            let mut r = Out::default();
+            r.u64(0).u64(0).u32(100).u32(0).u64(0).u32(0).u32(0);
+            reply(&s, op::READ, nodeid, &r.0)
+        };
+        let old = node("config.json");
+        assert_eq!(read(old), (0, b"old".to_vec()), "opens and caches its file");
+        // Saving by rename over it: the old node keeps its own contents and
+        // never turns into the new file.
+        let mut rename = Out::default();
+        rename.u64(FUSE_ROOT_ID);
+        rename.0.extend_from_slice(&name("tmp"));
+        rename.0.extend_from_slice(&name("config.json"));
+        assert_eq!(reply(&s, op::RENAME, FUSE_ROOT_ID, &rename.0).0, 0);
+        assert_eq!(read(old), (0, b"old".to_vec()));
+        assert_eq!(reply(&s, op::GETATTR, old, &[0; 16]).0, 0, "fstat of the open file");
+        // Removed while open: still readable and syncable.
+        let new = node("config.json");
+        assert_eq!(read(new), (0, b"new".to_vec()));
+        assert_eq!(reply(&s, op::UNLINK, FUSE_ROOT_ID, &name("config.json")).0, 0);
+        assert_eq!(read(new), (0, b"new".to_vec()));
+        assert_eq!(reply(&s, op::FSYNC, new, &[0; 16]).0, 0);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn errno_and_flags_translate() {
         assert_eq!(linux_errno(libc::ENOENT), 2);
         assert_eq!(linux_errno(libc::ENOTEMPTY), 39);
@@ -1270,5 +1363,10 @@ mod tests {
         let f = mac_open_flags(0o2 | 0o100 | 0o1000);
         assert_eq!(f & libc::O_ACCMODE, libc::O_RDWR);
         assert!(f & libc::O_CREAT != 0 && f & libc::O_TRUNC != 0);
+        // arm64: O_LARGEFILE (always set on 64-bit) and O_DIRECT mean nothing
+        // on macOS; O_DIRECTORY and O_NOFOLLOW have arm64's values.
+        assert_eq!(mac_open_flags(0o400000 | 0o200000), libc::O_CLOEXEC);
+        assert!(mac_open_flags(0o40000) & libc::O_DIRECTORY != 0);
+        assert!(mac_open_flags(0o100000) & libc::O_NOFOLLOW != 0);
     }
 }

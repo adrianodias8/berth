@@ -43,9 +43,9 @@ fn ensure_tools() -> io::Result<()> {
 /// Docker's FORWARD policy is DROP; let machine traffic through.
 fn allow_forwarding() {
     for rule in [["-i", "ve-+"], ["-o", "ve-+"]] {
-        let check = Command::new("iptables").args(["-C", "DOCKER-USER", rule[0], rule[1], "-j", "ACCEPT"]).output();
+        let check = Command::new("iptables").args(["-w", "-C", "DOCKER-USER", rule[0], rule[1], "-j", "ACCEPT"]).output();
         if !check.is_ok_and(|o| o.status.success()) {
-            let _ = Command::new("iptables").args(["-I", "DOCKER-USER", rule[0], rule[1], "-j", "ACCEPT"]).output();
+            let _ = Command::new("iptables").args(["-w", "-I", "DOCKER-USER", rule[0], rule[1], "-j", "ACCEPT"]).output();
         }
     }
 }

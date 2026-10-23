@@ -104,7 +104,8 @@ fn install_nerdctl_wrapper(paths: &Paths) -> Result<()> {
     let installed = std::path::Path::new("/usr/local/bin/berth");
     let berth = if installed.exists() { installed.to_path_buf() } else { std::env::current_exe()? };
     let wrapper = bin.join("nerdctl");
-    fs::write(&wrapper, format!("#!/bin/sh\n# nerdctl runs in the berth VM.\nexec '{}' nerdctl \"$@\"\n", berth.display()))?;
+    let quoted = format!("'{}'", berth.to_string_lossy().replace('\'', "'\\''"));
+    fs::write(&wrapper, format!("#!/bin/sh\n# nerdctl runs in the berth VM.\nexec {quoted} nerdctl \"$@\"\n"))?;
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))?;
     Ok(())
 }

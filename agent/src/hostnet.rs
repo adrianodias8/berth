@@ -148,6 +148,10 @@ pub(crate) fn vsock_connect(cid: u32, port: u32) -> io::Result<OwnedFd> {
 }
 
 fn quiet(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(cmd).args(args).output().ok()?;
+    let mut c = Command::new(cmd);
+    if cmd == "iptables" {
+        c.arg("-w"); // wait for the xtables lock rather than fail
+    }
+    let out = c.args(args).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }

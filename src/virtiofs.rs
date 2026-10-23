@@ -282,6 +282,18 @@ define_class!(
     }
 );
 
+const LINUX_EIO: i32 = 5;
+const LINUX_ERANGE: i32 = 34;
+
+/// A FUSE reply carrying only an error (fuse_out_header).
+fn error_header(unique: u64, errno: i32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&(-errno).to_le_bytes());
+    out.extend_from_slice(&unique.to_le_bytes());
+    out
+}
+
 /// A request taken off a virtqueue, on its way to a worker and back.
 struct Job {
     element: Retained<VZVirtioQueueElement>,
@@ -296,6 +308,12 @@ impl Job {
     fn complete(self, reply: Option<Vec<u8>>, served: Duration) {
         if let Some(mut reply) = reply {
             let room = unsafe { self.element.writeBuffersByteCount() };
+            if reply.len() > room {
+                // The guest reads whatever header is in its buffer: say why
+                // instead of leaving it to look like success.
+                let unique = reply.get(8..16).map_or(0, |u| u64::from_le_bytes(u.try_into().unwrap()));
+                reply = error_header(unique, LINUX_ERANGE);
+            }
             if reply.len() <= room {
                 let _ = unsafe { self.element.writeBuffer_exactLength_error(reply.as_mut_ptr().cast(), reply.len()) };
             }
@@ -379,7 +397,7 @@ impl FsDevice {
             let read = unsafe { element.readBytesIntoBuffer_exactLength_error(request.as_mut_ptr().cast(), len) };
             let job = Job { element, started };
             if read.is_err() {
-                job.complete(None, Duration::ZERO);
+                job.complete(Some(error_header(0, LINUX_EIO)), Duration::ZERO);
                 next = unsafe { queue.nextElement() };
                 continue;
             }

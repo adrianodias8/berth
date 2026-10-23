@@ -160,13 +160,18 @@ final class Engine: ObservableObject {
 
     // MARK: VM lifecycle
 
+    /// `berth start` hasn't exited yet: until then no status just means booting.
+    private var startInFlight = false
+
     func start() {
         guard state != .starting, state != .running else { return }
         state = .starting
         lastError = nil
+        startInFlight = true
         Task.detached {
             let result = Self.run([BerthPaths.cli, "start"])
             await MainActor.run {
+                self.startInFlight = false
                 if result.code != 0 {
                     self.state = .failed(result.output.trimmingCharacters(in: .whitespacesAndNewlines))
                     self.lastError = result.output
@@ -179,7 +184,13 @@ final class Engine: ObservableObject {
         guard state == .running || state == .starting else { return }
         state = .stopping
         Task.detached {
-            _ = Self.run([BerthPaths.cli, "stop"])
+            let result = Self.run([BerthPaths.cli, "stop"])
+            guard result.code != 0 else { return }
+            await MainActor.run {
+                // Still up: leave "Stopping…" so the buttons work again.
+                self.lastError = result.output
+                self.state = self.status?.docker == true ? .running : .failed(result.output.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
         }
     }
 
@@ -215,6 +226,9 @@ final class Engine: ObservableObject {
         case (nil, .stopping), (nil, .running):
             state = .stopped
             clearLists()
+        case (nil, .starting) where !startInFlight:
+            // `berth start` returned but the daemon is gone.
+            state = .stopped
         case (let s?, _) where s.docker:
             if state != .running && state != .stopping {
                 state = .running

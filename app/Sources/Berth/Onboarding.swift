@@ -151,9 +151,14 @@ enum Setup {
     static func installPrivileged(force: Bool = false) -> OnboardingView.Step.State {
         if !force && privilegedDone { return .done }
         let cli = shellQuote(BerthPaths.cli)
-        let command = "SUDO_UID=\(getuid()) \(cli) helper install"
-            + " && mkdir -p /usr/local/bin && ln -sf \(cli) /usr/local/bin/berth"
-        let script = "do shell script \"\(command.replacingOccurrences(of: "\"", with: "\\\""))\" "
+        var command = "SUDO_UID=\(getuid()) \(cli) helper install"
+        // A dev build may already run from /usr/local/bin/berth: don't link it to itself.
+        if BerthPaths.cli != "/usr/local/bin/berth" {
+            command += " && mkdir -p /usr/local/bin && ln -sf \(cli) /usr/local/bin/berth"
+        }
+        // AppleScript string escaping: backslashes first, then quotes.
+        let escaped = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let script = "do shell script \"\(escaped)\" "
             + "with administrator privileges with prompt \"Berth needs to set up networking for containers.\""
         var error: NSDictionary?
         NSAppleScript(source: script)?.executeAndReturnError(&error)

@@ -89,7 +89,17 @@ fn raise_fd_limit() {
     let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
         // macOS rejects more than kern.maxfilesperproc, even when unlimited.
-        lim.rlim_cur = lim.rlim_max.min(65_536);
+        let mut per_proc: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        let name = c"kern.maxfilesperproc";
+        let max = if unsafe { libc::sysctlbyname(name.as_ptr(), (&mut per_proc as *mut libc::c_int).cast(), &mut size, std::ptr::null_mut(), 0) } == 0
+            && per_proc > 0
+        {
+            per_proc as libc::rlim_t
+        } else {
+            10_240
+        };
+        lim.rlim_cur = lim.rlim_max.min(max).min(65_536);
         unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
     }
 }
@@ -97,7 +107,15 @@ fn raise_fd_limit() {
 pub fn run(paths: Paths) -> Result<()> {
     paths.create_dirs()?;
     raise_fd_limit();
-    std::fs::write(paths.pid_file(), std::process::id().to_string())?;
+    // One daemon per data directory: a second would delete the first's
+    // sockets and boot the same disk. The lock lives as long as the process.
+    let pid_file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(paths.pid_file())?;
+    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&pid_file), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        anyhow::bail!("berth is already running");
+    }
+    pid_file.set_len(0)?;
+    std::io::Write::write_all(&mut &pid_file, std::process::id().to_string().as_bytes())?;
+    std::mem::forget(pid_file);
     for sock in [paths.control_socket(), paths.docker_socket(), paths.ssh_socket(), paths.podman_socket()] {
         let _ = std::fs::remove_file(sock);
     }
@@ -135,7 +153,7 @@ async fn serve(paths: Paths, cpus: usize, memory: u64) -> Result<()> {
     tokio::spawn(ports::run());
     tokio::spawn(crate::memory::run(memory));
     tokio::spawn(crate::routes::run_periodic());
-    tokio::spawn(serve_host_connections());
+    tokio::spawn(serve_host_connections(memory));
 
     let cleanup_paths = Paths::new();
     tokio::spawn(async move {
@@ -263,12 +281,11 @@ fn bridge(listener: UnixListener, target: &'static str, name: &'static str) {
 ///                               balloon now (memory.rs)
 ///   sync                        containers changed outside Docker's event
 ///                               stream (nerdctl): re-sync port forwarding
-async fn serve_host_connections() {
+async fn serve_host_connections(max_memory: u64) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     if vm::INCOMING.set(tx).is_err() {
         return;
     }
-    let max_memory = vm::Resources::load(&Paths::new()).memory;
     let tls = match crate::tls::Authority::load_or_create(&Paths::new()).and_then(|ca| Arc::new(ca).acceptor()) {
         Ok(acceptor) => Some(acceptor),
         Err(err) => {
@@ -294,14 +311,19 @@ async fn host_connection(fd: std::os::fd::OwnedFd, tls: Option<tokio_rustls::Tls
     let mut guest = UnixStream::from_std(std)?;
     // Byte at a time: whatever follows the header (e.g. a TLS ClientHello)
     // must stay in the stream.
+    // Anything in the VM can connect here: don't let idle connections pile up.
     let mut header = Vec::new();
-    loop {
-        let byte = guest.read_u8().await?;
-        if byte == b'\n' || header.len() > 256 {
-            break;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let byte = guest.read_u8().await?;
+            if byte == b'\n' || header.len() > 256 {
+                break;
+            }
+            header.push(byte);
         }
-        header.push(byte);
-    }
+        anyhow::Ok(())
+    })
+    .await??;
     let header = String::from_utf8_lossy(&header).into_owned();
     let parts: Vec<&str> = header.split_whitespace().collect();
     match parts.as_slice() {
@@ -321,7 +343,9 @@ async fn host_connection(fd: std::os::fd::OwnedFd, tls: Option<tokio_rustls::Tls
             let tls = tls.ok_or_else(|| anyhow::anyhow!("TLS unavailable"))?;
             // Failed handshakes (e.g. a non-.local name, for which we never
             // issue) are the client's problem, not worth logging.
-            let Ok(mut client) = tls.accept(guest).await else { return Ok(()) };
+            let Ok(Ok(mut client)) = tokio::time::timeout(Duration::from_secs(10), tls.accept(guest)).await else {
+                return Ok(());
+            };
             let upstream = if port == 0 { None } else { guest_stream(&format!("tcp {ip}:{port}")).await.ok() };
             match upstream {
                 Some(mut upstream) => {

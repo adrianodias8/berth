@@ -127,15 +127,54 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
 /// attributes. Missing paths (deleted on the Mac) are skipped; the host also
 /// sends their parent directory.
 fn touch_paths(mut host: UnixStream) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     let mut list = String::new();
     host.read_to_string(&mut list)?;
     for path in list.lines().filter(|l| !l.is_empty()) {
-        if let Ok(meta) = std::fs::symlink_metadata(path)
-            && !meta.file_type().is_symlink()
-        {
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(meta.permissions().mode()));
-        }
+        let _ = touch(path);
+    }
+    Ok(())
+}
+
+/// chmod `path` to its current mode. We run as root and containers can
+/// change what's under a bind mount, so the path is opened refusing symlinks
+/// in any component (a swapped-in link to /etc/shadow can't be chmodded),
+/// and the mode is read and set through that one handle.
+fn touch(path: &str) -> io::Result<()> {
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    let c = std::ffi::CString::new(path).map_err(io::Error::other)?;
+    let how = OpenHow { flags: (libc::O_PATH | libc::O_CLOEXEC) as u64, mode: 0, resolve: RESOLVE_NO_SYMLINKS };
+    let fd = unsafe { libc::syscall(libc::SYS_openat2, libc::AT_FDCWD, c.as_ptr(), &how, std::mem::size_of::<OpenHow>()) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // An O_PATH handle can't fchmod; its /proc/self/fd entry can be chmodded.
+    let proc = std::ffi::CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(io::Error::other)?;
+    let mode = st.st_mode & 0o7777;
+    if unsafe { libc::chmod(proc.as_ptr(), mode) } == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::ESTALE) {
+        return Err(err);
+    }
+    // Removed on the Mac behind a cached entry (berth's own share answers
+    // ESTALE). By path, the kernel retries with a fresh lookup and drops
+    // what it cached, which is the point of the touch; still no following a
+    // symlink at the end (fchmodat2, Linux 6.6+).
+    const SYS_FCHMODAT2: libc::c_long = 452;
+    if unsafe { libc::syscall(SYS_FCHMODAT2, libc::AT_FDCWD, c.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }

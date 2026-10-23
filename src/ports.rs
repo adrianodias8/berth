@@ -269,7 +269,11 @@ async fn forward_udp(socket: tokio::net::UdpSocket, port: u16) {
     let mut sessions: HashMap<SocketAddr, Session> = HashMap::new();
     let mut buf = vec![0u8; 65536];
     loop {
-        let Ok((n, client)) = socket.recv_from(&mut buf).await else { continue };
+        let Ok((n, client)) = socket.recv_from(&mut buf).await else {
+            // Don't spin on a persistent error.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            continue;
+        };
         sessions.retain(|_, (_, last, _)| last.lock().unwrap().elapsed() < IDLE);
         let session = match sessions.get(&client) {
             Some((upstream, last, _)) => {
@@ -310,14 +314,23 @@ async fn forward_udp(socket: tokio::net::UdpSocket, port: u16) {
 async fn forward(listener: TcpListener, port: u16, direct: bool) {
     let target = format!("tcp 127.0.0.1:{port}");
     loop {
-        let Ok((mut client, _)) = listener.accept().await else { continue };
+        let (mut client, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                // Out of descriptors, typically: back off instead of spinning.
+                eprintln!("ports: {port}: accept: {err}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let target = target.clone();
         tokio::spawn(async move {
             let _ = client.set_nodelay(true);
             let result = async {
                 let guest_ip = if direct { *crate::routes::GUEST_IP.lock().unwrap() } else { None };
                 if let Some(ip) = guest_ip
-                    && let Ok(mut guest) = tokio::net::TcpStream::connect((ip, port)).await
+                    && let Ok(Ok(mut guest)) =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect((ip, port))).await
                 {
                     guest.set_nodelay(true)?;
                     tokio::io::copy_bidirectional_with_sizes(&mut client, &mut guest, crate::BUF, crate::BUF).await?;

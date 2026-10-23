@@ -148,11 +148,16 @@ async fn forward(mut rx: mpsc::UnboundedReceiver<Vec<PathBuf>>) {
             batch.extend(more);
         }
         GUEST_CHANGES.lock().unwrap().retain(|_, (_, t)| t.elapsed() < ECHO_WINDOW);
-        let paths: Vec<String> = changed(&mut seen, batch)
-            .into_iter()
-            .take(MAX_PATHS)
-            .filter_map(|p| p.to_str().map(str::to_string))
-            .collect();
+        let mut changed = changed(&mut seen, batch);
+        if changed.len() > MAX_PATHS {
+            // Directories first: their touch makes watchers rescan. What's
+            // cut wasn't sent, so it mustn't count as seen.
+            changed.sort_by_key(|p| !p.is_dir());
+            for p in changed.drain(MAX_PATHS..) {
+                seen.remove(&p);
+            }
+        }
+        let paths: Vec<String> = changed.into_iter().filter_map(|p| p.to_str().map(str::to_string)).collect();
         if paths.is_empty() {
             continue;
         }

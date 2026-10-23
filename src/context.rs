@@ -55,11 +55,15 @@ pub fn use_berth(paths: &Paths) -> Result<()> {
 /// Replace via rename so a crash never leaves a half-written file. Keeps the
 /// existing file's permissions (config.json can hold credentials).
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mode = fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o777);
     let tmp = path.with_extension("berth-tmp");
-    fs::write(&tmp, contents)?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+    let _ = fs::remove_file(&tmp);
+    // Created with the final mode: never briefly readable by others.
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
+    file.write_all(contents)?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?; // in case umask trimmed it
     fs::rename(&tmp, path)?;
     Ok(())
 }

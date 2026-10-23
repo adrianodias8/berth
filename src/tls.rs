@@ -1,9 +1,10 @@
 //! HTTPS for container domains: a local CA and on-demand leaf certificates.
 //!
 //! The CA lives in ~/.berth/tls and is trusted once in the login keychain
-//! (`berth tls trust`). It carries a name constraint limiting it to `.local`
-//! names, and we only ever issue for `.local` names, so the trusted key can't
-//! be used to impersonate real sites even if it leaked.
+//! (`berth tls trust`). Its name constraints permit only `.local` DNS names
+//! and exclude every IP address (a constraint on one name type doesn't limit
+//! the others), and we only ever issue for `.local` names, so the trusted key
+//! can't be used to impersonate real sites even if it leaked.
 
 use std::collections::HashMap;
 use std::fs;
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose, NameConstraints,
+    CidrSubnet, KeyUsagePurpose, NameConstraints,
 };
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -25,6 +26,11 @@ use time::OffsetDateTime;
 use crate::paths::Paths;
 
 const CA_NAME: &str = "berth local CA";
+/// Bumped when the CA's constraints change; an older CA is replaced (and
+/// re-trusted) by `berth tls trust`. 2: IP addresses excluded.
+const CA_VERSION: &str = "2";
+/// Leaf certificates kept; each distinct name costs a key generation.
+const MAX_LEAVES: usize = 1024;
 /// Leaf lifetime; reissued well before expiry by the cache below.
 const LEAF_DAYS: i64 = 30;
 const LEAF_REISSUE: Duration = Duration::from_secs(20 * 24 * 3600);
@@ -52,13 +58,25 @@ fn ca_params() -> Result<CertificateParams> {
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign, KeyUsagePurpose::DigitalSignature];
     params.name_constraints = Some(NameConstraints {
         permitted_subtrees: vec![GeneralSubtree::DnsName("local".into())],
-        excluded_subtrees: vec![],
+        excluded_subtrees: vec![
+            GeneralSubtree::IpAddress(CidrSubnet::from_v4_prefix([0; 4], 0)),
+            GeneralSubtree::IpAddress(CidrSubnet::from_v6_prefix([0; 16], 0)),
+        ],
     });
     Ok(params)
 }
 
 pub fn ca_cert_path(paths: &Paths) -> std::path::PathBuf {
     paths.root.join("tls/ca.crt")
+}
+
+fn ca_version_path(paths: &Paths) -> std::path::PathBuf {
+    paths.root.join("tls/ca.version")
+}
+
+/// The CA on disk predates the current constraints.
+fn is_outdated(paths: &Paths) -> bool {
+    ca_cert_path(paths).exists() && fs::read_to_string(ca_version_path(paths)).ok().as_deref() != Some(CA_VERSION)
 }
 
 impl Authority {
@@ -75,6 +93,7 @@ impl Authority {
             let cert = params.self_signed(&key)?;
             write_private(&key_path, key.serialize_pem().as_bytes())?;
             fs::write(&cert_path, cert.pem())?;
+            fs::write(ca_version_path(paths), CA_VERSION)?;
             eprintln!("tls: created local CA at {}", cert_path.display());
         }
         let key = KeyPair::from_pem(&fs::read_to_string(&key_path)?).context("reading CA key")?;
@@ -113,7 +132,13 @@ impl Authority {
             key.serialize_der(),
         )))?;
         let certified = Arc::new(CertifiedKey::new(vec![cert.der().clone(), self.ca_der.clone()], signing));
-        self.leaves.lock().unwrap().insert(name.to_string(), (Instant::now(), certified.clone()));
+        let mut leaves = self.leaves.lock().unwrap();
+        if leaves.len() >= MAX_LEAVES
+            && let Some(oldest) = leaves.iter().min_by_key(|(_, (t, _))| *t).map(|(k, _)| k.clone())
+        {
+            leaves.remove(&oldest);
+        }
+        leaves.insert(name.to_string(), (Instant::now(), certified.clone()));
         Ok(certified)
     }
 }
@@ -128,11 +153,15 @@ impl ResolvesServerCert for Authority {
     }
 }
 
-/// Only `<something>.local` names, the same restriction the CA itself carries.
+/// Only `<something>.local` names, the same restriction the CA itself
+/// carries; `*` only as a whole leftmost label.
 fn is_local_name(name: &str) -> bool {
     name.len() > ".local".len()
         && name.ends_with(".local")
-        && name.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'*'))
+        && name.split('.').enumerate().all(|(i, l)| {
+            (i == 0 && l == "*") || (!l.is_empty() && l.len() <= 63 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+        })
+        && name != "*.local"
 }
 
 fn write_private(path: &std::path::Path, contents: &[u8]) -> Result<()> {
@@ -154,6 +183,11 @@ fn login_keychain(paths: &Paths) -> String {
 /// this: it also demands Certificate Transparency, which only applies to
 /// publicly trusted CAs, so it fails even when browsers accept our certs.)
 pub fn is_trusted(paths: &Paths) -> bool {
+    // An outdated CA counts as untrusted, so the app offers to trust again,
+    // which replaces it.
+    if is_outdated(paths) {
+        return false;
+    }
     let cert = ca_cert_path(paths);
     let Ok(ours) = Command::new("openssl").args(["x509", "-noout", "-fingerprint", "-sha1", "-in"]).arg(&cert).output() else {
         return false;
@@ -182,6 +216,13 @@ pub fn is_trusted(paths: &Paths) -> bool {
 }
 
 pub fn trust(paths: &Paths) -> Result<()> {
+    if is_outdated(paths) {
+        println!("Replacing the berth CA with one that is also barred from IP addresses.");
+        remove_from_keychain(paths);
+        for file in ["ca.crt", "ca.key", "ca.version"] {
+            let _ = fs::remove_file(paths.root.join("tls").join(file));
+        }
+    }
     // Make sure the CA exists even if berth hasn't served HTTPS yet.
     Authority::load_or_create(paths)?;
     let cert = ca_cert_path(paths);
@@ -198,13 +239,17 @@ pub fn trust(paths: &Paths) -> Result<()> {
 }
 
 pub fn untrust(paths: &Paths) -> Result<()> {
+    remove_from_keychain(paths);
+    println!("Removed trust for the berth CA.");
+    Ok(())
+}
+
+fn remove_from_keychain(paths: &Paths) {
     let cert = ca_cert_path(paths);
     let _ = Command::new("security").args(["remove-trusted-cert"]).arg(&cert).status();
     let _ = Command::new("security")
         .args(["delete-certificate", "-c", CA_NAME, &login_keychain(paths)])
         .status();
-    println!("Removed trust for the berth CA.");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -220,6 +265,10 @@ mod tests {
         assert!(!is_local_name("google.com"));
         assert!(!is_local_name("evil.local.example.com"));
         assert!(!is_local_name("a..local"));
+        assert!(is_local_name("*.web.berth.local"));
+        assert!(!is_local_name("a*b.berth.local"));
+        assert!(!is_local_name("web.*.local"));
+        assert!(!is_local_name("*.local"));
     }
 
     #[test]
