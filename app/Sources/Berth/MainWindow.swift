@@ -164,7 +164,7 @@ struct ContainersView: View {
         HStack(spacing: 0) {
             List(selection: $selection) {
                 if engine.containers.isEmpty {
-                    EmptyHint(icon: "shippingbox", text: "No containers yet.\nRun one with: docker --context berth run -d -p 8080:80 nginx")
+                    EmptyHint(icon: "shippingbox", text: "No containers yet.\nTry: docker run -d -p 8080:80 nginx")
                 }
                 ForEach(groups, id: \.project) { group in
                     if let project = group.project {

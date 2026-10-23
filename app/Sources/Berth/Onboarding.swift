@@ -142,8 +142,14 @@ enum Setup {
     /// One administrator prompt: the route/socket helper and the `berth` CLI
     /// link in /usr/local/bin. NSAppleScript runs on the main thread; the
     /// prompt is modal anyway.
+    /// The helper is installed and `berth` is on PATH: nothing to ask for.
+    static var privilegedDone: Bool {
+        helperInstalled && FileManager.default.fileExists(atPath: "/usr/local/bin/berth")
+    }
+
     @MainActor
-    static func installPrivileged() -> OnboardingView.Step.State {
+    static func installPrivileged(force: Bool = false) -> OnboardingView.Step.State {
+        if !force && privilegedDone { return .done }
         let cli = shellQuote(BerthPaths.cli)
         let command = "SUDO_UID=\(getuid()) \(cli) helper install"
             + " && mkdir -p /usr/local/bin && ln -sf \(cli) /usr/local/bin/berth"

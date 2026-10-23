@@ -143,7 +143,7 @@ struct SettingsView: View {
 
     private func installHelper() {
         helperMessage = "Waiting for authorization…"
-        switch Setup.installPrivileged() {
+        switch Setup.installPrivileged(force: true) {
         case .done: helperMessage = "Installed."
         case .skipped: helperMessage = nil
         case let .failed(message): helperMessage = message
