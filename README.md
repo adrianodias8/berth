@@ -3,6 +3,14 @@
 A free, open-source way to run Docker containers on Apple Silicon Macs, in the
 spirit of OrbStack. Written in Rust on top of Apple's Virtualization.framework.
 
+## Why
+
+berth is highly inspired by DHH's talk about rewriting any app with AI and Rust.
+OrbStack is a great piece of software, but it's closed source, so I wanted to see
+how far an open-source take on the same idea could go: built with AI assistance,
+written in Rust, and matching OrbStack's behavior from the outside rather than
+from its code.
+
 ## Features
 
 **Engine**
