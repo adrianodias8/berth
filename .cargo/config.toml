@@ -1,0 +1,6 @@
+[target.aarch64-apple-darwin]
+runner = "scripts/sign.sh"
+
+# The guest agent is a static Linux binary, linked with Rust's bundled lld.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"

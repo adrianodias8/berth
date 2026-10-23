@@ -1,0 +1,301 @@
+//! Virtualization.framework glue. The VM lives on the main dispatch queue, so
+//! everything that touches it is funneled through `on_main`.
+
+use std::fs;
+use std::os::fd::{FromRawFd, OwnedFd};
+use std::sync::Mutex;
+
+use anyhow::{Context, Result, anyhow, bail};
+use block2::RcBlock;
+use dispatch2::DispatchQueue;
+use objc2::rc::Retained;
+use objc2::AllocAnyThread;
+use objc2_foundation::{NSArray, NSData, NSError, NSFileHandle, NSString, NSURL};
+use objc2_virtualization::*;
+use tokio::sync::oneshot;
+
+use crate::paths::Paths;
+
+/// Guest vsock port of berth-agent (agent/src/main.rs).
+pub const AGENT_VSOCK_PORT: u32 = 2400;
+
+/// The VM, touched only from blocks on the main queue. Not a thread_local:
+/// after `dispatch_main()` the main queue is drained by a worker thread.
+struct MainQueueVm(Retained<VZVirtualMachine>);
+unsafe impl Send for MainQueueVm {}
+static VM: Mutex<Option<MainQueueVm>> = Mutex::new(None);
+
+pub struct Resources {
+    pub cpus: usize,
+    pub memory: u64,
+}
+
+impl Resources {
+    pub fn default_for_host() -> Self {
+        let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let host_memory = host_memory_bytes();
+        // Half of host RAM, capped at 16 GiB. The balloon device lets the guest
+        // hand pages back, so this is a ceiling rather than a reservation.
+        let memory = (host_memory / 2).clamp(2 << 30, 16 << 30);
+        Self { cpus, memory }
+    }
+}
+
+fn host_memory_bytes() -> u64 {
+    let mut value: u64 = 0;
+    let mut len = size_of::<u64>();
+    let name = c"hw.memsize";
+    unsafe {
+        libc::sysctlbyname(name.as_ptr(), (&raw mut value).cast(), &mut len, std::ptr::null_mut(), 0);
+    }
+    value
+}
+
+fn file_url(path: &std::path::Path) -> Retained<NSURL> {
+    NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()))
+}
+
+fn ns_error(err: &NSError) -> anyhow::Error {
+    anyhow!("{}", err.localizedDescription())
+}
+
+/// Build and validate the VM configuration. Must run on the main thread.
+fn build_config(paths: &Paths, res: &Resources) -> Result<Retained<VZVirtualMachineConfiguration>> {
+    unsafe {
+        let config = VZVirtualMachineConfiguration::new();
+        config.setCPUCount(res.cpus);
+        config.setMemorySize(res.memory);
+
+        // Platform with a stable machine identifier so the guest sees the same
+        // hardware across boots.
+        let platform = VZGenericPlatformConfiguration::new();
+        let machine_id = fs::read(paths.machine_id())
+            .ok()
+            .and_then(|bytes| {
+                VZGenericMachineIdentifier::initWithDataRepresentation(
+                    VZGenericMachineIdentifier::alloc(),
+                    &NSData::with_bytes(&bytes),
+                )
+            })
+            .unwrap_or_else(|| {
+                let id = VZGenericMachineIdentifier::new();
+                fs::write(paths.machine_id(), id.dataRepresentation().to_vec()).ok();
+                id
+            });
+        platform.setMachineIdentifier(&machine_id);
+        config.setPlatform(&platform);
+
+        // EFI boot through the image's own GRUB.
+        let vars_url = file_url(&paths.efi_vars());
+        let vars = if paths.efi_vars().exists() {
+            VZEFIVariableStore::initWithURL(VZEFIVariableStore::alloc(), &vars_url)
+        } else {
+            VZEFIVariableStore::initCreatingVariableStoreAtURL_options_error(
+                VZEFIVariableStore::alloc(),
+                &vars_url,
+                VZEFIVariableStoreInitializationOptions::empty(),
+            )
+            .map_err(|e| ns_error(&e))
+            .context("creating EFI variable store")?
+        };
+        let boot = VZEFIBootLoader::new();
+        boot.setVariableStore(Some(&vars));
+        config.setBootLoader(Some(&boot));
+
+        // Root disk, then the cloud-init seed (read-only).
+        let disk = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
+            VZDiskImageStorageDeviceAttachment::alloc(),
+            &file_url(&paths.disk()),
+            false,
+            VZDiskImageCachingMode::Cached,
+            VZDiskImageSynchronizationMode::Fsync,
+        )
+        .map_err(|e| ns_error(&e))
+        .context("attaching data disk")?;
+        let seed = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+            VZDiskImageStorageDeviceAttachment::alloc(),
+            &file_url(&paths.seed_iso()),
+            true,
+        )
+        .map_err(|e| ns_error(&e))
+        .context("attaching seed ISO")?;
+        let storage = [disk, seed].map(|attachment| {
+            Retained::into_super(VZVirtioBlockDeviceConfiguration::initWithAttachment(
+                VZVirtioBlockDeviceConfiguration::alloc(),
+                &attachment,
+            ))
+        });
+        config.setStorageDevices(&NSArray::from_retained_slice(&storage));
+
+        // NAT networking with a persistent MAC so the DHCP lease stays put.
+        let mac = fs::read_to_string(paths.mac_address())
+            .ok()
+            .and_then(|s| VZMACAddress::initWithString(VZMACAddress::alloc(), &NSString::from_str(s.trim())))
+            .unwrap_or_else(|| {
+                let mac = VZMACAddress::randomLocallyAdministeredAddress();
+                fs::write(paths.mac_address(), mac.string().to_string()).ok();
+                mac
+            });
+        let net = VZVirtioNetworkDeviceConfiguration::new();
+        net.setMACAddress(&mac);
+        net.setAttachment(Some(&VZNATNetworkDeviceAttachment::new()));
+        config.setNetworkDevices(&NSArray::from_retained_slice(&[Retained::into_super(net)]));
+
+        // Shared directories: the macOS home directory and, if available, Rosetta.
+        let home = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+            VZVirtioFileSystemDeviceConfiguration::alloc(),
+            &NSString::from_str("home"),
+        );
+        let home_dir = VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &file_url(&paths.home), false);
+        let home_share = VZSingleDirectoryShare::initWithDirectory(VZSingleDirectoryShare::alloc(), &home_dir);
+        home.setShare(Some(&home_share));
+        let mut shares = vec![Retained::into_super(home)];
+        if VZLinuxRosettaDirectoryShare::availability() == VZLinuxRosettaAvailability::Installed {
+            let rosetta = VZLinuxRosettaDirectoryShare::initWithError(VZLinuxRosettaDirectoryShare::alloc())
+                .map_err(|e| ns_error(&e))
+                .context("creating Rosetta share")?;
+            let dev = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                VZVirtioFileSystemDeviceConfiguration::alloc(),
+                &NSString::from_str("rosetta"),
+            );
+            dev.setShare(Some(&rosetta));
+            shares.push(Retained::into_super(dev));
+        } else {
+            eprintln!("Rosetta is not installed; x86-64 images will not run. Install it with `softwareupdate --install-rosetta`.");
+        }
+        config.setDirectorySharingDevices(&NSArray::from_retained_slice(&shares));
+
+        // Guest console goes to a log file for debugging.
+        let console_fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+        let log_path = std::ffi::CString::new(paths.console_log().to_string_lossy().as_bytes())?;
+        let log_fd = libc::open(log_path.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND, 0o644);
+        if log_fd < 0 || console_fd < 0 {
+            bail!("opening console log: {}", std::io::Error::last_os_error());
+        }
+        let serial_attachment = VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+            VZFileHandleSerialPortAttachment::alloc(),
+            Some(&NSFileHandle::initWithFileDescriptor_closeOnDealloc(NSFileHandle::alloc(), console_fd, true)),
+            Some(&NSFileHandle::initWithFileDescriptor_closeOnDealloc(NSFileHandle::alloc(), log_fd, true)),
+        );
+        let serial = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+        serial.setAttachment(Some(&serial_attachment));
+        config.setSerialPorts(&NSArray::from_retained_slice(&[Retained::into_super(serial)]));
+
+        config.setSocketDevices(&NSArray::from_retained_slice(&[Retained::into_super(
+            VZVirtioSocketDeviceConfiguration::new(),
+        )]));
+        config.setEntropyDevices(&NSArray::from_retained_slice(&[Retained::into_super(
+            VZVirtioEntropyDeviceConfiguration::new(),
+        )]));
+        config.setMemoryBalloonDevices(&NSArray::from_retained_slice(&[Retained::into_super(
+            VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new(),
+        )]));
+
+        config.validateWithError().map_err(|e| ns_error(&e)).context("invalid VM configuration")?;
+        Ok(config)
+    }
+}
+
+/// Create the VM and start it. Must run on the main thread before the main
+/// queue starts draining; `on_started` is called on the main queue.
+pub fn create_and_start(paths: &Paths, res: &Resources, on_started: impl Fn(Result<()>) + 'static) -> Result<()> {
+    let config = build_config(paths, res)?;
+    let vm = unsafe { VZVirtualMachine::initWithConfiguration(VZVirtualMachine::alloc(), &config) };
+    let handler = RcBlock::new(move |err: *mut NSError| {
+        on_started(match unsafe { err.as_ref() } {
+            None => Ok(()),
+            Some(err) => Err(ns_error(err)),
+        })
+    });
+    unsafe { vm.startWithCompletionHandler(&handler) };
+    *VM.lock().unwrap() = Some(MainQueueVm(vm));
+    Ok(())
+}
+
+/// Run `f` with the VM on the main queue and return its result.
+pub async fn on_main<T: Send + 'static>(f: impl FnOnce(&VZVirtualMachine) -> T + Send + 'static) -> Result<T> {
+    let (tx, rx) = oneshot::channel();
+    DispatchQueue::main().exec_async(move || {
+        let result = VM.lock().unwrap().as_ref().map(|vm| f(&vm.0));
+        let _ = tx.send(result);
+    });
+    rx.await?.context("VM not created")
+}
+
+pub fn state_name(state: VZVirtualMachineState) -> &'static str {
+    match state {
+        VZVirtualMachineState::Stopped => "stopped",
+        VZVirtualMachineState::Running => "running",
+        VZVirtualMachineState::Paused => "paused",
+        VZVirtualMachineState::Error => "error",
+        VZVirtualMachineState::Starting => "starting",
+        VZVirtualMachineState::Stopping => "stopping",
+        _ => "busy",
+    }
+}
+
+pub async fn state() -> Result<VZVirtualMachineState> {
+    on_main(|vm| unsafe { vm.state() }).await
+}
+
+/// Ask the guest to shut down (ACPI-style power button).
+pub async fn request_stop() -> Result<()> {
+    on_main(|vm| unsafe { vm.requestStopWithError() }.map_err(|e| ns_error(&e).to_string()))
+        .await?
+        .map_err(|e| anyhow!(e))
+}
+
+/// Hard stop, for when the guest ignores the stop request.
+pub async fn force_stop() -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    let tx = Mutex::new(Some(tx));
+    on_main(move |vm| {
+        let handler = RcBlock::new(move |err: *mut NSError| {
+            let result = unsafe { err.as_ref() }.map_or(Ok(()), |e| Err(ns_error(e).to_string()));
+            if let Some(tx) = tx.lock().unwrap().take() {
+                let _ = tx.send(result);
+            }
+        });
+        unsafe { vm.stopWithCompletionHandler(&handler) };
+    })
+    .await?;
+    rx.await?.map_err(|e| anyhow!(e))
+}
+
+/// Open a vsock connection to `port` in the guest. The returned fd is a
+/// duplicate owned by the caller; the VZ connection object is released.
+pub async fn connect_vsock(port: u32) -> Result<OwnedFd> {
+    let (tx, rx) = oneshot::channel::<Result<OwnedFd, String>>();
+    let tx = Mutex::new(Some(tx));
+    on_main(move |vm| {
+        let devices = unsafe { vm.socketDevices() };
+        let Some(device) = devices.firstObject().and_then(|d| d.downcast::<VZVirtioSocketDevice>().ok()) else {
+            if let Some(tx) = tx.lock().unwrap().take() {
+                let _ = tx.send(Err("no vsock device".into()));
+            }
+            return;
+        };
+        let handler = RcBlock::new(move |conn: *mut VZVirtioSocketConnection, err: *mut NSError| {
+            let result = match (unsafe { conn.as_ref() }, unsafe { err.as_ref() }) {
+                (Some(conn), None) => {
+                    // Dup rather than close: the connection object closes its
+                    // own fd when VZ releases it after this block returns.
+                    let fd = unsafe { libc::dup(conn.fileDescriptor()) };
+                    if fd < 0 {
+                        Err(std::io::Error::last_os_error().to_string())
+                    } else {
+                        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+                    }
+                }
+                (_, Some(err)) => Err(ns_error(err).to_string()),
+                _ => Err("vsock connect returned nothing".into()),
+            };
+            if let Some(tx) = tx.lock().unwrap().take() {
+                let _ = tx.send(result);
+            }
+        });
+        unsafe { device.connectToPort_completionHandler(port, &handler) };
+    })
+    .await?;
+    rx.await?.map_err(|e| anyhow!(e))
+}

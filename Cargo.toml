@@ -1,0 +1,23 @@
+[package]
+name = "berth"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+block2 = "0.6.2"
+clap = { version = "4.6.7", features = ["derive"] }
+dispatch2 = "0.3.1"
+libc = "0.2.191"
+objc2 = "0.6.5"
+objc2-foundation = "0.3.2"
+objc2-virtualization = "0.3.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "signal"] }
+
+[workspace]
+members = [".", "agent"]
+
+[profile.release]
+strip = true
