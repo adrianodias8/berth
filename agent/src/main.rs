@@ -14,6 +14,7 @@
 //! containers (dns.rs), host.docker.internal forwarding (hostnet.rs) and web
 //! access to domains: port detection and HTTPS (web.rs).
 
+mod boot;
 mod dns;
 mod docker;
 mod domains;
@@ -45,6 +46,7 @@ fn main() {
     web::run(table.clone());
     thread::spawn(memory::watch_pressure);
     thread::spawn(memory::ensure_kernel_args);
+    thread::spawn(boot::tune);
     thread::spawn(move || domains::run(t1));
     thread::spawn(move || mdns::run(t2));
     thread::spawn(move || dns::run(t3));

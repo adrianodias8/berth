@@ -167,8 +167,11 @@ fn start(paths: &Paths) -> Result<()> {
     print!("Starting berth");
     std::io::stdout().flush()?;
     let started = Instant::now();
+    let mut ticks = 0u32;
     loop {
-        std::thread::sleep(Duration::from_secs(1));
+        // Poll often: this delay adds straight onto the start time.
+        std::thread::sleep(Duration::from_millis(200));
+        ticks += 1;
         if let Some(code) = child.try_wait()? {
             println!();
             bail!(
@@ -188,8 +191,10 @@ fn start(paths: &Paths) -> Result<()> {
                 paths.console_log().display()
             );
         }
-        print!(".");
-        std::io::stdout().flush()?;
+        if ticks.is_multiple_of(5) {
+            print!(".");
+            std::io::stdout().flush()?;
+        }
     }
     println!(" ready in {:.0?}", started.elapsed());
     use_docker_context(paths);
