@@ -20,9 +20,9 @@ mounts:
   - [home, "@HOME@", virtiofs, "rw,nofail", "0", "0"]
   - [rosetta, /mnt/rosetta, virtiofs, "ro,nofail", "0", "0"]
 
+# Docker Engine itself (docker-ce from Docker's repository) is installed by
+# the guest agent on first boot; see agent/src/engine.rs.
 package_update: true
-packages:
-  - docker.io
 
 write_files:
   # Don't zero pages on allocation: the memory balloon allocates the pages it
@@ -59,5 +59,6 @@ runcmd:
   - [update-grub]
   - [systemctl, daemon-reload]
   - [systemctl, restart, systemd-binfmt]
+  - [groupadd, -f, docker]
   - [usermod, -aG, docker, "@USER@"]
-  - [systemctl, enable, --now, docker, berth-agent]
+  - [systemctl, enable, --now, berth-agent]

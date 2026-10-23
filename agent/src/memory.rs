@@ -27,6 +27,10 @@ pub struct MemInfo {
     pub pressure: f64,
     /// Bytes currently held by the balloon (counted as used in MemTotal).
     pub balloon: u64,
+    /// The kernel doesn't zero pages on allocation, so inflating the balloon
+    /// costs macOS nothing. False on a VM's very first boot (the setting
+    /// applies from the next one); the host then leaves the balloon alone.
+    pub balloon_safe: bool,
 }
 
 pub fn read() -> io::Result<MemInfo> {
@@ -34,6 +38,7 @@ pub fn read() -> io::Result<MemInfo> {
     if let Ok(psi) = std::fs::read_to_string("/proc/pressure/memory") {
         info.pressure = parse_psi_some_avg10(&psi).unwrap_or(0.0);
     }
+    info.balloon_safe = std::fs::read_to_string("/proc/cmdline").is_ok_and(|c| c.contains("init_on_alloc=0"));
     if let Ok(vmstat) = std::fs::read_to_string("/proc/vmstat") {
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         info.balloon = parse_balloon_pages(&vmstat) * page;

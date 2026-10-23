@@ -39,6 +39,9 @@ pub struct Sample {
     pub pressure: f64,
     #[serde(default)]
     pub balloon: u64,
+    /// Older agents don't report it; they predate the kernel setting too.
+    #[serde(default)]
+    pub balloon_safe: bool,
 }
 
 impl Sample {
@@ -95,7 +98,9 @@ pub async fn run(max: u64) {
         let Ok(sample) = sample().await else { continue };
         GUEST_USED.store(sample.used(), Ordering::Relaxed);
         let current = TARGET.load(Ordering::Relaxed);
-        let mut next = next_target(max, current, &sample);
+        // Inflating while the guest zeroes allocated pages would make macOS
+        // back every ballooned page (see agent/src/memory.rs).
+        let mut next = if sample.balloon_safe { next_target(max, current, &sample) } else { max };
         if next < current && HOLD_UNTIL.lock().unwrap().is_some_and(|t| Instant::now() < t) {
             next = current;
         }
@@ -119,7 +124,7 @@ mod tests {
     const MAX: u64 = 16 * GIB;
 
     fn s(total: u64, available: u64) -> Sample {
-        Sample { total, available, pressure: 0.0, balloon: 0 }
+        Sample { total, available, pressure: 0.0, balloon: 0, balloon_safe: true }
     }
 
     #[test]
@@ -155,7 +160,7 @@ mod tests {
     fn balloon_pages_are_not_usage() {
         // The bug this guards against: 16 GiB guest, 6 GiB in the balloon,
         // 9 GiB available. Real use is 1 GiB, not 7.
-        let sample = Sample { total: MAX, available: 9 * GIB, pressure: 0.0, balloon: 6 * GIB };
+        let sample = Sample { total: MAX, available: 9 * GIB, pressure: 0.0, balloon: 6 * GIB, balloon_safe: true };
         assert_eq!(sample.used(), GIB);
         // So with 10 GiB allowed we keep shrinking, rather than growing back.
         assert!(next_target(MAX, 10 * GIB, &sample) < 10 * GIB);

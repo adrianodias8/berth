@@ -15,6 +15,7 @@
 mod dns;
 mod docker;
 mod domains;
+mod engine;
 mod hostnet;
 mod mdns;
 mod memory;
@@ -36,6 +37,8 @@ static TABLE: OnceLock<domains::Shared> = OnceLock::new();
 fn main() {
     let table = TABLE.get_or_init(|| Arc::new(Default::default()));
     hostnet::setup();
+    // docker-ce before anything talks to Docker; the watchers retry anyway.
+    thread::spawn(engine::ensure_docker_ce);
     let (t1, t2, t3) = (table.clone(), table.clone(), table.clone());
     web::run(table.clone());
     thread::spawn(memory::watch_pressure);
