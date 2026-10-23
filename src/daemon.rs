@@ -83,8 +83,20 @@ pub struct Status {
 
 static STOPPING: AtomicBool = AtomicBool::new(false);
 
+/// launchd starts processes with 256 descriptors; every forwarded
+/// connection and shared file needs one.
+fn raise_fd_limit() {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+        // macOS rejects more than kern.maxfilesperproc, even when unlimited.
+        lim.rlim_cur = lim.rlim_max.min(65_536);
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
+    }
+}
+
 pub fn run(paths: Paths) -> Result<()> {
     paths.create_dirs()?;
+    raise_fd_limit();
     std::fs::write(paths.pid_file(), std::process::id().to_string())?;
     for sock in [paths.control_socket(), paths.docker_socket(), paths.ssh_socket(), paths.podman_socket()] {
         let _ = std::fs::remove_file(sock);

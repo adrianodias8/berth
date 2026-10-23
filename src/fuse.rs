@@ -12,6 +12,8 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const FUSE_ROOT_ID: u64 = 1;
@@ -75,6 +77,11 @@ const FATTR_MTIME_NOW: u32 = 1 << 8;
 
 const FOPEN_KEEP_CACHE: u32 = 1 << 1;
 const MAX_WRITE: u32 = 1 << 20;
+/// Files kept open for no-open reads and writes; past this the oldest are
+/// closed (the kernel never says when it's done with them).
+const MAX_CACHED_FILES: usize = 4096;
+/// Async requests (readahead, writeback) the kernel may have in flight.
+const MAX_BACKGROUND: u16 = 64;
 
 /// Linux errno values (FUSE replies carry the negated Linux number).
 mod lerr {
@@ -146,27 +153,38 @@ struct Node {
     lookups: u64,
     /// With "no open" mode the kernel skips OPEN/RELEASE and sends fh 0;
     /// reads and writes then use this per-node file, opened on first use.
-    file: Option<fs::File>,
+    file: Option<Arc<fs::File>>,
 }
 
+struct Dir {
+    path: PathBuf,
+    entries: Vec<(Vec<u8>, u64, u32)>,
+}
+
+#[derive(Clone)]
 enum Handle {
-    File(fs::File),
-    Dir(Vec<(Vec<u8>, u64, u32)>),
+    File(Arc<fs::File>),
+    Dir(Arc<Dir>),
 }
 
+/// Safe to call from several threads at once: the tables are locked only
+/// to look up or record paths and handles, never across a syscall, so
+/// requests from different guest threads hit the Mac's filesystem in
+/// parallel.
 pub struct Server {
     root: PathBuf,
     policy: CachePolicy,
     /// nodeid → node. nodeid is the file's inode number (root is 1).
-    nodes: HashMap<u64, Node>,
-    handles: HashMap<u64, Handle>,
-    next_fh: u64,
-    /// Requests seen per opcode, for tuning.
-    pub opcodes: HashMap<u32, u64>,
+    nodes: Mutex<HashMap<u64, Node>>,
+    /// Nodes holding a cached file, oldest first.
+    cached: Mutex<std::collections::VecDeque<u64>>,
+    handles: Mutex<HashMap<u64, Handle>>,
+    next_fh: AtomicU64,
+    /// Requests seen, and nanoseconds spent, per opcode, for tuning.
+    opcodes: [AtomicU64; 64],
+    opcode_nanos: [AtomicU64; 64],
     /// The kernel supports skipping OPEN/RELEASE (FUSE_NO_OPEN_SUPPORT).
-    no_open: bool,
-    /// Directory path per open directory handle (READDIRPLUS).
-    dir_paths: HashMap<u64, PathBuf>,
+    no_open: AtomicBool,
 }
 
 /// Little-endian cursor over a request.
@@ -237,15 +255,49 @@ impl Server {
     pub fn new(root: PathBuf, policy: CachePolicy) -> Self {
         let mut nodes = HashMap::new();
         nodes.insert(FUSE_ROOT_ID, Node { path: root.clone(), lookups: 1, file: None });
-        Self { root, policy, nodes, handles: HashMap::new(), next_fh: 1, opcodes: HashMap::new(), no_open: false, dir_paths: HashMap::new() }
+        Self {
+            root,
+            policy,
+            nodes: Mutex::new(nodes),
+            cached: Mutex::new(std::collections::VecDeque::new()),
+            handles: Mutex::new(HashMap::new()),
+            next_fh: AtomicU64::new(1),
+            opcodes: std::array::from_fn(|_| AtomicU64::new(0)),
+            opcode_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
+            no_open: AtomicBool::new(false),
+        }
+    }
+
+    /// (opcode, requests, average µs) for every opcode seen, most frequent first.
+    pub fn opcode_counts(&self) -> Vec<(u32, u64, f64)> {
+        let mut counts: Vec<_> = (0..64usize)
+            .map(|op| (op as u32, self.opcodes[op].load(Ordering::Relaxed), self.opcode_nanos[op].load(Ordering::Relaxed)))
+            .filter(|(_, n, _)| *n > 0)
+            .map(|(op, n, ns)| (op, n, ns as f64 / n as f64 / 1000.0))
+            .collect();
+        counts.sort_unstable_by_key(|&(_, n, _)| std::cmp::Reverse(n));
+        counts
     }
 
     /// Handle one request. Returns the reply bytes, or None when the opcode
     /// expects no reply (FORGET).
-    pub fn handle(&mut self, request: &[u8]) -> Option<Vec<u8>> {
+    pub fn handle(&self, request: &[u8]) -> Option<Vec<u8>> {
+        let started = std::time::Instant::now();
+        let reply = self.serve(request);
+        if let Some(op) = request.get(4..8).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+            && op < 64
+        {
+            self.opcode_nanos[op].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        reply
+    }
+
+    fn serve(&self, request: &[u8]) -> Option<Vec<u8>> {
         let mut r = Reader::new(request);
         let (_len, opcode, unique, nodeid) = (r.u32()?, r.u32()?, r.u64()?, r.u64()?);
-        *self.opcodes.entry(opcode).or_default() += 1;
+        if let Some(n) = self.opcodes.get(opcode as usize) {
+            n.fetch_add(1, Ordering::Relaxed);
+        }
         let (_uid, _gid, _pid, _extlen, _pad) = (r.u32()?, r.u32()?, r.u32()?, r.u16()?, r.u16()?);
         let result = match opcode {
             op::FORGET => {
@@ -303,7 +355,7 @@ impl Server {
             }
             // ENOSYS tells a no-open-capable kernel to stop sending OPEN and
             // RELEASE for regular files.
-            op::OPEN if self.no_open => Err(lerr::ENOSYS),
+            op::OPEN if self.no_open.load(Ordering::Relaxed) => Err(lerr::ENOSYS),
             op::OPEN => self.open(nodeid, r.u32().unwrap_or(0)),
             op::CREATE => {
                 let (flags, mode) = (r.u32().unwrap_or(0), r.u32().unwrap_or(0o644));
@@ -322,8 +374,9 @@ impl Server {
             }
             op::RELEASE | op::RELEASEDIR => {
                 let fh = r.u64().unwrap_or(0);
-                self.handles.remove(&fh);
-                self.dir_paths.remove(&fh);
+                // Dropped outside the lock: closing a file is a syscall.
+                let handle = self.handles.lock().unwrap().remove(&fh);
+                drop(handle);
                 Ok(Vec::new())
             }
             // Nothing to flush (writes go straight to the file); ENOSYS makes
@@ -354,7 +407,7 @@ impl Server {
         Some(out.0)
     }
 
-    fn init(&mut self, r: &mut Reader) -> Reply {
+    fn init(&self, r: &mut Reader) -> Reply {
         let (major, minor, max_readahead, kernel_flags) = (
             r.u32().ok_or(lerr::EINVAL)?,
             r.u32().ok_or(lerr::EINVAL)?,
@@ -364,7 +417,7 @@ impl Server {
         if major != 7 {
             return Err(lerr::EINVAL);
         }
-        self.no_open = kernel_flags & FUSE_NO_OPEN_SUPPORT != 0;
+        self.no_open.store(kernel_flags & FUSE_NO_OPEN_SUPPORT != 0, Ordering::Relaxed);
         let mut want = FUSE_ASYNC_READ
             | FUSE_ATOMIC_O_TRUNC
             | FUSE_BIG_WRITES
@@ -382,8 +435,8 @@ impl Server {
             .u32(minor.min(KERNEL_MINOR))
             .u32(max_readahead)
             .u32(kernel_flags & want)
-            .u16(16) // max_background
-            .u16(12) // congestion_threshold
+            .u16(MAX_BACKGROUND)
+            .u16(MAX_BACKGROUND * 3 / 4) // congestion_threshold
             .u32(MAX_WRITE)
             .u32(1) // time_gran: nanoseconds
             .u16((MAX_WRITE / 4096) as u16) // max_pages
@@ -394,8 +447,8 @@ impl Server {
         Ok(out.0)
     }
 
-    fn path(&self, nodeid: u64) -> Result<&Path, i32> {
-        self.nodes.get(&nodeid).map(|n| n.path.as_path()).ok_or(lerr::ENOENT)
+    fn path(&self, nodeid: u64) -> Result<PathBuf, i32> {
+        self.nodes.lock().unwrap().get(&nodeid).map(|n| n.path.clone()).ok_or(lerr::ENOENT)
     }
 
     fn child(&self, parent: u64, name: &[u8]) -> Result<PathBuf, i32> {
@@ -405,14 +458,17 @@ impl Server {
         Ok(self.path(parent)?.join(OsStr::from_bytes(name)))
     }
 
-    fn forget(&mut self, nodeid: u64, n: u64) {
+    fn forget(&self, nodeid: u64, n: u64) {
         if nodeid == FUSE_ROOT_ID {
             return;
         }
-        if let Some(node) = self.nodes.get_mut(&nodeid) {
+        let mut nodes = self.nodes.lock().unwrap();
+        if let Some(node) = nodes.get_mut(&nodeid) {
             node.lookups = node.lookups.saturating_sub(n);
             if node.lookups == 0 {
-                self.nodes.remove(&nodeid);
+                let node = nodes.remove(&nodeid);
+                drop(nodes);
+                drop(node);
             }
         }
     }
@@ -437,15 +493,18 @@ impl Server {
     }
 
     /// Register (or re-reference) the node at `path` and reply fuse_entry_out.
-    fn entry(&mut self, path: PathBuf) -> Reply {
+    fn entry(&self, path: PathBuf) -> Reply {
         let m = fs::symlink_metadata(&path).map_err(|e| io_errno(&e))?;
         let nodeid = if path == self.root { FUSE_ROOT_ID } else { m.ino() };
-        let node = self.nodes.entry(nodeid).or_insert(Node { path: path.clone(), lookups: 0, file: None });
-        if node.path != path {
-            node.file = None;
-        }
-        node.path = path;
-        node.lookups += 1;
+        let stale = {
+            let mut nodes = self.nodes.lock().unwrap();
+            let node = nodes.entry(nodeid).or_insert(Node { path: path.clone(), lookups: 0, file: None });
+            let stale = if node.path != path { node.file.take() } else { None };
+            node.path = path;
+            node.lookups += 1;
+            stale
+        };
+        drop(stale);
         let p = self.policy;
         let mut out = Out::default();
         out.u64(nodeid)
@@ -458,7 +517,7 @@ impl Server {
         Ok(out.0)
     }
 
-    fn lookup(&mut self, parent: u64, name: &[u8]) -> Reply {
+    fn lookup(&self, parent: u64, name: &[u8]) -> Reply {
         let path = self.child(parent, name)?;
         self.entry(path)
     }
@@ -470,12 +529,12 @@ impl Server {
         out.0
     }
 
-    fn getattr(&mut self, nodeid: u64) -> Reply {
+    fn getattr(&self, nodeid: u64) -> Reply {
         let m = fs::symlink_metadata(self.path(nodeid)?).map_err(|e| io_errno(&e))?;
         Ok(self.attr_reply(nodeid, &m))
     }
 
-    fn setattr(&mut self, nodeid: u64, r: &mut Reader) -> Reply {
+    fn setattr(&self, nodeid: u64, r: &mut Reader) -> Reply {
         let valid = r.u32().ok_or(lerr::EINVAL)?;
         let _pad = r.u32();
         let fh = r.u64().unwrap_or(0);
@@ -486,7 +545,7 @@ impl Server {
         let mode = r.u32().unwrap_or(0);
         let _unused = r.u32();
         let (uid, gid) = (r.u32().unwrap_or(u32::MAX), r.u32().unwrap_or(u32::MAX));
-        let path = self.path(nodeid)?.to_path_buf();
+        let path = self.path(nodeid)?;
         let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| lerr::EINVAL)?;
 
         if valid & FATTR_MODE != 0 && unsafe { libc::chmod(c.as_ptr(), (mode & 0o7777) as libc::mode_t) } != 0 {
@@ -495,15 +554,20 @@ impl Server {
         if valid & (FATTR_UID | FATTR_GID) != 0 {
             let u = if valid & FATTR_UID != 0 { uid } else { u32::MAX };
             let g = if valid & FATTR_GID != 0 { gid } else { u32::MAX };
-            // We run as the user; chown to anything else fails, as on the Mac.
+            // We run as the user, so ownership changes mostly fail (guest
+            // root extracting a tarball, Linux group IDs): ignore EPERM like
+            // Apple's share does, and the file stays the user's.
             if unsafe { libc::lchown(c.as_ptr(), u, g) } != 0 {
-                return Err(io_errno(&std::io::Error::last_os_error()));
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EPERM) {
+                    return Err(io_errno(&err));
+                }
             }
         }
         if valid & FATTR_SIZE != 0 {
-            let result = match self.handles.get(&fh) {
-                Some(Handle::File(f)) => f.set_len(size),
-                _ => fs::OpenOptions::new().write(true).open(&path).and_then(|f| f.set_len(size)),
+            let result = match self.handle_file(fh) {
+                Some(f) => f.set_len(size),
+                None => fs::OpenOptions::new().write(true).open(&path).and_then(|f| f.set_len(size)),
             };
             result.map_err(|e| io_errno(&e))?;
         }
@@ -530,18 +594,18 @@ impl Server {
         Ok(self.attr_reply(nodeid, &m))
     }
 
-    fn readlink(&mut self, nodeid: u64) -> Reply {
+    fn readlink(&self, nodeid: u64) -> Reply {
         let target = fs::read_link(self.path(nodeid)?).map_err(|e| io_errno(&e))?;
         Ok(target.as_os_str().as_bytes().to_vec())
     }
 
-    fn symlink(&mut self, parent: u64, name: &[u8], target: &[u8]) -> Reply {
+    fn symlink(&self, parent: u64, name: &[u8], target: &[u8]) -> Reply {
         let path = self.child(parent, name)?;
         std::os::unix::fs::symlink(OsStr::from_bytes(target), &path).map_err(|e| io_errno(&e))?;
         self.entry(path)
     }
 
-    fn mkdir(&mut self, parent: u64, name: &[u8], mode: u32) -> Reply {
+    fn mkdir(&self, parent: u64, name: &[u8], mode: u32) -> Reply {
         let path = self.child(parent, name)?;
         let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| lerr::EINVAL)?;
         if unsafe { libc::mkdir(c.as_ptr(), (mode & 0o7777) as libc::mode_t) } != 0 {
@@ -550,17 +614,17 @@ impl Server {
         self.entry(path)
     }
 
-    fn remove(&mut self, parent: u64, name: &[u8], dir: bool) -> Reply {
+    fn remove(&self, parent: u64, name: &[u8], dir: bool) -> Reply {
         let path = self.child(parent, name)?;
         if dir { fs::remove_dir(&path) } else { fs::remove_file(&path) }.map_err(|e| io_errno(&e))?;
         Ok(Vec::new())
     }
 
-    fn rename(&mut self, olddir: u64, old: &[u8], newdir: u64, new: &[u8]) -> Reply {
+    fn rename(&self, olddir: u64, old: &[u8], newdir: u64, new: &[u8]) -> Reply {
         let (from, to) = (self.child(olddir, old)?, self.child(newdir, new)?);
         fs::rename(&from, &to).map_err(|e| io_errno(&e))?;
         // Path-keyed nodes under the old name move with it.
-        for node in self.nodes.values_mut() {
+        for node in self.nodes.lock().unwrap().values_mut() {
             if let Ok(rest) = node.path.strip_prefix(&from) {
                 node.path = if rest.as_os_str().is_empty() { to.clone() } else { to.join(rest) };
             }
@@ -568,17 +632,23 @@ impl Server {
         Ok(Vec::new())
     }
 
-    fn link(&mut self, old: u64, newdir: u64, name: &[u8]) -> Reply {
-        let (from, to) = (self.path(old)?.to_path_buf(), self.child(newdir, name)?);
+    fn link(&self, old: u64, newdir: u64, name: &[u8]) -> Reply {
+        let (from, to) = (self.path(old)?, self.child(newdir, name)?);
         fs::hard_link(&from, &to).map_err(|e| io_errno(&e))?;
         self.entry(to)
     }
 
-    fn new_handle(&mut self, handle: Handle) -> u64 {
-        let fh = self.next_fh;
-        self.next_fh += 1;
-        self.handles.insert(fh, handle);
+    fn new_handle(&self, handle: Handle) -> u64 {
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        self.handles.lock().unwrap().insert(fh, handle);
         fh
+    }
+
+    fn handle_file(&self, fh: u64) -> Option<Arc<fs::File>> {
+        match self.handles.lock().unwrap().get(&fh) {
+            Some(Handle::File(f)) => Some(f.clone()),
+            _ => None,
+        }
     }
 
     fn open_file(path: &Path, flags: u32, mode: u32) -> Result<fs::File, i32> {
@@ -604,39 +674,71 @@ impl Server {
         out.0
     }
 
-    fn open(&mut self, nodeid: u64, flags: u32) -> Reply {
-        let file = Self::open_file(self.path(nodeid)?, flags & !0o100, 0)?;
-        let fh = self.new_handle(Handle::File(file));
+    fn open(&self, nodeid: u64, flags: u32) -> Reply {
+        let file = Self::open_file(&self.path(nodeid)?, flags & !0o100, 0)?;
+        let fh = self.new_handle(Handle::File(Arc::new(file)));
         Ok(Self::open_out(fh))
     }
 
-    fn create(&mut self, parent: u64, name: &[u8], flags: u32, mode: u32) -> Reply {
+    fn create(&self, parent: u64, name: &[u8], flags: u32, mode: u32) -> Reply {
         let path = self.child(parent, name)?;
-        let file = Self::open_file(&path, flags | 0o100, mode & 0o7777)?;
-        let mut body = self.entry(path)?;
-        let fh = self.new_handle(Handle::File(file));
+        let file = Arc::new(Self::open_file(&path, flags | 0o100, mode & 0o7777)?);
+        let mut body = self.entry(path.clone())?;
+        // A no-open kernel never sends RELEASE, even for created files: keep
+        // the file as the node's (closed when evicted) and reply fh 0.
+        let fh = if self.no_open.load(Ordering::Relaxed) {
+            let nodeid = u64::from_le_bytes(body[0..8].try_into().unwrap());
+            self.cache_file(nodeid, &path, file);
+            0
+        } else {
+            self.new_handle(Handle::File(file))
+        };
         body.extend_from_slice(&Self::open_out(fh));
         Ok(body)
     }
 
     /// The file for a read or write: the open handle, or with no-open the
     /// node's own file, opened read-write (read-only if that's all we may).
-    fn file_for(&mut self, nodeid: u64, fh: u64) -> Result<&fs::File, i32> {
+    fn file_for(&self, nodeid: u64, fh: u64) -> Result<Arc<fs::File>, i32> {
         if fh != 0 {
-            return match self.handles.get(&fh) {
-                Some(Handle::File(f)) => Ok(f),
-                _ => Err(lerr::EBADF),
-            };
+            return self.handle_file(fh).ok_or(lerr::EBADF);
         }
-        let node = self.nodes.get_mut(&nodeid).ok_or(lerr::ENOENT)?;
-        if node.file.is_none() {
-            let file = Self::open_file(&node.path, 2, 0).or_else(|_| Self::open_file(&node.path, 0, 0))?;
-            node.file = Some(file);
-        }
-        Ok(node.file.as_ref().unwrap())
+        let path = {
+            let nodes = self.nodes.lock().unwrap();
+            let node = nodes.get(&nodeid).ok_or(lerr::ENOENT)?;
+            if let Some(f) = &node.file {
+                return Ok(f.clone());
+            }
+            node.path.clone()
+        };
+        let file = Arc::new(Self::open_file(&path, 2, 0).or_else(|_| Self::open_file(&path, 0, 0))?);
+        Ok(self.cache_file(nodeid, &path, file))
     }
 
-    fn read(&mut self, nodeid: u64, fh: u64, offset: u64, size: u32) -> Reply {
+    /// Keep `file` as the node's open file, unless another thread got there
+    /// first (then that one is returned), closing the oldest past the cap.
+    fn cache_file(&self, nodeid: u64, path: &Path, file: Arc<fs::File>) -> Arc<fs::File> {
+        let mut nodes = self.nodes.lock().unwrap();
+        let Some(node) = nodes.get_mut(&nodeid).filter(|n| n.path == path) else { return file };
+        if let Some(f) = &node.file {
+            return f.clone();
+        }
+        node.file = Some(file.clone());
+        let mut cached = self.cached.lock().unwrap();
+        cached.push_back(nodeid);
+        let mut evicted = Vec::new();
+        while cached.len() > MAX_CACHED_FILES {
+            let Some(old) = cached.pop_front() else { break };
+            if let Some(f) = nodes.get_mut(&old).and_then(|n| n.file.take()) {
+                evicted.push(f);
+            }
+        }
+        drop((cached, nodes));
+        drop(evicted);
+        file
+    }
+
+    fn read(&self, nodeid: u64, fh: u64, offset: u64, size: u32) -> Reply {
         let f = self.file_for(nodeid, fh)?;
         let mut buf = vec![0u8; size as usize];
         let mut done = 0;
@@ -652,7 +754,7 @@ impl Server {
         Ok(buf)
     }
 
-    fn write(&mut self, nodeid: u64, fh: u64, offset: u64, data: &[u8]) -> Reply {
+    fn write(&self, nodeid: u64, fh: u64, offset: u64, data: &[u8]) -> Reply {
         let f = self.file_for(nodeid, fh)?;
         f.write_all_at(data, offset).map_err(|e| io_errno(&e))?;
         let mut out = Out::default();
@@ -660,14 +762,14 @@ impl Server {
         Ok(out.0)
     }
 
-    fn fsync(&mut self, fh: u64) -> Reply {
-        if let Some(Handle::File(f)) = self.handles.get(&fh) {
+    fn fsync(&self, fh: u64) -> Reply {
+        if let Some(f) = self.handle_file(fh) {
             f.sync_data().map_err(|e| io_errno(&e))?;
         }
         Ok(Vec::new())
     }
 
-    fn statfs(&mut self) -> Reply {
+    fn statfs(&self) -> Reply {
         let c = CString::new(self.root.as_os_str().as_bytes()).map_err(|_| lerr::EINVAL)?;
         let mut s: libc::statfs = unsafe { std::mem::zeroed() };
         if unsafe { libc::statfs(c.as_ptr(), &mut s) } != 0 {
@@ -687,8 +789,8 @@ impl Server {
         Ok(out.0)
     }
 
-    fn opendir(&mut self, nodeid: u64) -> Reply {
-        let path = self.path(nodeid)?.to_path_buf();
+    fn opendir(&self, nodeid: u64) -> Reply {
+        let path = self.path(nodeid)?;
         let mut entries = vec![(b".".to_vec(), nodeid, libc::DT_DIR as u32), (b"..".to_vec(), 0, libc::DT_DIR as u32)];
         for entry in fs::read_dir(&path).map_err(|e| io_errno(&e))?.flatten() {
             let kind = entry.file_type().map_or(0, |t| {
@@ -705,26 +807,31 @@ impl Server {
             let ino = entry.metadata().map_or(0, |m| m.ino());
             entries.push((entry.file_name().as_bytes().to_vec(), ino, kind));
         }
-        let fh = self.new_handle(Handle::Dir(entries));
-        self.dir_paths.insert(fh, path);
+        let fh = self.new_handle(Handle::Dir(Arc::new(Dir { path, entries })));
         Ok(Self::open_out(fh))
     }
 
     /// READDIR, or READDIRPLUS which also returns each entry's attributes
     /// (and counts as a lookup), saving the kernel a LOOKUP per name.
-    fn readdir(&mut self, fh: u64, offset: u64, size: u32, plus: bool) -> Reply {
-        let Some(Handle::Dir(entries)) = self.handles.get(&fh) else { return Err(lerr::EBADF) };
-        let entries: Vec<_> = entries.iter().enumerate().skip(offset as usize).map(|(i, e)| (i, e.clone())).collect();
+    fn readdir(&self, fh: u64, offset: u64, size: u32, plus: bool) -> Reply {
+        let dir = match self.handles.lock().unwrap().get(&fh) {
+            Some(Handle::Dir(d)) => d.clone(),
+            _ => return Err(lerr::EBADF),
+        };
         let mut out = Out::default();
-        for (i, (name, ino, kind)) in entries {
+        for (i, (name, ino, kind)) in dir.entries.iter().enumerate().skip(offset as usize) {
             let len = 24 + name.len();
             let padded = (len + 7) & !7;
-            let entry = if plus && name != b"." && name != b".." { self.entry_for_name(fh, &name) } else { None };
             let need = padded + if plus { 128 } else { 0 };
             if out.0.len() + need > size as usize {
                 break;
             }
             if plus {
+                let entry = if name != b"." && name != b".." {
+                    self.entry(dir.path.join(OsStr::from_bytes(name))).ok()
+                } else {
+                    None
+                };
                 match entry {
                     Some(e) => out.0.extend_from_slice(&e),
                     // "." / ".." or a vanished name: a zero entry (nodeid 0)
@@ -734,17 +841,11 @@ impl Server {
                     }
                 }
             }
-            out.u64(ino).u64(i as u64 + 1).u32(name.len() as u32).u32(kind);
-            out.0.extend_from_slice(&name);
+            out.u64(*ino).u64(i as u64 + 1).u32(name.len() as u32).u32(*kind);
+            out.0.extend_from_slice(name);
             out.zeros(padded - len);
         }
         Ok(out.0)
-    }
-
-    /// fuse_entry_out for `name` in the directory open as `fh`.
-    fn entry_for_name(&mut self, fh: u64, name: &[u8]) -> Option<Vec<u8>> {
-        let dir = self.dir_paths.get(&fh)?.clone();
-        self.entry(dir.join(OsStr::from_bytes(name))).ok()
     }
 }
 
@@ -759,7 +860,7 @@ mod tests {
         out.0
     }
 
-    fn reply(server: &mut Server, opcode: u32, nodeid: u64, body: &[u8]) -> (i32, Vec<u8>) {
+    fn reply(server: &Server, opcode: u32, nodeid: u64, body: &[u8]) -> (i32, Vec<u8>) {
         let r = server.handle(&header(opcode, nodeid, body)).unwrap();
         let error = i32::from_le_bytes(r[4..8].try_into().unwrap());
         assert_eq!(u64::from_le_bytes(r[8..16].try_into().unwrap()), 7, "unique echoed");
@@ -782,12 +883,12 @@ mod tests {
     #[test]
     fn create_write_read_rename_unlink() {
         let dir = tempdir("rw");
-        let mut s = Server::new(dir.clone(), CachePolicy::default());
+        let s = Server::new(dir.clone(), CachePolicy::default());
 
         // INIT
         let mut init = Out::default();
         init.u32(7).u32(41).u32(131072).u32(FUSE_ASYNC_READ | FUSE_WRITEBACK_CACHE);
-        let (err, body) = reply(&mut s, op::INIT, 0, &init.0);
+        let (err, body) = reply(&s, op::INIT, 0, &init.0);
         assert_eq!(err, 0);
         assert_eq!(body.len(), 64);
         assert_eq!(u32::from_le_bytes(body[4..8].try_into().unwrap()), 31, "minor negotiated down");
@@ -796,7 +897,7 @@ mod tests {
         let mut create = Out::default();
         create.u32(0o1 | 0o100 | 0o1000).u32(0o644).u32(0o022).u32(0);
         create.0.extend_from_slice(&name("a.txt"));
-        let (err, body) = reply(&mut s, op::CREATE, FUSE_ROOT_ID, &create.0);
+        let (err, body) = reply(&s, op::CREATE, FUSE_ROOT_ID, &create.0);
         assert_eq!(err, 0);
         let nodeid = u64::from_le_bytes(body[0..8].try_into().unwrap());
         let fh = u64::from_le_bytes(body[128..136].try_into().unwrap());
@@ -805,35 +906,35 @@ mod tests {
         let mut write = Out::default();
         write.u64(fh).u64(0).u32(5).u32(0).u64(0).u32(0).u32(0);
         write.0.extend_from_slice(b"hello");
-        let (err, body) = reply(&mut s, op::WRITE, nodeid, &write.0);
+        let (err, body) = reply(&s, op::WRITE, nodeid, &write.0);
         assert_eq!((err, u32::from_le_bytes(body[0..4].try_into().unwrap())), (0, 5));
         assert_eq!(fs::read(dir.join("a.txt")).unwrap(), b"hello");
 
         // READ it back through the handle
         let mut read = Out::default();
         read.u64(fh).u64(1).u32(100).u32(0).u64(0).u32(0).u32(0);
-        assert_eq!(reply(&mut s, op::READ, nodeid, &read.0), (0, b"ello".to_vec()));
+        assert_eq!(reply(&s, op::READ, nodeid, &read.0), (0, b"ello".to_vec()));
 
         // RENAME a.txt -> b.txt, then LOOKUP b.txt returns the same node
         let mut rename = Out::default();
         rename.u64(FUSE_ROOT_ID);
         rename.0.extend_from_slice(&name("a.txt"));
         rename.0.extend_from_slice(&name("b.txt"));
-        assert_eq!(reply(&mut s, op::RENAME, FUSE_ROOT_ID, &rename.0).0, 0);
-        let (err, body) = reply(&mut s, op::LOOKUP, FUSE_ROOT_ID, &name("b.txt"));
+        assert_eq!(reply(&s, op::RENAME, FUSE_ROOT_ID, &rename.0).0, 0);
+        let (err, body) = reply(&s, op::LOOKUP, FUSE_ROOT_ID, &name("b.txt"));
         assert_eq!((err, u64::from_le_bytes(body[0..8].try_into().unwrap())), (0, nodeid));
 
         // Missing names map to Linux ENOENT; removing a non-empty dir maps
         // macOS ENOTEMPTY (66) to Linux 39.
-        assert_eq!(reply(&mut s, op::LOOKUP, FUSE_ROOT_ID, &name("nope")).0, -lerr::ENOENT);
+        assert_eq!(reply(&s, op::LOOKUP, FUSE_ROOT_ID, &name("nope")).0, -lerr::ENOENT);
         let mut mkdir = Out::default();
         mkdir.u32(0o755).u32(0);
         mkdir.0.extend_from_slice(&name("d"));
-        assert_eq!(reply(&mut s, op::MKDIR, FUSE_ROOT_ID, &mkdir.0).0, 0);
+        assert_eq!(reply(&s, op::MKDIR, FUSE_ROOT_ID, &mkdir.0).0, 0);
         fs::write(dir.join("d/x"), "x").unwrap();
-        assert_eq!(reply(&mut s, op::RMDIR, FUSE_ROOT_ID, &name("d")).0, -39);
+        assert_eq!(reply(&s, op::RMDIR, FUSE_ROOT_ID, &name("d")).0, -39);
 
-        assert_eq!(reply(&mut s, op::UNLINK, FUSE_ROOT_ID, &name("b.txt")).0, 0);
+        assert_eq!(reply(&s, op::UNLINK, FUSE_ROOT_ID, &name("b.txt")).0, 0);
         assert!(!dir.join("b.txt").exists());
         fs::remove_dir_all(dir).ok();
     }
@@ -843,13 +944,13 @@ mod tests {
         let dir = tempdir("rd");
         fs::write(dir.join("one"), "").unwrap();
         fs::create_dir(dir.join("two")).unwrap();
-        let mut s = Server::new(dir.clone(), CachePolicy::default());
-        let (err, body) = reply(&mut s, op::OPENDIR, FUSE_ROOT_ID, &[0; 8]);
+        let s = Server::new(dir.clone(), CachePolicy::default());
+        let (err, body) = reply(&s, op::OPENDIR, FUSE_ROOT_ID, &[0; 8]);
         assert_eq!(err, 0);
         let fh = u64::from_le_bytes(body[0..8].try_into().unwrap());
         let mut read = Out::default();
         read.u64(fh).u64(0).u32(4096).u32(0).u64(0).u32(0).u32(0);
-        let (err, body) = reply(&mut s, op::READDIR, FUSE_ROOT_ID, &read.0);
+        let (err, body) = reply(&s, op::READDIR, FUSE_ROOT_ID, &read.0);
         assert_eq!(err, 0);
         let mut names = Vec::new();
         let mut pos = 0;
@@ -867,17 +968,17 @@ mod tests {
     fn readdirplus_and_no_open() {
         let dir = tempdir("plus");
         fs::write(dir.join("f"), "data").unwrap();
-        let mut s = Server::new(dir.clone(), CachePolicy::default());
+        let s = Server::new(dir.clone(), CachePolicy::default());
         // A kernel that supports no-open: OPEN is refused, reads use fh 0.
         let mut init = Out::default();
         init.u32(7).u32(41).u32(131072).u32(FUSE_NO_OPEN_SUPPORT);
-        assert_eq!(reply(&mut s, op::INIT, 0, &init.0).0, 0);
+        assert_eq!(reply(&s, op::INIT, 0, &init.0).0, 0);
 
-        let (_, body) = reply(&mut s, op::OPENDIR, FUSE_ROOT_ID, &[0; 8]);
+        let (_, body) = reply(&s, op::OPENDIR, FUSE_ROOT_ID, &[0; 8]);
         let fh = u64::from_le_bytes(body[0..8].try_into().unwrap());
         let mut read = Out::default();
         read.u64(fh).u64(0).u32(4096).u32(0).u64(0).u32(0).u32(0);
-        let (err, body) = reply(&mut s, op::READDIRPLUS, FUSE_ROOT_ID, &read.0);
+        let (err, body) = reply(&s, op::READDIRPLUS, FUSE_ROOT_ID, &read.0);
         assert_eq!(err, 0);
         // Entries: ".", "..", "f" each with a 128-byte entry_out before the dirent.
         let mut pos = 0;
@@ -893,11 +994,11 @@ mod tests {
         }
         assert_ne!(f_node, 0, "f came with a real entry");
 
-        assert_eq!(reply(&mut s, op::OPEN, f_node, &[0; 8]).0, -lerr::ENOSYS);
+        assert_eq!(reply(&s, op::OPEN, f_node, &[0; 8]).0, -lerr::ENOSYS);
         let mut read = Out::default();
         read.u64(0).u64(0).u32(100).u32(0).u64(0).u32(0).u32(0);
-        assert_eq!(reply(&mut s, op::READ, f_node, &read.0), (0, b"data".to_vec()));
-        assert_eq!(reply(&mut s, op::FLUSH, f_node, &[0; 24]).0, -lerr::ENOSYS);
+        assert_eq!(reply(&s, op::READ, f_node, &read.0), (0, b"data".to_vec()));
+        assert_eq!(reply(&s, op::FLUSH, f_node, &[0; 24]).0, -lerr::ENOSYS);
         fs::remove_dir_all(dir).ok();
     }
 
@@ -905,12 +1006,76 @@ mod tests {
     fn forget_has_no_reply_and_drops_node() {
         let dir = tempdir("fg");
         fs::write(dir.join("f"), "").unwrap();
-        let mut s = Server::new(dir.clone(), CachePolicy::default());
-        let (_, body) = reply(&mut s, op::LOOKUP, FUSE_ROOT_ID, &name("f"));
+        let s = Server::new(dir.clone(), CachePolicy::default());
+        let (_, body) = reply(&s, op::LOOKUP, FUSE_ROOT_ID, &name("f"));
         let nodeid = u64::from_le_bytes(body[0..8].try_into().unwrap());
-        assert!(s.nodes.contains_key(&nodeid));
+        assert!(s.nodes.lock().unwrap().contains_key(&nodeid));
         assert!(s.handle(&header(op::FORGET, nodeid, &1u64.to_le_bytes())).is_none());
-        assert!(!s.nodes.contains_key(&nodeid));
+        assert!(!s.nodes.lock().unwrap().contains_key(&nodeid));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn serves_from_many_threads() {
+        let dir = tempdir("mt");
+        let s = Server::new(dir.clone(), CachePolicy::default());
+        std::thread::scope(|scope| {
+            for t in 0..8 {
+                let s = &s;
+                scope.spawn(move || {
+                    for i in 0..50 {
+                        let file = format!("t{t}-{i}");
+                        let mut create = Out::default();
+                        create.u32(0o2 | 0o100).u32(0o644).u32(0).u32(0);
+                        create.0.extend_from_slice(&name(&file));
+                        let (err, body) = reply(s, op::CREATE, FUSE_ROOT_ID, &create.0);
+                        assert_eq!(err, 0);
+                        let nodeid = u64::from_le_bytes(body[0..8].try_into().unwrap());
+                        let fh = u64::from_le_bytes(body[128..136].try_into().unwrap());
+                        let mut write = Out::default();
+                        write.u64(fh).u64(0).u32(file.len() as u32).u32(0).u64(0).u32(0).u32(0);
+                        write.0.extend_from_slice(file.as_bytes());
+                        assert_eq!(reply(s, op::WRITE, nodeid, &write.0).0, 0);
+                        let mut read = Out::default();
+                        read.u64(fh).u64(0).u32(100).u32(0).u64(0).u32(0).u32(0);
+                        assert_eq!(reply(s, op::READ, nodeid, &read.0), (0, file.clone().into_bytes()));
+                        assert_eq!(reply(s, op::RELEASE, nodeid, &fh.to_le_bytes()).0, 0);
+                        if i % 2 == 0 {
+                            assert_eq!(reply(s, op::UNLINK, FUSE_ROOT_ID, &name(&file)).0, 0);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 8 * 25);
+        assert!(s.handles.lock().unwrap().is_empty(), "every handle released");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn no_open_create_keeps_no_handles_and_caps_open_files() {
+        let dir = tempdir("cap");
+        let s = Server::new(dir.clone(), CachePolicy::default());
+        let mut init = Out::default();
+        init.u32(7).u32(41).u32(131072).u32(FUSE_NO_OPEN_SUPPORT);
+        assert_eq!(reply(&s, op::INIT, 0, &init.0).0, 0);
+        for i in 0..MAX_CACHED_FILES + 100 {
+            let mut create = Out::default();
+            create.u32(0o1 | 0o100).u32(0o644).u32(0).u32(0);
+            create.0.extend_from_slice(&name(&format!("f{i}")));
+            let (err, body) = reply(&s, op::CREATE, FUSE_ROOT_ID, &create.0);
+            assert_eq!(err, 0);
+            assert_eq!(u64::from_le_bytes(body[128..136].try_into().unwrap()), 0, "fh 0: no RELEASE will come");
+            let nodeid = u64::from_le_bytes(body[0..8].try_into().unwrap());
+            let mut write = Out::default();
+            write.u64(0).u64(0).u32(1).u32(0).u64(0).u32(0).u32(0);
+            write.0.push(b'x');
+            assert_eq!(reply(&s, op::WRITE, nodeid, &write.0).0, 0);
+        }
+        assert!(s.handles.lock().unwrap().is_empty());
+        let open = s.nodes.lock().unwrap().values().filter(|n| n.file.is_some()).count();
+        assert_eq!(open, MAX_CACHED_FILES);
+        assert_eq!(fs::read(dir.join("f0")).unwrap(), b"x", "evicted files were written");
         fs::remove_dir_all(dir).ok();
     }
 
