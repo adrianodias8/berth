@@ -157,6 +157,31 @@ fn ns_error(err: &NSError) -> anyhow::Error {
     anyhow!("{}", err.localizedDescription())
 }
 
+/// Boot the guest's own kernel directly when the agent has exported it (see
+/// agent/src/boot.rs), skipping EFI firmware and GRUB. A "trying" marker is
+/// left for the agent to clear once up; if it's still there at the next start,
+/// that direct boot failed, and we use EFI until a new kernel is exported.
+fn direct_boot(paths: &Paths) -> Option<Retained<VZBootLoader>> {
+    let dir = paths.guest().join("boot");
+    let (kernel, initrd, trying, failed) =
+        (dir.join("vmlinuz"), dir.join("initrd.img"), dir.join("trying"), dir.join("direct-failed"));
+    if trying.exists() {
+        eprintln!("boot: last direct boot didn't come up; using EFI");
+        let _ = fs::rename(&trying, &failed);
+    }
+    let cmdline = fs::read_to_string(dir.join("cmdline")).ok()?;
+    if failed.exists() || !kernel.exists() || !initrd.exists() || cmdline.trim().is_empty() {
+        return None;
+    }
+    fs::write(&trying, "").ok()?;
+    unsafe {
+        let boot = VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &file_url(&kernel));
+        boot.setInitialRamdiskURL(Some(&file_url(&initrd)));
+        boot.setCommandLine(&NSString::from_str(cmdline.trim()));
+        Some(Retained::into_super(boot))
+    }
+}
+
 /// Build and validate the VM configuration. Must run on the main thread.
 fn build_config(paths: &Paths, res: &Resources) -> Result<Retained<VZVirtualMachineConfiguration>> {
     unsafe {
@@ -183,22 +208,27 @@ fn build_config(paths: &Paths, res: &Resources) -> Result<Retained<VZVirtualMach
         platform.setMachineIdentifier(&machine_id);
         config.setPlatform(&platform);
 
-        // EFI boot through the image's own GRUB.
-        let vars_url = file_url(&paths.efi_vars());
-        let vars = if paths.efi_vars().exists() {
-            VZEFIVariableStore::initWithURL(VZEFIVariableStore::alloc(), &vars_url)
-        } else {
-            VZEFIVariableStore::initCreatingVariableStoreAtURL_options_error(
-                VZEFIVariableStore::alloc(),
-                &vars_url,
-                VZEFIVariableStoreInitializationOptions::empty(),
-            )
-            .map_err(|e| ns_error(&e))
-            .context("creating EFI variable store")?
-        };
-        let boot = VZEFIBootLoader::new();
-        boot.setVariableStore(Some(&vars));
-        config.setBootLoader(Some(&boot));
+        match direct_boot(paths) {
+            Some(boot) => config.setBootLoader(Some(&boot)),
+            None => {
+                // EFI boot through the image's own GRUB.
+                let vars_url = file_url(&paths.efi_vars());
+                let vars = if paths.efi_vars().exists() {
+                    VZEFIVariableStore::initWithURL(VZEFIVariableStore::alloc(), &vars_url)
+                } else {
+                    VZEFIVariableStore::initCreatingVariableStoreAtURL_options_error(
+                        VZEFIVariableStore::alloc(),
+                        &vars_url,
+                        VZEFIVariableStoreInitializationOptions::empty(),
+                    )
+                    .map_err(|e| ns_error(&e))
+                    .context("creating EFI variable store")?
+                };
+                let boot = VZEFIBootLoader::new();
+                boot.setVariableStore(Some(&vars));
+                config.setBootLoader(Some(&boot));
+            }
+        }
 
         // Root disk, then the cloud-init seed (read-only).
         let disk = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(

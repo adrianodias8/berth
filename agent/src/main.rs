@@ -47,6 +47,7 @@ fn main() {
     thread::spawn(memory::watch_pressure);
     thread::spawn(memory::ensure_kernel_args);
     thread::spawn(boot::tune);
+    thread::spawn(boot::export_kernel);
     thread::spawn(move || domains::run(t1));
     thread::spawn(move || mdns::run(t2));
     thread::spawn(move || dns::run(t3));

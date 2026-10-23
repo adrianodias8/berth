@@ -40,6 +40,53 @@ fn lazy_efi_mount() {
     }
 }
 
+/// Export the running kernel, initrd and command line to the shared
+/// ~/.berth/guest/boot so the host can boot it directly (no EFI firmware or
+/// GRUB, see vm.rs). Copies only when the kernel changed (e.g. after an apt
+/// upgrade). Also clears the host's "trying" marker: reaching this point means
+/// a direct boot worked.
+pub fn export_kernel() {
+    let Some(dir) = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join("boot"))) else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::remove_file(dir.join("trying"));
+
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let release = release.trim();
+    let mut changed = false;
+    for (src, dest) in [(format!("/boot/vmlinuz-{release}"), "vmlinuz"), (format!("/boot/initrd.img-{release}"), "initrd.img")] {
+        let dest = dir.join(dest);
+        let same = matches!(
+            (std::fs::metadata(&src), std::fs::metadata(&dest)),
+            (Ok(a), Ok(b)) if a.len() == b.len() && std::fs::read(&src).ok() == std::fs::read(&dest).ok()
+        );
+        if same {
+            continue;
+        }
+        let tmp = dest.with_extension("tmp");
+        if std::fs::copy(&src, &tmp).is_ok() && std::fs::rename(&tmp, &dest).is_ok() {
+            changed = true;
+        } else {
+            eprintln!("berth-agent: boot: could not export {src}");
+            return;
+        }
+    }
+    // The command line GRUB used, minus its own BOOT_IMAGE, with the console
+    // on the virtio port the host logs.
+    let cmdline: Vec<String> = std::fs::read_to_string("/proc/cmdline")
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter(|t| !t.starts_with("BOOT_IMAGE=") && !t.starts_with("console="))
+        .map(str::to_string)
+        .chain(["console=hvc0".to_string()])
+        .collect();
+    let _ = std::fs::write(dir.join("cmdline"), cmdline.join(" "));
+    if changed {
+        // A new kernel gets a fresh chance at direct boot.
+        let _ = std::fs::remove_file(dir.join("direct-failed"));
+        eprintln!("berth-agent: boot: exported kernel {release} for direct boot");
+    }
+}
+
 pub fn tune() {
     lazy_efi_mount();
     // Docker doesn't need DHCP to have finished; container networking comes
