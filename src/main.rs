@@ -2,6 +2,7 @@ mod cli_tools;
 mod context;
 mod daemon;
 mod engines;
+mod fuse;
 mod helper;
 mod k8s;
 mod machines;
@@ -11,6 +12,7 @@ mod ports;
 mod provision;
 mod routes;
 mod tls;
+mod virtiofs;
 mod vm;
 mod watch;
 

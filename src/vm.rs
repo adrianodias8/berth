@@ -292,6 +292,8 @@ fn build_config(paths: &Paths, res: &Resources) -> Result<Retained<VZVirtualMach
             eprintln!("Rosetta is not installed; x86-64 images will not run. Install it with `softwareupdate --install-rosetta`.");
         }
         config.setDirectorySharingDevices(&NSArray::from_retained_slice(&shares));
+        // Experimental berth virtio-fs (macOS 27+, BERTH_EXPERIMENTAL_FS=1).
+        crate::virtiofs::attach(&config, &paths.home);
 
         // Guest console goes to a log file for debugging.
         let console_fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
