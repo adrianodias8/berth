@@ -44,6 +44,35 @@ something here stops being true, fix it.
   - the classes aren't in objc2-virtualization 0.3.2: declare them with
     `extern_class!`/`extern_protocol!` and look them up at runtime.
 
+## Snapshots
+
+- **What works:** `VZVirtualMachineConfiguration.validateSaveRestoreSupport`
+  passes for berth's normal configuration: virtio-fs shares, Rosetta, vsock,
+  NAT, balloon and the console. The macOS 27 custom Virtio device doesn't
+  support it unless it implements save hooks (`supportsSaveRestore`).
+- **The Mac must be unlocked to save state:**
+  - **What happens:** `saveMachineStateToURL` encrypts the state with a
+    Secure Enclave key created "when unlocked", so with the screen locked it
+    fails with "permission denied". The log shows
+    `ctkd … unable to generate key … e00002e2`, and the key API reports
+    `errSecInteractionNotAllowed`.
+  - **What it isn't:** signing identity, an embedded Info.plist or the save
+    location (none of them made a difference).
+  - **Fallback:** a disk-only snapshot.
+- **The save file must not exist yet;** the framework creates it. Restore
+  needs the same host, a macOS build no older than the save's, and the same
+  hardware configuration (CPU count, memory), so a snapshot keeps its own
+  values and restore uses them.
+- **Disk clones:** `fsync` the disk image, then `clonefile`, with the VM
+  paused (memory snapshots need nothing else: memory and disk come from the
+  same instant). For disk-only snapshots, `sync` in the guest first.
+- **After resuming a saved state:**
+  - the guest's clock is still at save time, so the agent sets it;
+  - the direct-boot "trying" marker must be cleared, since nothing in the
+    guest will;
+  - a disk-only restore boots, and Docker starts only containers with a
+    restart policy, so berth starts the ones that were running.
+
 ## Networking
 
 - **Container IPs need routes,** and routes need root. OrbStack uses per-network

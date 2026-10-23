@@ -326,21 +326,91 @@ fn build_config(paths: &Paths, res: &Resources) -> Result<Retained<VZVirtualMach
     }
 }
 
-/// Create the VM and start it. Must run on the main thread before the main
-/// queue starts draining; `on_started` is called on the main queue.
-pub fn create_and_start(paths: &Paths, res: &Resources, on_started: impl Fn(Result<()>) + 'static) -> Result<()> {
+/// Create the VM and start it, or with `restore`, resume it from a saved
+/// machine state (snapshots.rs), falling back to booting the disk if that
+/// fails. Must run on the main thread before the main queue starts
+/// draining; `on_started` is called on the main queue with whether the state
+/// was restored.
+pub fn create_and_start(
+    paths: &Paths,
+    res: &Resources,
+    restore: Option<&std::path::Path>,
+    on_started: impl Fn(Result<bool>) + 'static,
+) -> Result<()> {
     let config = build_config(paths, res)?;
     let vm = unsafe { VZVirtualMachine::initWithConfiguration(VZVirtualMachine::alloc(), &config) };
     listen_vsock(&vm, HOST_VSOCK_PORT)?;
-    let handler = RcBlock::new(move |err: *mut NSError| {
-        on_started(match unsafe { err.as_ref() } {
-            None => Ok(()),
-            Some(err) => Err(ns_error(err)),
+    let on_started = std::rc::Rc::new(on_started);
+    let boot = {
+        let on_started = on_started.clone();
+        RcBlock::new(move |err: *mut NSError| {
+            on_started(match unsafe { err.as_ref() } {
+                None => Ok(false),
+                Some(err) => Err(ns_error(err)),
+            })
         })
-    });
-    unsafe { vm.startWithCompletionHandler(&handler) };
+    };
+    match restore {
+        None => unsafe { vm.startWithCompletionHandler(&boot) },
+        Some(state) => {
+            let trying = paths.guest().join("boot/trying");
+            let vm2 = vm.clone();
+            let restored = RcBlock::new(move |err: *mut NSError| {
+                if let Some(err) = unsafe { err.as_ref() } {
+                    eprintln!("snapshot: can't restore the saved state ({}); booting its disk instead", ns_error(err));
+                    unsafe { vm2.startWithCompletionHandler(&boot) };
+                    return;
+                }
+                // The restored guest is long past booting: nothing will clear
+                // the direct-boot marker, and it would turn direct boot off.
+                let _ = fs::remove_file(&trying);
+                let on_started = on_started.clone();
+                let resumed = RcBlock::new(move |err: *mut NSError| {
+                    on_started(match unsafe { err.as_ref() } {
+                        None => Ok(true),
+                        Some(err) => Err(ns_error(err)),
+                    })
+                });
+                unsafe { vm2.resumeWithCompletionHandler(&resumed) };
+            });
+            unsafe { vm.restoreMachineStateFromURL_completionHandler(&file_url(state), &restored) };
+        }
+    }
     *VM.lock().unwrap() = Some(MainQueueVm(vm));
     Ok(())
+}
+
+/// Run a VM operation that reports through a completion handler.
+async fn with_completion(
+    op: impl FnOnce(&VZVirtualMachine, &block2::DynBlock<dyn Fn(*mut NSError)>) + Send + 'static,
+) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    let tx = Mutex::new(Some(tx));
+    on_main(move |vm| {
+        let handler = RcBlock::new(move |err: *mut NSError| {
+            let result = unsafe { err.as_ref() }.map_or(Ok(()), |e| Err(ns_error(e).to_string()));
+            if let Some(tx) = tx.lock().unwrap().take() {
+                let _ = tx.send(result);
+            }
+        });
+        op(vm, &handler);
+    })
+    .await?;
+    rx.await?.map_err(|e| anyhow!(e))
+}
+
+pub async fn pause() -> Result<()> {
+    with_completion(|vm, done| unsafe { vm.pauseWithCompletionHandler(done) }).await
+}
+
+pub async fn resume() -> Result<()> {
+    with_completion(|vm, done| unsafe { vm.resumeWithCompletionHandler(done) }).await
+}
+
+/// Save the paused VM's memory and device state to `path`. macOS encrypts
+/// it with a key it can only create while the Mac is unlocked.
+pub async fn save_state(path: std::path::PathBuf) -> Result<()> {
+    with_completion(move |vm, done| unsafe { vm.saveMachineStateToURL_completionHandler(&file_url(&path), done) }).await
 }
 
 /// Run `f` with the VM on the main queue and return its result.
@@ -378,19 +448,7 @@ pub async fn request_stop() -> Result<()> {
 
 /// Hard stop, for when the guest ignores the stop request.
 pub async fn force_stop() -> Result<()> {
-    let (tx, rx) = oneshot::channel();
-    let tx = Mutex::new(Some(tx));
-    on_main(move |vm| {
-        let handler = RcBlock::new(move |err: *mut NSError| {
-            let result = unsafe { err.as_ref() }.map_or(Ok(()), |e| Err(ns_error(e).to_string()));
-            if let Some(tx) = tx.lock().unwrap().take() {
-                let _ = tx.send(result);
-            }
-        });
-        unsafe { vm.stopWithCompletionHandler(&handler) };
-    })
-    .await?;
-    rx.await?.map_err(|e| anyhow!(e))
+    with_completion(|vm, done| unsafe { vm.stopWithCompletionHandler(done) }).await
 }
 
 fn balloon(vm: &VZVirtualMachine) -> Option<Retained<VZVirtioTraditionalMemoryBalloonDevice>> {

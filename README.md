@@ -59,6 +59,17 @@ from its code.
   Fedora, Alpine, Arch, Rocky, Alma, openSUSE…) with your user, sudo, your Mac
   home, systemd, and `dev.berth.local`; `berth machine shell dev`
 
+**Snapshots**
+- `berth snapshot create <name>` saves the whole VM (containers, images, volumes,
+  machines, Kubernetes) in about a second: the disk is an APFS copy-on-write clone,
+  so a snapshot only takes space as the VM changes afterwards
+- While the Mac is unlocked it also saves memory, so `berth snapshot restore <name>`
+  brings back running processes exactly where they were (databases included).
+  Otherwise, or if macOS can't resume the state, it boots the snapshot's disk and
+  restarts the containers that were running
+- Files on the Mac (bind mounts) aren't part of a snapshot. Also in the app
+  (Snapshots)
+
 **App**: Berth.app (SwiftUI) with first-run setup, a menu-bar item, containers,
 images, volumes, networks, Kubernetes, machines, terminals, logs, files and stats.
 
@@ -128,6 +139,8 @@ berth tls trust           # trust the local CA for https://*.berth.local (one-ti
 berth k8s enable          # Kubernetes (k3s) with a `berth` kubectl context
 berth engine enable podman   # or nerdctl; berth engine status
 berth machine create dev  # an Ubuntu machine; then: berth machine shell dev
+berth snapshot create before-migration   # then break things...
+berth snapshot restore before-migration  # ...and go back; also: list, delete
 berth shell               # SSH into the VM; `berth shell uname -a` runs a command
 berth stop
 berth delete --yes        # wipe the VM disk (containers, images, volumes)
@@ -226,6 +239,7 @@ refuses any other name, so trusting it cannot be abused for real sites.
   - `dns.rs`: DNS server for containers
   - `hostnet.rs`: `host.docker.internal` forwarding to the Mac
   - `web.rs`: web port detection, HTTP/HTTPS entry for domains
+- `src/snapshots.rs`: VM snapshots (disk clones, saved machine state, restore)
 - `src/tls.rs`: the local CA, per-name certificates, keychain trust
 - `src/provision.rs`: image download and checksum, disk clone, SSH key, cloud-init seed
 - `guest/user-data.yaml`: guest provisioning (Docker, mounts, Rosetta binfmt, agent unit)
@@ -245,7 +259,8 @@ discussions) and the limits above:
   ownership like OrbStack. Left: path handling hardened against symlink races,
   building and loading the module automatically, mounting it at the home path
   in place of Apple's, and wider testing (`docs/KNOWN_ISSUES.md`)
-- **Machines**: snapshots, cloud-init / custom images
+- **Machines**: cloud-init / custom images; per-machine and per-volume snapshots
+  next to the whole-VM ones
 - **Linux GUI apps**: first a console window (virtio-gpu 2D, clipboard via
   spice-vdagent), then per-app windows like WSLg (a compositor in the machine,
   surfaces streamed to native windows). Rendering is CPU-only until there's GPU

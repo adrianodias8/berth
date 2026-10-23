@@ -350,6 +350,27 @@ async fn forward(listener: TcpListener, port: u16, direct: bool) {
 }
 
 /// GET from the guest's Docker API; returns the body reader after the headers.
+/// IDs of the running Docker containers.
+pub async fn running_containers() -> Result<Vec<String>> {
+    let mut body = String::new();
+    docker_get("/containers/json").await?.read_to_string(&mut body).await?;
+    let list: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+    Ok(list.iter().filter_map(|c| c["Id"].as_str().map(str::to_string)).collect())
+}
+
+/// Start a Docker container (ignoring "already started").
+pub async fn start_container(id: &str) -> Result<()> {
+    let mut stream = guest_stream(DOCKER_TARGET).await?;
+    stream.write_all(format!("POST /containers/{id}/start HTTP/1.0\r\nHost: docker\r\n\r\n").as_bytes()).await?;
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).await?;
+    let status = reply.split_whitespace().nth(1).unwrap_or("");
+    if !matches!(status, "204" | "304") {
+        anyhow::bail!("{}", reply.lines().last().unwrap_or(status));
+    }
+    Ok(())
+}
+
 async fn docker_get(path: &str) -> Result<BufReader<UnixStream>> {
     docker_get_from(DOCKER_TARGET, path).await
 }

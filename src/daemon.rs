@@ -34,6 +34,13 @@ pub enum Request {
     K8s { action: String },
     Machine { action: String, args: Vec<String> },
     Engine { args: String },
+    Snapshot { name: String, memory: bool },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SnapshotReply {
+    pub meta: Option<crate::snapshots::Meta>,
+    pub error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -82,6 +89,40 @@ pub struct Status {
 }
 
 static STOPPING: AtomicBool = AtomicBool::new(false);
+/// The VM resumed a snapshot's saved state: its clock is where it was saved.
+static RESTORED: AtomicBool = AtomicBool::new(false);
+
+/// The VM booted (rather than resuming a saved state).
+static BOOTED: AtomicBool = AtomicBool::new(false);
+/// Containers to start once a restored snapshot's disk has booted.
+static RESTART_AFTER_BOOT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// After a restore: set the clock of a resumed VM, or start the snapshot's
+/// containers on one that booted its disk.
+async fn after_restore() {
+    for _ in 0..150 {
+        if BOOTED.load(std::sync::atomic::Ordering::SeqCst) {
+            let ids = std::mem::take(&mut *RESTART_AFTER_BOOT.lock().unwrap());
+            if !ids.is_empty() {
+                eprintln!("snapshot: starting the {} containers that were running", ids.len());
+                crate::snapshots::start_containers(ids).await;
+            }
+            return;
+        }
+        if RESTORED.load(std::sync::atomic::Ordering::SeqCst) {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            match guest_stream(&format!("clock {}", now.as_secs_f64())).await {
+                Ok(mut guest) => {
+                    let _ = guest.read_to_end(&mut Vec::new()).await;
+                    eprintln!("snapshot: guest clock set");
+                }
+                Err(err) => eprintln!("snapshot: setting the guest clock: {err:#}"),
+            }
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
 
 /// launchd starts processes with 256 descriptors; every forwarded
 /// connection and shared file needs one.
@@ -120,11 +161,29 @@ pub fn run(paths: Paths) -> Result<()> {
         let _ = std::fs::remove_file(sock);
     }
 
-    let res = Resources::load(&paths);
-    eprintln!("starting VM: {} CPUs, {} MiB", res.cpus, res.memory >> 20);
+    let restore = crate::snapshots::take_restore(&paths);
+    let res = match &restore {
+        Some(r) => Resources { cpus: r.resources.cpus, memory: r.resources.memory },
+        None => Resources::load(&paths),
+    };
+    let state = restore.as_ref().and_then(|r| r.state.clone());
+    *RESTART_AFTER_BOOT.lock().unwrap() = restore.map(|r| r.start).unwrap_or_default();
+    eprintln!(
+        "{} VM: {} CPUs, {} MiB",
+        if state.is_some() { "restoring" } else { "starting" },
+        res.cpus,
+        res.memory >> 20
+    );
     let (cpus, memory) = (res.cpus, res.memory);
-    vm::create_and_start(&paths, &res, |result| match result {
-        Ok(()) => eprintln!("VM started"),
+    vm::create_and_start(&paths, &res, state.as_deref(), |result| match result {
+        Ok(true) => {
+            eprintln!("VM restored from snapshot");
+            RESTORED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(false) => {
+            eprintln!("VM started");
+            BOOTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         Err(err) => {
             eprintln!("VM failed to start: {err:#}");
             std::process::exit(1);
@@ -154,6 +213,7 @@ async fn serve(paths: Paths, cpus: usize, memory: u64) -> Result<()> {
     tokio::spawn(crate::memory::run(memory));
     tokio::spawn(crate::routes::run_periodic());
     tokio::spawn(serve_host_connections(memory));
+    tokio::spawn(after_restore());
 
     let cleanup_paths = Paths::new();
     tokio::spawn(async move {
@@ -235,6 +295,14 @@ async fn handle_control(stream: UnixStream, cpus: usize, memory: u64) -> Result<
             let mut json = String::new();
             guest.read_to_string(&mut json).await?;
             json
+        }
+        Request::Snapshot { name, memory: with_memory } => {
+            let res = Resources { cpus, memory };
+            let reply = match crate::snapshots::create_running(&Paths::new(), &name, with_memory, &res).await {
+                Ok(meta) => SnapshotReply { meta: Some(meta), error: None },
+                Err(err) => SnapshotReply { meta: None, error: Some(format!("{err:#}")) },
+            };
+            serde_json::to_string(&reply)?
         }
         Request::Stop => {
             tokio::spawn(shutdown());

@@ -7,6 +7,7 @@ enum Section: String, CaseIterable, Identifiable {
     case networks = "Networks"
     case kubernetes = "Kubernetes"
     case machine = "Machines"
+    case snapshots = "Snapshots"
     var id: String { rawValue }
 
     var icon: String {
@@ -17,6 +18,7 @@ enum Section: String, CaseIterable, Identifiable {
         case .networks: "network"
         case .kubernetes: "helm"
         case .machine: "terminal"
+        case .snapshots: "clock.arrow.circlepath"
         }
     }
 }
@@ -43,12 +45,15 @@ struct MainWindow: View {
                 SwiftUI.Section("Linux") {
                     Label(Section.machine.rawValue, systemImage: Section.machine.icon).tag(Section.machine)
                 }
+                SwiftUI.Section("VM") {
+                    Label(Section.snapshots.rawValue, systemImage: Section.snapshots.icon).tag(Section.snapshots)
+                }
             }
             .navigationSplitViewColumnWidth(min: 170, ideal: 190)
             .safeAreaInset(edge: .bottom) { EngineBadge().padding(10) }
         } detail: {
             Group {
-                if engine.isRunning || section == .machine {
+                if engine.isRunning || section == .machine || section == .snapshots {
                     switch section {
                     case .containers: ContainersView()
                     case .images: ImagesView()
@@ -56,6 +61,7 @@ struct MainWindow: View {
                     case .networks: NetworksView()
                     case .kubernetes: KubernetesView()
                     case .machine: MachinesView()
+                    case .snapshots: SnapshotsView()
                     }
                 } else {
                     NotRunningView()

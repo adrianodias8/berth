@@ -11,6 +11,7 @@ mod paths;
 mod ports;
 mod provision;
 mod routes;
+mod snapshots;
 mod tls;
 mod virtiofs;
 mod vm;
@@ -74,6 +75,12 @@ enum Cmd {
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
+    /// Save the whole VM and go back to it later: containers, volumes,
+    /// images, machines, running processes
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotCmd,
+    },
     /// Delete the VM disk and all containers and images in it
     Delete {
         #[arg(long)]
@@ -124,6 +131,28 @@ enum MachineCmd {
     Start { name: String },
     Stop { name: String },
     /// Delete a machine and its files
+    Delete { name: String },
+}
+
+#[derive(Subcommand)]
+enum SnapshotCmd {
+    /// Take a snapshot (instant copy-on-write; a running VM keeps running)
+    Create {
+        name: String,
+        /// Save only the disk, not memory and running processes
+        #[arg(long)]
+        disk_only: bool,
+    },
+    /// List snapshots
+    List,
+    /// Go back to a snapshot: everything since is discarded
+    Restore {
+        name: String,
+        /// Don't ask for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Delete a snapshot
     Delete { name: String },
 }
 
@@ -226,6 +255,7 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Snapshot { action } => snapshot(&paths, action),
         Cmd::Shell { command } => shell(&paths, &command),
         Cmd::Delete { yes } => delete(&paths, yes),
         Cmd::Tls { action: TlsCmd::Trust } => tls::trust(&paths),
@@ -236,6 +266,85 @@ fn main() -> Result<()> {
         }
         Cmd::Daemon => daemon::run(paths),
         Cmd::Helper { .. } => unreachable!(),
+    }
+}
+
+fn snapshot(paths: &Paths, action: SnapshotCmd) -> Result<()> {
+    match action {
+        SnapshotCmd::Create { name, disk_only } => {
+            snapshots::valid_name(&name)?;
+            let t = Instant::now();
+            let meta = if current_status(paths).is_some() {
+                println!("Saving {}…", if disk_only { "the VM's disk" } else { "the VM (memory and disk)" });
+                let reply: daemon::SnapshotReply = request_with_timeout(
+                    paths,
+                    &Request::Snapshot { name: name.clone(), memory: !disk_only },
+                    Duration::from_secs(600),
+                )?;
+                match (reply.meta, reply.error) {
+                    (Some(meta), _) => meta,
+                    (None, err) => bail!("{}", err.unwrap_or_default()),
+                }
+            } else {
+                snapshots::create_stopped(paths, &name)?
+            };
+            let what = if meta.with_memory { "memory and disk" } else { "disk" };
+            println!("Snapshot {name} saved ({what}) in {:.1}s.", t.elapsed().as_secs_f64());
+            if !disk_only && !meta.with_memory {
+                println!(
+                    "Running processes weren't saved: macOS only saves a VM's state while the Mac is unlocked \
+                     (details in ~/.berth/log/daemon.log). Restoring boots this disk and restarts the containers \
+                     that were running."
+                );
+            }
+            Ok(())
+        }
+        SnapshotCmd::List => {
+            let all = snapshots::list(paths);
+            if all.is_empty() {
+                println!("No snapshots. Take one with: berth snapshot create <name>");
+            }
+            for meta in all {
+                let age = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs())
+                    .saturating_sub(meta.created);
+                let age = match age {
+                    a if a < 120 => format!("{a} s ago"),
+                    a if a < 7200 => format!("{} min ago", a / 60),
+                    a if a < 172_800 => format!("{} h ago", a / 3600),
+                    a => format!("{} days ago", a / 86_400),
+                };
+                let size = snapshots::size_on_disk(paths, &meta.name) as f64 / (1u64 << 30) as f64;
+                let kind = if meta.with_memory { "memory + disk" } else { "disk" };
+                println!("{:<24} {:<14} {kind:<14} {size:.1} GiB (shared with the VM until it changes)", meta.name, age);
+            }
+            Ok(())
+        }
+        SnapshotCmd::Restore { name, yes } => {
+            let meta = snapshots::get(paths, &name)?;
+            if !yes {
+                print!("Restore {name}? Everything in the VM since then is lost. [y/N] ");
+                std::io::stdout().flush()?;
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if !answer.trim().eq_ignore_ascii_case("y") {
+                    bail!("not restored");
+                }
+            }
+            if current_status(paths).is_some() {
+                stop(paths)?;
+            }
+            snapshots::prepare_restore(paths, &meta.name)?;
+            start(paths)?;
+            println!("Restored {name}.");
+            Ok(())
+        }
+        SnapshotCmd::Delete { name } => {
+            snapshots::delete(paths, &name)?;
+            println!("Deleted snapshot {name}.");
+            Ok(())
+        }
     }
 }
 

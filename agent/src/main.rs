@@ -11,6 +11,8 @@
 //!   engine <action> [name]\n enable|disable podman|nerdctl, status (engines.rs)
 //!   touch\n                 followed by newline-separated paths until EOF: raise
 //!                           inotify events for files changed on the Mac
+//!   sync\n                  flush filesystems (before a disk-only snapshot); replies "ok"
+//!   clock <unix seconds>\n  set the clock (after restoring a snapshot); replies "ok"
 //!
 //! A failed connect just closes the stream. The agent also runs the container
 //! domain controller (domains.rs), its mDNS responder (mdns.rs), DNS for
@@ -88,6 +90,13 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
     if header == "touch" {
         return touch_paths(host);
     }
+    if header == "sync" {
+        unsafe { libc::sync() };
+        return host.write_all(b"ok");
+    }
+    if let Some(secs) = header.strip_prefix("clock ") {
+        return set_clock(secs, host);
+    }
     match header.split_once(' ') {
         Some(("tcp", addr)) => {
             let guest = TcpStream::connect(addr)?;
@@ -120,6 +129,16 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
         }
         _ => Err(io::Error::new(io::ErrorKind::InvalidData, format!("bad header {header:?}"))),
     }
+}
+
+/// A restored snapshot wakes up with the clock it was saved at.
+fn set_clock(secs: &str, mut host: UnixStream) -> io::Result<()> {
+    let secs: f64 = secs.trim().parse().map_err(|_| io::Error::other("bad time"))?;
+    let ts = libc::timespec { tv_sec: secs.trunc() as _, tv_nsec: (secs.fract() * 1e9) as _ };
+    if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    host.write_all(b"ok")
 }
 
 /// chmod each path to its current mode: a no-op that still raises IN_ATTRIB
