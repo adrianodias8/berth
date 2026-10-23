@@ -187,7 +187,11 @@ for e in "${engines[@]}"; do bench "$e"; done
     echo
     echo "| Test | berth | OrbStack |"
     echo "|---|---|---|"
-    paste -d'\t' "$out.berth" "$out.orbstack" 2>/dev/null | while IFS=$'\t' read -r b o; do
+    # A single-engine run leaves the other column empty.
+    touch "$out.berth" "$out.orbstack"
+    [ -s "$out.berth" ] || sed 's/|[^|]*|[^|]*|$/| | |/' "$out.orbstack" > "$out.berth"
+    [ -s "$out.orbstack" ] || sed 's/|[^|]*|[^|]*|$/| | |/' "$out.berth" > "$out.orbstack"
+    paste -d'\t' "$out.berth" "$out.orbstack" | while IFS=$'\t' read -r b o; do
         name=$(echo "$b" | cut -d'|' -f2 | sed 's/^ *//;s/ *$//')
         bv=$(echo "$b" | cut -d'|' -f3 | sed 's/^ *//;s/ *$//')
         ov=$(echo "$o" | cut -d'|' -f3 | sed 's/^ *//;s/ *$//')

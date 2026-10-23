@@ -3,57 +3,56 @@
 A free, open-source way to run Docker containers on Apple Silicon Macs, in the
 spirit of OrbStack. Written in Rust on top of Apple's Virtualization.framework.
 
-## Status
+## Features
 
-Milestones 1–2: a Linux VM with a Docker engine your existing `docker` CLI talks to,
-with published ports and container domain names on the Mac.
+**Engine**
+- Debian 13 VM on Virtualization.framework, booted straight into its kernel (no
+  EFI/GRUB once set up): Docker ready about 3 s after `berth start`
+- Docker's own engine (docker-ce 29) with the Docker API at `~/.berth/run/docker.sock`,
+  `/var/run/docker.sock` (via the helper) and a `berth` docker context made current on start
+- Official `docker`, Compose, Buildx and `kubectl` CLIs in `~/.berth/bin`, linked
+  wherever none work, so berth doesn't depend on another Docker app
+- x86-64 images through Rosetta
+- Memory balloon steered by guest usage and memory-pressure events: the VM can
+  use what it needs but doesn't hoard. (Virtualization.framework doesn't hand
+  already-used pages back to macOS; see "Limits".)
+- ASIF disk image on macOS 26+: deleting images and containers frees disk space
+  on the Mac. VM data is excluded from Time Machine.
 
-- Debian 13 guest, booted through EFI, provisioned by cloud-init
-- Docker API exposed on the Mac at `~/.berth/run/docker.sock` (bridged over vsock)
-- Your home directory mounted in the VM at the same path (virtiofs), so
-  `docker run -v "$PWD:/src" ...` works
-- x86-64 images run through Rosetta
-- Published ports (`-p 8080:80`) appear on the Mac, IPv4 and IPv6, following
-  Docker's bind address: `-p 127.0.0.1:8080:80` stays local, the default listens
-  on all interfaces. If a Mac process already holds `127.0.0.1:<port>`, it keeps
-  local connections on that address; the container gets the rest. TCP only for now.
-- Container domain names, no setup or root needed:
-  - `<container>.berth.local`, and `<service>.<project>.berth.local` for Compose
-  - any subdomain of those, e.g. `api.web.berth.local`
-  - custom names from the `dev.berth.domains` label (comma-separated, `*.` wildcards,
-    `.local` only); the `dev.orbstack.domains` label is read too
-  - `berth.local` is the VM itself; `berth domains` lists everything
-  
-  Each running container gets its own address on the Mac↔VM network, so every
-  port and protocol works without publishing (`curl http://web.berth.local`,
-  `redis-cli -h cache.shop.berth.local`, `ping`).
-- Direct container IPs from the Mac (`curl 172.17.0.2`, `ping`), for every Docker
-  bridge network, once the route helper is installed (below)
-- `host.docker.internal` from containers reaches the Mac, including servers bound
-  only to `localhost` (`127.0.0.1` or `::1`). Also answered: `gateway.docker.internal`,
-  `host.berth.internal`, `docker.for.mac.host.internal`, `docker.for.mac.localhost`.
-- Containers resolve `*.berth.local` names too, and use the Mac's DNS for
-  everything else, so VPN and split-DNS settings apply inside containers
-- Memory balloon, so the VM's RAM size is a ceiling, not a reservation
+**Networking**
+- Published ports (`-p 8080:80`, TCP and UDP) on the Mac, IPv4 and IPv6, following
+  Docker's bind address
+- Container domains with no setup: `<container>.berth.local`,
+  `<service>.<project>.berth.local` for Compose, any subdomain, plus custom names
+  from the `dev.berth.domains` (or `dev.orbstack.domains`) label; `berth domains`
+  lists them. Every port and protocol works on a domain, no publishing needed.
+- `http://` and `https://<name>.berth.local` without port numbers: the web port is
+  detected (override: `dev.berth.http-port`), HTTPS uses a local CA limited to
+  `.local` names (`berth tls trust`, or the app's setup)
+- Direct container IPs from the Mac (`curl 172.17.0.2`) for every bridge network
+- `host.docker.internal` reaches the Mac, including localhost-only servers;
+  containers use the Mac's DNS, so VPN and split DNS apply
 
-- **Berth.app**: a native SwiftUI app with a menu-bar item and a management window
-  (see below)
+**Development**
+- Bind mounts of your home directory at the same path, with file change
+  notifications forwarded so hot reload works (edits and new files; deletions are
+  seen on the watcher's next rescan)
+- Kubernetes: `berth k8s enable` gives a single-node k3s using berth's Docker, so
+  locally built images run in pods without a registry; `berth` kubectl context,
+  API on `localhost:6443`, pod and service IPs reachable from the Mac
+- Linux machines: `berth machine create dev --distro ubuntu:noble` (Debian,
+  Fedora, Alpine, Arch, Rocky, Alma, openSUSE…) with your user, sudo, your Mac
+  home, systemd, and `dev.berth.local`; `berth machine shell dev`
 
-- **HTTPS and port-less URLs** for container domains: `http://` and `https://<name>.berth.local`
-  reach the container's web server on whatever port it listens on (detected; port
-  80 first, then common dev ports). Override with the `dev.berth.http-port` label
-  (`dev.orbstack.http-port` is read too). Containers that serve 443 themselves are
-  passed through untouched. Trust the local CA once: `berth tls trust`.
+**App**: Berth.app (SwiftUI) with first-run setup, a menu-bar item, containers,
+images, volumes, networks, Kubernetes, machines, terminals, logs, files and stats.
 
-- **File change notifications** on bind mounts: edits and new files on the Mac
-  reach watchers in containers (Vite, webpack, nodemon, `fs.watch`), so hot reload
-  works. Deletions are picked up on the watcher's next rescan.
-- **Own Docker CLIs**: berth downloads the official `docker` 29.9.2, Compose and
-  Buildx into `~/.berth/bin` and links them wherever none work (so removing another
-  Docker app doesn't break `docker`). The VM runs Docker's own engine (docker-ce 29).
-
-Not yet: per-domain `@port` routing hints in domain labels, UDP published ports and
-UDP to `host.docker.internal`, Linux machines. See the roadmap below.
+**Limits** (measured against OrbStack 2.2.5 in `bench/results/`)
+- Small-file I/O on bind mounts is ~3.5x slower: Apple's virtiofs costs ~450 µs
+  per operation, and nothing on the guest side changes that.
+- Memory used by a workload isn't returned to macOS after it ends (OrbStack in the
+  same test didn't return it within 2 minutes either).
+- Deleting a file on the Mac doesn't raise an inotify event in containers.
 
 ## Build
 
@@ -106,6 +105,8 @@ docker context use berth  # or: docker --context berth ps
 berth status
 berth domains             # container names and addresses
 berth tls trust           # trust the local CA for https://*.berth.local (one-time, asks for password)
+berth k8s enable          # Kubernetes (k3s) with a `berth` kubectl context
+berth machine create dev  # an Ubuntu machine; then: berth machine shell dev
 berth shell               # SSH into the VM; `berth shell uname -a` runs a command
 berth stop
 berth delete --yes        # wipe the VM disk (containers, images, volumes)
@@ -192,6 +193,10 @@ refuses any other name, so trusting it cannot be abused for real sites.
 - `src/daemon.rs`: background process; control socket, socket bridges, shutdown
 - `src/ports.rs`: published-port forwarding driven by Docker events
 - `src/routes.rs`, `src/helper.rs`: container subnet routes and the root helper
+- `src/watch.rs`: FSEvents → inotify forwarding for bind mounts
+- `src/memory.rs`: balloon controller
+- `src/k8s.rs`, `src/machines.rs`: Kubernetes and Linux machines (agent: `k8s.rs`, `machines.rs`)
+- `src/cli_tools.rs`: bundled Docker/Compose/Buildx/kubectl CLIs
 - `agent/`: the guest agent, a static Linux binary embedded in `berth` and
   refreshed into `~/.berth/guest/` on every start
   - `domains.rs`: Docker watcher, service IPs, guest addresses and NAT
@@ -208,13 +213,20 @@ Logs are in `~/.berth/log/` (`daemon.log`, `console.log`).
 
 ## Roadmap
 
-1. ✅ VM + Docker socket
-2. ✅ Port forwarding for published ports (TCP), Rust guest agent, container
-   domain names, direct container IPs, `host.docker.internal`, HTTPS and port
-   detection for domains. Next: UDP
-3. Custom kernel with direct boot for sub-second
-   start; userspace networking and file sharing tuned for throughput
-4. ✅ Menu-bar app and management window. Next: Linux machines (`berth create ubuntu`), Kubernetes
+Informed by OrbStack users' most-requested features (public issue tracker and
+discussions) and the limits above:
+
+- **Engine choice**: Podman and containerd/nerdctl alongside Docker (OrbStack's
+  most-upvoted open request)
+- **Faster file sharing**: a userspace file server (e.g. NFS) over the VM network
+  to beat virtiofs on metadata-heavy workloads
+- **Machines**: snapshots, cloud-init / custom images, GUI apps
+- **Networking**: bridged mode (container IPs on the LAN) through the root helper,
+  `.berth.local` names reachable from other devices, client source IP preservation
+- **Memory**: returning freed memory to macOS needs a VMM with free-page reporting
+  (Hypervisor.framework / libkrun); worth it only if it keeps Rosetta working
+- **Distribution**: signed and notarized releases with auto-update; data location
+  setting
 
 ## Compatibility notes
 
