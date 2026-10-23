@@ -11,7 +11,8 @@
 //! regular `home` share. Tunables: BERTH_FS_ENTRY_TIMEOUT / _ATTR_TIMEOUT
 //! / _NEGATIVE_TIMEOUT (seconds, default 1), BERTH_FS_WRITEBACK=1, BERTH_FS_POLL_US (default
 //! 100), BERTH_FS_QUEUES (request queues, default 1), BERTH_FS_THREADS=1
-//! (serve concurrent requests on worker threads), BERTH_FS_STATS=1.
+//! (serve concurrent requests on worker threads), BERTH_FS_STATS=1,
+//! BERTH_FS_TRACE=1 (log every request).
 //!
 //! Where the time goes: the framework takes ~70 µs to deliver each queue
 //! notification to us and about as long to get a reply back to the guest,
@@ -30,6 +31,13 @@
 //! 2.6 / 2.7; 4 in parallel: extract 19.1 / 12.8, read 8.6 / 3.7, delete
 //! 6.6 / 5.6. 2 GiB file: write 1.6 / 2.1 GB/s, read 2.9 / 3.5 GB/s.
 //! OrbStack's bind mounts extract the same files in ~2.3 s.
+//!
+//! Requests per file are set by the guest kernel and the tool: tar costs 5
+//! (LOOKUP, CREATE, WRITE, SETATTR, GETATTR of the directory), Composer ~12
+//! (it chmods each file 2-3 times). What's left to cut is our time per
+//! request (SETATTR goes through the open file and skips no-op chmods:
+//! 21 -> 7 µs) and the framework's per-request latency, which only a guest
+//! driver that polls for replies could reduce.
 
 #![allow(non_snake_case)]
 
@@ -348,9 +356,9 @@ impl FsDevice {
         // that landed before they could see this is picked up now.
         done.polling.store(false, Ordering::SeqCst);
         done.flush();
-        if stats::enabled() && stats::due() {
+        if let Some(idle) = stats::enabled().then(stats::due).flatten() {
             let ops = ivars.server.opcode_counts();
-            eprintln!("virtiofs: by opcode {:?}", ops.iter().take(12).map(|(op, n, us)| format!("{op}:{n}@{us:.1}µs")).collect::<Vec<_>>());
+            eprintln!("virtiofs: by opcode{} {:?}", if idle { " (idle)" } else { "" }, ops.iter().map(|(op, n, us)| format!("{op}:{n}@{us:.1}µs")).collect::<Vec<_>>());
         }
     }
 
@@ -407,7 +415,8 @@ fn poll_window() -> Duration {
     }))
 }
 
-/// Where time goes per request (BERTH_FS_STATS=1 logs every 20,000).
+/// Where time goes per request (BERTH_FS_STATS=1 logs every 20,000, and
+/// on going idle a second after the last log, so a workload gets a snapshot).
 mod stats {
     use std::sync::Mutex;
     use std::sync::OnceLock;
@@ -419,13 +428,14 @@ mod stats {
         serve: Duration,
         total: Duration,
         logged: u64,
+        logged_at: Option<std::time::Instant>,
         /// Notifications per virtqueue: shows whether the guest spreads
         /// requests over the request queues.
         queues: [u64; 17],
     }
 
     static STATS: Mutex<Stats> =
-        Mutex::new(Stats { n: 0, serve: Duration::ZERO, total: Duration::ZERO, logged: 0, queues: [0; 17] });
+        Mutex::new(Stats { n: 0, serve: Duration::ZERO, total: Duration::ZERO, logged: 0, logged_at: None, queues: [0; 17] });
 
     pub fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
@@ -451,12 +461,16 @@ mod stats {
         s.total += total;
     }
 
-    /// True once per 20,000 requests, logging the averages.
-    pub fn due() -> bool {
+    /// Called when the device goes idle: logs the averages every 20,000
+    /// requests (Some(false)), or when there are new ones after a second's
+    /// quiet (Some(true): a snapshot between workloads).
+    pub fn due() -> Option<bool> {
         let mut s = STATS.lock().unwrap();
-        if s.n < s.logged + 20_000 {
-            return false;
+        let quiet = s.logged_at.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) && s.n > s.logged;
+        if s.n < s.logged + 20_000 && !quiet {
+            return None;
         }
+        s.logged_at = Some(std::time::Instant::now());
         let us = |d: Duration| d.as_secs_f64() * 1e6 / s.n as f64;
         eprintln!(
             "virtiofs: {} requests, avg µs: serve {:.1}, queue-to-return {:.1}; notifications per queue {:?}",
@@ -466,7 +480,7 @@ mod stats {
             &s.queues[..s.queues.iter().rposition(|&n| n > 0).map_or(0, |i| i + 1)]
         );
         s.logged = s.n;
-        true
+        Some(quiet)
     }
 }
 

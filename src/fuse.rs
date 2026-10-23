@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr};
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -90,6 +91,12 @@ mod lerr {
     pub const EINVAL: i32 = 22;
     pub const ENOSYS: i32 = 38;
     pub const ESTALE: i32 = 116;
+}
+
+/// BERTH_FS_TRACE=1: log every request's opcode and node (for tuning).
+fn trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BERTH_FS_TRACE").is_some())
 }
 
 /// macOS errno → Linux errno. 1–34 are the same on both.
@@ -305,6 +312,12 @@ impl Server {
     fn serve(&self, request: &[u8]) -> Option<Vec<u8>> {
         let mut r = Reader::new(request);
         let (_len, opcode, unique, nodeid) = (r.u32()?, r.u32()?, r.u64()?, r.u64()?);
+        if trace() {
+            let name = request.get(40..).and_then(|b| b.split(|&c| c == 0).next()).filter(|_| matches!(opcode, op::LOOKUP | op::CREATE | op::MKDIR | op::UNLINK));
+            let valid = (opcode == op::SETATTR).then(|| request.get(40..44).map(|b| u32::from_le_bytes(b.try_into().unwrap()))).flatten();
+            let size = (opcode == op::SETATTR).then(|| request.get(56..64).map(|b| u64::from_le_bytes(b.try_into().unwrap()))).flatten();
+            eprintln!("fuse: op {opcode} node {nodeid}{}{}", valid.map(|v| format!(" valid {v:#x} size {}", size.unwrap_or(0))).unwrap_or_default(), name.map(|n| format!(" {:?}", String::from_utf8_lossy(&n[..n.len().min(40)]))).unwrap_or_default());
+        }
         if let Some(n) = self.opcodes.get(opcode as usize) {
             n.fetch_add(1, Ordering::Relaxed);
         }
@@ -480,6 +493,13 @@ impl Server {
             || self.path(nodeid).is_ok_and(|p| fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound))
     }
 
+    /// The node's path and its cached open file, if any.
+    fn path_and_file(&self, nodeid: u64) -> Result<(PathBuf, Option<Arc<fs::File>>), i32> {
+        let nodes = self.nodes.lock().unwrap();
+        let node = nodes.get(&nodeid).ok_or(lerr::ENOENT)?;
+        Ok((node.path.clone(), node.file.clone()))
+    }
+
     fn child(&self, parent: u64, name: &[u8]) -> Result<PathBuf, i32> {
         if name.is_empty() || name.contains(&b'/') {
             return Err(lerr::EINVAL);
@@ -524,6 +544,11 @@ impl Server {
     /// Register (or re-reference) the node at `path` and reply fuse_entry_out.
     fn entry(&self, path: PathBuf) -> Reply {
         let m = fs::symlink_metadata(&path).map_err(|e| io_errno(&e))?;
+        self.entry_with(path, &m)
+    }
+
+    /// `entry` for a path whose metadata the caller already has.
+    fn entry_with(&self, path: PathBuf, m: &fs::Metadata) -> Reply {
         let nodeid = if path == self.root { FUSE_ROOT_ID } else { m.ino() };
         let stale = {
             let mut nodes = self.nodes.lock().unwrap();
@@ -542,7 +567,7 @@ impl Server {
             .u64(p.attr.as_secs())
             .u32(p.entry.subsec_nanos())
             .u32(p.attr.subsec_nanos());
-        Self::attr(&mut out, nodeid, &m);
+        Self::attr(&mut out, nodeid, m);
         Ok(out.0)
     }
 
@@ -583,11 +608,36 @@ impl Server {
         let mode = r.u32().unwrap_or(0);
         let _unused = r.u32();
         let (uid, gid) = (r.u32().unwrap_or(u32::MAX), r.u32().unwrap_or(u32::MAX));
-        let path = self.path(nodeid)?;
+        // Through the open file when there is one (no path lookups), else
+        // by path.
+        let (path, cached) = self.path_and_file(nodeid)?;
+        let file = self.handle_file(fh).or(cached);
+        let fd = file.as_ref().map(|f| f.as_raw_fd());
         let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| lerr::EINVAL)?;
+        let stat = || match &file {
+            Some(f) => f.metadata(),
+            None => fs::symlink_metadata(&path),
+        };
+        let os_err = || io_errno(&std::io::Error::last_os_error());
+        // Attributes known to be current, saving a stat for the reply.
+        let mut current = None;
 
-        if valid & FATTR_MODE != 0 && unsafe { libc::chmod(c.as_ptr(), (mode & 0o7777) as libc::mode_t) } != 0 {
-            return Err(io_errno(&std::io::Error::last_os_error()));
+        if valid & FATTR_MODE != 0 {
+            // Tools set modes that are already right all the time (Composer
+            // chmods every extracted file, often twice): skip the change.
+            let m = stat().map_err(|e| io_errno(&e))?;
+            if m.mode() & 0o7777 == mode & 0o7777 {
+                current = Some(m);
+            } else {
+                let mode = (mode & 0o7777) as libc::mode_t;
+                let rc = match fd {
+                    Some(fd) => unsafe { libc::fchmod(fd, mode) },
+                    None => unsafe { libc::chmod(c.as_ptr(), mode) },
+                };
+                if rc != 0 {
+                    return Err(os_err());
+                }
+            }
         }
         if valid & (FATTR_UID | FATTR_GID) != 0 {
             let u = if valid & FATTR_UID != 0 { uid } else { u32::MAX };
@@ -595,19 +645,26 @@ impl Server {
             // We run as the user, so ownership changes mostly fail (guest
             // root extracting a tarball, Linux group IDs): ignore EPERM like
             // Apple's share does, and the file stays the user's.
-            if unsafe { libc::lchown(c.as_ptr(), u, g) } != 0 {
+            let rc = match fd {
+                Some(fd) => unsafe { libc::fchown(fd, u, g) },
+                None => unsafe { libc::lchown(c.as_ptr(), u, g) },
+            };
+            if rc != 0 {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() != Some(libc::EPERM) {
                     return Err(io_errno(&err));
                 }
+            } else {
+                current = None;
             }
         }
         if valid & FATTR_SIZE != 0 {
-            let result = match self.handle_file(fh) {
+            let result = match &file {
                 Some(f) => f.set_len(size),
                 None => fs::OpenOptions::new().write(true).open(&path).and_then(|f| f.set_len(size)),
             };
             result.map_err(|e| io_errno(&e))?;
+            current = None;
         }
         if valid & (FATTR_ATIME | FATTR_MTIME | FATTR_ATIME_NOW | FATTR_MTIME_NOW) != 0 {
             let ts = |set: bool, now: bool, sec: u64, nsec: u32| libc::timespec {
@@ -624,11 +681,19 @@ impl Server {
                 ts(valid & FATTR_ATIME != 0, valid & FATTR_ATIME_NOW != 0, atime, atimensec),
                 ts(valid & FATTR_MTIME != 0, valid & FATTR_MTIME_NOW != 0, mtime, mtimensec),
             ];
-            if unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
-                return Err(io_errno(&std::io::Error::last_os_error()));
+            let rc = match fd {
+                Some(fd) => unsafe { libc::futimens(fd, times.as_ptr()) },
+                None => unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) },
+            };
+            if rc != 0 {
+                return Err(os_err());
             }
+            current = None;
         }
-        let m = fs::symlink_metadata(&path).map_err(|e| io_errno(&e))?;
+        let m = match current {
+            Some(m) => m,
+            None => stat().map_err(|e| io_errno(&e))?,
+        };
         Ok(self.attr_reply(nodeid, &m))
     }
 
@@ -721,7 +786,8 @@ impl Server {
     fn create(&self, parent: u64, name: &[u8], flags: u32, mode: u32) -> Reply {
         let path = self.child(parent, name)?;
         let file = Arc::new(Self::open_file(&path, flags | 0o100, mode & 0o7777)?);
-        let mut body = self.entry(path.clone())?;
+        let m = file.metadata().map_err(|e| io_errno(&e))?;
+        let mut body = self.entry_with(path.clone(), &m)?;
         // A no-open kernel never sends RELEASE, even for created files: keep
         // the file as the node's (closed when evicted) and reply fh 0.
         let fh = if self.no_open.load(Ordering::Relaxed) {
@@ -1139,6 +1205,43 @@ mod tests {
         assert_eq!(reply(&s, op::MKDIR, vendor, &mkdir.0).0, -lerr::ESTALE);
         assert_eq!(reply(&s, op::LOOKUP, vendor, &name("nope")).0, -lerr::ESTALE);
         assert_eq!(reply(&s, op::GETATTR, vendor, &[0; 16]).0, -lerr::ESTALE);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    fn setattr_body(valid: u32, size: u64, mtime: u64, mode: u32) -> Vec<u8> {
+        let mut b = Out::default();
+        b.u32(valid).u32(0).u64(0).u64(size).u64(0).u64(0).u64(mtime).u64(0).u32(0).u32(0).u32(0).u32(mode).u32(0).u32(0).u32(0).u32(0);
+        b.0
+    }
+
+    #[test]
+    fn setattr_through_the_open_file() {
+        let dir = tempdir("setattr");
+        let s = Server::new(dir.clone(), CachePolicy::default());
+        let mut init = Out::default();
+        init.u32(7).u32(41).u32(131072).u32(FUSE_NO_OPEN_SUPPORT);
+        reply(&s, op::INIT, 0, &init.0);
+        let mut create = Out::default();
+        create.u32(0o1 | 0o100).u32(0o644).u32(0).u32(0);
+        create.0.extend_from_slice(&name("f"));
+        let (_, body) = reply(&s, op::CREATE, FUSE_ROOT_ID, &create.0);
+        let nodeid = u64::from_le_bytes(body[0..8].try_into().unwrap());
+        let mut write = Out::default();
+        write.u64(0).u64(0).u32(5).u32(0).u64(0).u32(0).u32(0);
+        write.0.extend_from_slice(b"hello");
+        reply(&s, op::WRITE, nodeid, &write.0);
+        let mode_of = |body: &[u8]| u32::from_le_bytes(body[16 + 60..16 + 64].try_into().unwrap()) & 0o7777;
+
+        // Same mode: nothing changes, the reply still carries the attributes.
+        let (err, body) = reply(&s, op::SETATTR, nodeid, &setattr_body(FATTR_MODE, 0, 0, 0o100644));
+        assert_eq!((err, mode_of(&body)), (0, 0o644));
+        let (err, body) = reply(&s, op::SETATTR, nodeid, &setattr_body(FATTR_MODE, 0, 0, 0o100600));
+        assert_eq!((err, mode_of(&body)), (0, 0o600));
+        assert_eq!(fs::metadata(dir.join("f")).unwrap().mode() & 0o7777, 0o600);
+        assert_eq!(reply(&s, op::SETATTR, nodeid, &setattr_body(FATTR_SIZE, 2, 0, 0)).0, 0);
+        assert_eq!(fs::read(dir.join("f")).unwrap(), b"he");
+        assert_eq!(reply(&s, op::SETATTR, nodeid, &setattr_body(FATTR_MTIME, 0, 1_000_000_000, 0)).0, 0);
+        assert_eq!(fs::metadata(dir.join("f")).unwrap().mtime(), 1_000_000_000);
         fs::remove_dir_all(dir).ok();
     }
 
