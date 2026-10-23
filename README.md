@@ -65,6 +65,11 @@ images, volumes, networks, Kubernetes, machines, terminals, logs, files and stat
 **Limits** (measured against OrbStack 2.2.5 in `bench/results/`)
 - Small-file I/O on bind mounts is ~3.5x slower: Apple's virtiofs costs ~450 µs
   per operation, and nothing on the guest side changes that.
+- DDEV + Drupal CMS: `ddev composer create-project` fails on Apple's virtiofs
+  (the project folder shows as root-owned in containers, so `rsync -g` can't
+  set its group). It works on berth's own share (below), where everything that
+  writes many small files is still 2–2.4x slower than OrbStack; warm page loads
+  are on par (`bench/results/2026-10-23-ddev-drupal.md`).
 - Memory used by a workload isn't returned to macOS after it ends (OrbStack in the
   same test didn't return it within 2 minutes either).
 - Deleting a file on the Mac doesn't raise an inotify event in containers.
@@ -233,8 +238,13 @@ Logs are in `~/.berth/log/` (`daemon.log`, `console.log`).
 Informed by OrbStack users' most-requested features (public issue tracker and
 discussions) and the limits above:
 
-- **Faster file sharing**: a userspace file server (e.g. NFS) over the VM network
-  to beat virtiofs on metadata-heavy workloads
+- **berth's own file sharing as the default** (macOS 27): a virtio-fs server on
+  the new custom Virtio device API (`src/virtiofs.rs`, `src/fuse.rs`), today
+  behind `BERTH_EXPERIMENTAL_FS=1`. It beats Apple's share on reads (1.8x),
+  parallel work (1.5–2.3x) and large files, handles ownership like OrbStack,
+  and ties on single-process creates. Left: mounting it at the home path in
+  place of Apple's, wider testing, and fewer round trips per file to close the
+  remaining gap to OrbStack on writes
 - **Machines**: snapshots, cloud-init / custom images
 - **Linux GUI apps**: first a console window (virtio-gpu 2D, clipboard via
   spice-vdagent), then per-app windows like WSLg (a compositor in the machine,

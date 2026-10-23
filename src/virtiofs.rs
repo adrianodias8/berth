@@ -9,7 +9,7 @@
 //! Enabled with BERTH_EXPERIMENTAL_FS=1. The share appears in the guest under
 //! the tag `berthfs` (mount -t virtiofs berthfs /mnt/berthfs), next to the
 //! regular `home` share. Tunables: BERTH_FS_ENTRY_TIMEOUT / _ATTR_TIMEOUT
-//! (seconds, default 1), BERTH_FS_WRITEBACK=1, BERTH_FS_POLL_US (default
+//! / _NEGATIVE_TIMEOUT (seconds, default 1), BERTH_FS_WRITEBACK=1, BERTH_FS_POLL_US (default
 //! 100), BERTH_FS_QUEUES (request queues, default 1), BERTH_FS_THREADS=1
 //! (serve concurrent requests on worker threads), BERTH_FS_STATS=1.
 //!
@@ -486,6 +486,7 @@ pub fn device(root: &std::path::Path) -> Option<Retained<NSObject>> {
     let policy = CachePolicy {
         entry: Duration::from_secs_f64(num("BERTH_FS_ENTRY_TIMEOUT", 1.0)),
         attr: Duration::from_secs_f64(num("BERTH_FS_ATTR_TIMEOUT", 1.0)),
+        negative: Duration::from_secs_f64(num("BERTH_FS_NEGATIVE_TIMEOUT", 1.0)),
         writeback: std::env::var_os("BERTH_FS_WRITEBACK").is_some(),
     };
     let request_queues = (num("BERTH_FS_QUEUES", DEFAULT_REQUEST_QUEUES as f64) as u16).clamp(1, 16);

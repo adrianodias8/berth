@@ -185,13 +185,13 @@ async fn sync() -> Result<()> {
         // Bind synchronously so a conflict is reported now and retried on the
         // next event instead of failing silently in a task.
         let task = match key.2 {
-            Proto::Tcp => std::net::TcpListener::bind((key.0, key.1)).and_then(|std| {
+            Proto::Tcp => bind_tcp(key.0, key.1).and_then(|std| {
                 std.set_nonblocking(true)?;
                 // Ports Docker binds on all guest interfaces can be reached on
                 // the guest's NAT address; loopback-only ones only via the agent.
                 Ok(tokio::spawn(forward(TcpListener::from_std(std)?, key.1, key.0 == "::")))
             }),
-            Proto::Udp => std::net::UdpSocket::bind((key.0, key.1)).and_then(|std| {
+            Proto::Udp => bind_udp(key.0, key.1).and_then(|std| {
                 std.set_nonblocking(true)?;
                 Ok(tokio::spawn(forward_udp(tokio::net::UdpSocket::from_std(std)?, key.1)))
             }),
@@ -205,6 +205,35 @@ async fn sync() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// macOS lets users bind ports below 1024 only on all interfaces; for
+/// loopback ones (DDEV's router on 127.0.0.1:80/443, say) the root helper
+/// binds and hands us the socket.
+fn privileged(addr: &str, port: u16, err: &std::io::Error) -> Option<std::net::IpAddr> {
+    let ip: std::net::IpAddr = addr.parse().ok()?;
+    (err.kind() == std::io::ErrorKind::PermissionDenied && port < 1024 && ip.is_loopback()).then_some(ip)
+}
+
+fn bind_tcp(addr: &str, port: u16) -> std::io::Result<std::net::TcpListener> {
+    std::net::TcpListener::bind((addr, port)).or_else(|err| {
+        let Some(ip) = privileged(addr, port, &err) else { return Err(err) };
+        let fd = crate::helper::bind_privileged(ip, port, false).map_err(|e| std::io::Error::other(format!("{err}; helper: {e:#}")))?;
+        let listener = std::net::TcpListener::from(fd);
+        // The helper only binds; listening is ours.
+        if unsafe { libc::listen(std::os::fd::AsRawFd::as_raw_fd(&listener), 1024) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(listener)
+    })
+}
+
+fn bind_udp(addr: &str, port: u16) -> std::io::Result<std::net::UdpSocket> {
+    std::net::UdpSocket::bind((addr, port)).or_else(|err| {
+        let Some(ip) = privileged(addr, port, &err) else { return Err(err) };
+        let fd = crate::helper::bind_privileged(ip, port, true).map_err(|e| std::io::Error::other(format!("{err}; helper: {e:#}")))?;
+        Ok(std::net::UdpSocket::from(fd))
+    })
 }
 
 /// Map Docker's host IP for a binding to where we listen on the Mac.

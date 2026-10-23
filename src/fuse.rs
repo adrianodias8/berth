@@ -54,7 +54,6 @@ mod op {
 
 // FUSE_INIT flags we may enable.
 const FUSE_ASYNC_READ: u32 = 1 << 0;
-const FUSE_ATOMIC_O_TRUNC: u32 = 1 << 3;
 const FUSE_BIG_WRITES: u32 = 1 << 5;
 const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
 const FUSE_DO_READDIRPLUS: u32 = 1 << 13;
@@ -90,6 +89,7 @@ mod lerr {
     pub const EBADF: i32 = 9;
     pub const EINVAL: i32 = 22;
     pub const ENOSYS: i32 = 38;
+    pub const ESTALE: i32 = 116;
 }
 
 /// macOS errno → Linux errno. 1–34 are the same on both.
@@ -139,12 +139,22 @@ fn mac_open_flags(linux: u32) -> i32 {
 pub struct CachePolicy {
     pub entry: Duration,
     pub attr: Duration,
+    /// How long the guest may remember that a name doesn't exist. PHP,
+    /// Composer and compilers probe many missing paths; each costs a round
+    /// trip otherwise. Short, since a file created on the Mac stays
+    /// invisible to the guest this long.
+    pub negative: Duration,
     pub writeback: bool,
 }
 
 impl Default for CachePolicy {
     fn default() -> Self {
-        Self { entry: Duration::from_secs(1), attr: Duration::from_secs(1), writeback: false }
+        Self {
+            entry: Duration::from_secs(1),
+            attr: Duration::from_secs(1),
+            negative: Duration::from_secs(1),
+            writeback: false,
+        }
     }
 }
 
@@ -397,6 +407,15 @@ impl Server {
             op::ACCESS => self.path(nodeid).map(|_| Vec::new()),
             _ => Err(lerr::ENOSYS),
         };
+        // The guest caches names and attributes, so it may refer to a file
+        // or directory that was since removed on the Mac. ESTALE (rather
+        // than ENOENT) makes its kernel look the path up again, bypassing
+        // the cache, and retry: `rm -rf vendor` on the Mac followed by
+        // `composer install` in a container then just works.
+        let result = match result {
+            Err(lerr::ENOENT) if nodeid != 0 && self.vanished(nodeid) => Err(lerr::ESTALE),
+            result => result,
+        };
         let (error, body) = match result {
             Ok(body) => (0, body),
             Err(errno) => (-errno, Vec::new()),
@@ -418,8 +437,11 @@ impl Server {
             return Err(lerr::EINVAL);
         }
         self.no_open.store(kernel_flags & FUSE_NO_OPEN_SUPPORT != 0, Ordering::Relaxed);
+        // Not FUSE_ATOMIC_O_TRUNC: it moves O_TRUNC into OPEN, which a
+        // no-open kernel never sends, so `open(O_TRUNC)` wouldn't truncate
+        // (a rewritten shorter file kept its old tail). Without it the
+        // kernel truncates with SETATTR first.
         let mut want = FUSE_ASYNC_READ
-            | FUSE_ATOMIC_O_TRUNC
             | FUSE_BIG_WRITES
             | FUSE_AUTO_INVAL_DATA
             | FUSE_PARALLEL_DIROPS
@@ -449,6 +471,13 @@ impl Server {
 
     fn path(&self, nodeid: u64) -> Result<PathBuf, i32> {
         self.nodes.lock().unwrap().get(&nodeid).map(|n| n.path.clone()).ok_or(lerr::ENOENT)
+    }
+
+    /// The node (the file itself, or the directory a name is looked up in)
+    /// is gone: unknown to us, or no longer on disk.
+    fn vanished(&self, nodeid: u64) -> bool {
+        self.path(nodeid).is_err()
+            || self.path(nodeid).is_ok_and(|p| fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound))
     }
 
     fn child(&self, parent: u64, name: &[u8]) -> Result<PathBuf, i32> {
@@ -519,7 +548,16 @@ impl Server {
 
     fn lookup(&self, parent: u64, name: &[u8]) -> Reply {
         let path = self.child(parent, name)?;
-        self.entry(path)
+        match self.entry(path) {
+            // A negative entry (node ID 0) the guest may cache.
+            Err(lerr::ENOENT) if !self.policy.negative.is_zero() && !self.vanished(parent) => {
+                let n = self.policy.negative;
+                let mut out = Out::default();
+                out.u64(0).u64(0).u64(n.as_secs()).u64(0).u32(n.subsec_nanos()).u32(0).zeros(88);
+                Ok(out.0)
+            }
+            result => result,
+        }
     }
 
     fn attr_reply(&self, nodeid: u64, m: &fs::Metadata) -> Vec<u8> {
@@ -926,7 +964,10 @@ mod tests {
 
         // Missing names map to Linux ENOENT; removing a non-empty dir maps
         // macOS ENOTEMPTY (66) to Linux 39.
-        assert_eq!(reply(&s, op::LOOKUP, FUSE_ROOT_ID, &name("nope")).0, -lerr::ENOENT);
+        let (err, body) = reply(&s, op::LOOKUP, FUSE_ROOT_ID, &name("nope"));
+        assert_eq!((err, u64::from_le_bytes(body[0..8].try_into().unwrap())), (0, 0), "negative entry");
+        let plain = Server::new(dir.clone(), CachePolicy { negative: Duration::ZERO, ..CachePolicy::default() });
+        assert_eq!(reply(&plain, op::LOOKUP, FUSE_ROOT_ID, &name("nope")).0, -lerr::ENOENT);
         let mut mkdir = Out::default();
         mkdir.u32(0o755).u32(0);
         mkdir.0.extend_from_slice(&name("d"));
@@ -1076,6 +1117,28 @@ mod tests {
         let open = s.nodes.lock().unwrap().values().filter(|n| n.file.is_some()).count();
         assert_eq!(open, MAX_CACHED_FILES);
         assert_eq!(fs::read(dir.join("f0")).unwrap(), b"x", "evicted files were written");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn removed_on_the_mac_is_stale_not_missing() {
+        let dir = tempdir("stale");
+        fs::create_dir_all(dir.join("vendor/old")).unwrap();
+        let s = Server::new(dir.clone(), CachePolicy::default());
+        let (_, body) = reply(&s, op::LOOKUP, FUSE_ROOT_ID, &name("vendor"));
+        let vendor = u64::from_le_bytes(body[0..8].try_into().unwrap());
+        // A missing name in a directory that exists is just missing...
+        let (err, body) = reply(&s, op::LOOKUP, vendor, &name("nope"));
+        assert_eq!((err, u64::from_le_bytes(body[0..8].try_into().unwrap())), (0, 0));
+        // ...but once the directory itself is removed behind the guest's
+        // back, anything through it is stale.
+        fs::remove_dir_all(dir.join("vendor")).unwrap();
+        let mut mkdir = Out::default();
+        mkdir.u32(0o755).u32(0);
+        mkdir.0.extend_from_slice(&name("composer"));
+        assert_eq!(reply(&s, op::MKDIR, vendor, &mkdir.0).0, -lerr::ESTALE);
+        assert_eq!(reply(&s, op::LOOKUP, vendor, &name("nope")).0, -lerr::ESTALE);
+        assert_eq!(reply(&s, op::GETATTR, vendor, &[0; 16]).0, -lerr::ESTALE);
         fs::remove_dir_all(dir).ok();
     }
 

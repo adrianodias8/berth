@@ -2,8 +2,10 @@
 //! to reach container IPs directly it needs a route per subnet via the guest,
 //! and routes need root. This runs as a LaunchDaemon installed once with
 //! `sudo berth helper install`. It keeps a set of routes for private subnets
-//! via a VM on a vmnet bridge, and points /var/run/docker.sock at the user's
-//! berth socket, for one user.
+//! via a VM on a vmnet bridge, points /var/run/docker.sock at the user's
+//! berth socket, and binds privileged loopback ports for port forwarding
+//! (macOS lets users bind ports below 1024 only on all interfaces), for one
+//! user.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
@@ -37,7 +39,7 @@ pub struct Route {
 }
 
 /// Bumped when the helper gains abilities, so berth can ask for a reinstall.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize)]
 pub struct SetRoutes {
@@ -251,6 +253,9 @@ fn handle(stream: UnixStream, uid: u32, installed: &mut BTreeSet<Route>) -> Resu
     }
     let mut line = String::new();
     BufReader::new(&stream).read_line(&mut line)?;
+    if let Ok(bind) = serde_json::from_str::<BindRequest>(&line) {
+        return send_bound(&stream, &bind);
+    }
     let request: SetRoutes = serde_json::from_str(&line)?;
     let mut reply = reconcile(&request.routes, installed);
     if let Some(target) = &request.docker_socket
@@ -434,6 +439,89 @@ fn parse_netstat_dest(dest: &str) -> Option<Cidr> {
 
 /// Ask the helper to make exactly `routes` active and, if given, point the
 /// default Docker socket at ours. None if the helper isn't installed.
+/// A request for a listening socket on a privileged loopback port.
+#[derive(Serialize, Deserialize)]
+struct BindRequest {
+    bind: std::net::IpAddr,
+    port: u16,
+    udp: bool,
+}
+
+/// Bind the port and pass the socket back over `stream` (SCM_RIGHTS), or
+/// reply with the error. Only loopback and only ports below 1024: anything
+/// else berth can bind itself.
+fn send_bound(stream: &UnixStream, req: &BindRequest) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let result: std::io::Result<std::os::fd::OwnedFd> = if !req.bind.is_loopback() || req.port == 0 || req.port >= 1024 {
+        Err(std::io::Error::other(format!("refusing to bind {}:{}", req.bind, req.port)))
+    } else if req.udp {
+        std::net::UdpSocket::bind((req.bind, req.port)).map(Into::into)
+    } else {
+        std::net::TcpListener::bind((req.bind, req.port)).map(Into::into)
+    };
+    let fd = match result {
+        Ok(fd) => fd,
+        Err(err) => {
+            let mut stream = stream;
+            writeln!(stream, "error: {err}")?;
+            return Ok(());
+        }
+    };
+    let mut byte = *b"\n";
+    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
+    let mut control = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as _;
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as _;
+        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<i32>(), fd.as_raw_fd());
+        if libc::sendmsg(stream.as_raw_fd(), &msg, 0) < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    eprintln!("berth-helper: bound {}:{} for berth", req.bind, req.port);
+    Ok(())
+}
+
+/// A socket bound by the helper on a privileged loopback port, for a port
+/// forward. The TCP one is bound but not yet listening.
+pub fn bind_privileged(bind: std::net::IpAddr, port: u16, udp: bool) -> Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    if !Path::new(SOCKET).exists() {
+        bail!("needs the berth helper");
+    }
+    let mut stream = UnixStream::connect(SOCKET)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    writeln!(stream, "{}", serde_json::to_string(&BindRequest { bind, port, udp })?)?;
+    let mut buf = [0u8; 256];
+    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+    let mut control = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len() as _;
+    let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if !cmsg.is_null() && (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+            let fd = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<i32>());
+            return Ok(std::os::fd::OwnedFd::from_raw_fd(fd));
+        }
+    }
+    let text = String::from_utf8_lossy(&buf[..n as usize]);
+    bail!("{}", text.trim().strip_prefix("error: ").unwrap_or("helper did not bind (outdated helper?)"))
+}
+
 pub fn set_routes(routes: Vec<Route>, docker_socket: Option<String>, cli_dir: Option<String>) -> Option<Result<Reply>> {
     if !Path::new(SOCKET).exists() {
         return None;
