@@ -7,6 +7,8 @@ are in the commit messages.
 
 ### 2026-10-24
 - **Kubernetes:** LoadBalancer services on the Mac's localhost.
+- **Finder:** running containers' root filesystems at `~/Berth/containers`;
+  `~/Berth` is now SMB with a password (no helper needed), files show as yours.
 - **App:** import from OrbStack or Docker Desktop (Settings), and Intel /
   cloud-init options for new machines.
 - **CLI:** `berth restart`, `berth info`, `berth logs`, `berth completions`.

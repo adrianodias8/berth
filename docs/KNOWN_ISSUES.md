@@ -98,9 +98,11 @@ fix one, remove it here in the same change.
     (`berth config set` checks it);
   - a Docker binding only on `::1` maps to 127.0.0.1.
 
-- **`~/Berth` (NFS) gives root in the VM** to whoever mounts it. Only root
-  on the Mac can (the export needs a reserved port; the helper mounts it),
-  but another VM on the same vmnet bridge could spoof the Mac's address.
+- **`~/Berth` (SMB) gives root in the VM** to whoever has the share's
+  password (`~/.berth/files-password`, readable only by the Mac user). Absolute
+  symlinks in `~/Berth/containers` resolve in the VM, not the container: the
+  share follows links so the containers' folders (links to their root
+  filesystems) work.
 
 ## Root helper and downloads
 

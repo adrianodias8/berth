@@ -343,6 +343,7 @@ fn sync_now(table: &Shared) -> io::Result<()> {
     }
 
     apply(&up, &mapping)?;
+    crate::files::sync_containers();
     let gone: Vec<(String, Ipv4Addr)> = {
         let mut t = table.write().unwrap();
         let gone = t

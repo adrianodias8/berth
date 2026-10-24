@@ -78,10 +78,13 @@ and boot messages). `berth shell` opens a shell in the VM.
 
 ## Files
 
-- **`~/Berth` is empty.** It's only mounted while berth runs, with the IP route
-  helper installed (`sudo berth helper install`; the VM accepts mounts only
-  from root), and not with `"finder": false`. `daemon.log` says why if the
-  mount failed.
+- **`~/Berth` is empty.** It's only mounted while berth runs, and not with
+  `"finder": false`. `daemon.log` says why if the mount failed. A container
+  shows up in `~/Berth/containers` a second or so after it starts (Finder
+  may need a moment to refresh), and only while it runs.
+- **A container's symlink opens the wrong file in Finder.** Absolute symlinks
+  inside a container (`/usr/lib/x -> /usr/lib/y`) are followed in the VM, not
+  the container.
 
 - **A change on the Mac shows up late in a container.** Changes are
   forwarded from FSEvents, which takes ~0.6 s. Deleting a file on the Mac

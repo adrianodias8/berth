@@ -98,10 +98,11 @@ from its code.
   - the Mac's SSH agent works in machines (`SSH_AUTH_SOCK`), and in
     containers that mount `/run/host-services/ssh-auth.sock`, as with Docker
     Desktop: `-v /run/host-services/ssh-auth.sock:/agent.sock -e SSH_AUTH_SOCK=/agent.sock`
-- Files in Finder: `~/Berth/volumes` (Docker volumes) and `~/Berth/machines`
-  (machines' root folders), mounted from the VM while berth runs, through the IP
-  route helper (the VM only accepts mounts from root). Files open as root in the
-  VM, so anything there can be read and edited (`"finder": false` turns it off)
+- Files in Finder: `~/Berth/volumes` (Docker volumes), `~/Berth/machines`
+  (machines' root folders) and `~/Berth/containers` (running containers' root
+  filesystems), mounted over SMB from the VM while berth runs, with a password only
+  you can read. Files show as yours and open as root in the VM, so anything there
+  can be read and edited (`"finder": false` turns it off)
 - Debug shell: `berth debug <container>` opens a root shell inside any
   container, distroless and scratch images included, with the VM's tools
   (bash, ps, ss, curl, `apt install` for more). It shares the container's
@@ -342,7 +343,7 @@ refuses any other name, so trusting it cannot be abused for real sites.
 - `src/snapshots.rs`: VM snapshots and suspend (disk clones, saved machine state, restore)
 - `src/macexec.rs` (agent: `mac.rs`), `src/sshconfig.rs`: machines and the Mac: the `mac`
   command, the SSH agent, `ssh <machine>.berth`
-- `src/files.rs` (agent: `files.rs`): `~/Berth` in Finder over NFS
+- `src/files.rs` (agent: `files.rs`): `~/Berth` in Finder over SMB
 - `guest/berth-debug.sh`: `berth debug`
 - `src/import.rs`: `berth import` from OrbStack or Docker Desktop
 - `src/cacerts.rs` (+ `guest/berth-ca-sync.sh`): the Mac's trusted CAs for the VM

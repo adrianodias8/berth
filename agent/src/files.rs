@@ -1,21 +1,34 @@
-//! The VM's files in Finder: Docker volumes and machines, exported over
-//! NFS to the Mac only, which mounts them at ~/Berth (src/files.rs).
+//! The VM's files in Finder at ~/Berth (src/files.rs mounts it): Docker
+//! volumes, machines, and running containers' root filesystems, shared
+//! over SMB to the Mac only.
 //!
-//! The export root /srv/berth holds bind mounts of /var/lib/docker/volumes
-//! and /var/lib/machines. Requests are squashed to root: the Mac user can
-//! open what containers and machines wrote, whoever owns it in the VM. Only
-//! the Mac's address on the VM network may mount it, from a reserved port
-//! (root on the Mac: berth's helper).
+//! SMB rather than the kernel's NFS server: containers' root filesystems
+//! are overlay mounts, which knfsd can't export, while Samba reads them like
+//! any folder. It also checks a password the host generates (only the Mac
+//! user can read it), instead of trusting whoever connects.
+//!
+//! /srv/berth holds bind mounts of /var/lib/docker/volumes and
+//! /var/lib/machines, and `containers/<name>` symlinks to each running
+//! container's root filesystem: a bind mount would keep a stopped
+//! container's overlay alive, and its restart would then mount the same
+//! upper directory twice. Samba follows the links (wide links), so a
+//! container's absolute symlinks resolve in the VM, not the container.
+//! Everything is served as root: the Mac user can open what containers and
+//! machines wrote, whoever owns it in the VM.
 
 use std::io;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const ROOT: &str = "/srv/berth";
-const EXPORTS: &str = "/etc/exports.d/berth.exports";
-const NFS_CONF: &str = "/etc/nfs.conf.d/berth.conf";
-/// Fixed so the Mac can mount without asking rpcbind (src/helper.rs).
-pub const MOUNTD_PORT: u16 = 20048;
+const CONF: &str = "/etc/samba/smb.conf";
+const USER: &str = "berthsmb";
+/// The share (src/files.rs mounts smb://<vm>/berth).
+pub const SHARE: &str = "berth";
+
+/// Set once the share is up: container links are kept from then on.
+static ENABLED: AtomicBool = AtomicBool::new(false);
 
 fn sh(script: &str) -> io::Result<String> {
     let out = Command::new("sh").args(["-c", script]).output()?;
@@ -30,11 +43,21 @@ fn mounted(path: &str) -> bool {
     std::fs::read_to_string("/proc/self/mountinfo").is_ok_and(|info| info.lines().any(|l| l.split(' ').nth(4) == Some(path)))
 }
 
-/// `files` header: make sure the export is up; replies "ok" (or an error).
-pub fn ensure() -> io::Result<()> {
-    if !Path::new("/usr/sbin/exportfs").exists() {
-        eprintln!("berth-agent: files: installing the NFS server");
-        sh("DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends nfs-kernel-server >/dev/null")?;
+/// `files <password>`: make sure the share is up with this password.
+pub fn ensure(password: &str) -> io::Result<()> {
+    if password.len() < 32 || !password.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(io::Error::other("bad password"));
+    }
+    if !Path::new("/usr/sbin/smbd").exists() {
+        eprintln!("berth-agent: files: installing Samba");
+        sh("DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends samba >/dev/null")?;
+        // Only smbd: no NetBIOS name service, no AD domain controller.
+        let _ = sh("systemctl disable --now nmbd samba-ad-dc 2>/dev/null; true");
+    }
+    // An earlier berth exported these over NFS.
+    if Path::new("/etc/exports.d/berth.exports").exists() {
+        let _ = std::fs::remove_file("/etc/exports.d/berth.exports");
+        let _ = sh("exportfs -ra 2>/dev/null; systemctl disable --now nfs-server 2>/dev/null; true");
     }
     for (name, source) in [("volumes", "/var/lib/docker/volumes"), ("machines", "/var/lib/machines")] {
         let target = format!("{ROOT}/{name}");
@@ -44,26 +67,109 @@ pub fn ensure() -> io::Result<()> {
             sh(&format!("mount --bind {source} {target}"))?;
         }
     }
-    // The Mac is the VM's default gateway on the NAT network.
+    std::fs::create_dir_all(format!("{ROOT}/containers"))?;
+
+    // The Mac is the VM's default gateway on the NAT network; listen only
+    // on the address it reaches us at.
     let mac = sh("ip -4 route show default | awk '{print $3; exit}'")?.trim().to_string();
-    if mac.parse::<std::net::Ipv4Addr>().is_err() {
-        return Err(io::Error::other("no default gateway"));
+    let dev = sh("ip -4 route show default | awk '{print $5; exit}'")?.trim().to_string();
+    if mac.parse::<std::net::Ipv4Addr>().is_err() || dev.is_empty() || !dev.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(io::Error::other("no default route"));
     }
-    // `secure` (the default): reserved source ports only, which on the Mac
-    // only root has: its helper mounts it (src/helper.rs).
-    let exports = format!("{ROOT} {mac}(rw,secure,no_subtree_check,crossmnt,all_squash,anonuid=0,anongid=0)\n");
-    let conf = format!("[mountd]\nport={MOUNTD_PORT}\n[nfsd]\nthreads=8\n");
-    let mut changed = false;
-    for (path, contents) in [(EXPORTS, &exports), (NFS_CONF, &conf)] {
-        if std::fs::read_to_string(path).ok().as_deref() != Some(contents.as_str()) {
-            std::fs::create_dir_all(Path::new(path).parent().unwrap_or(Path::new("/")))?;
-            std::fs::write(path, contents)?;
-            changed = true;
+    let conf = format!(
+        "# Written by berth (agent/src/files.rs).\n\
+         [global]\n\
+         \x20 server role = standalone server\n\
+         \x20 map to guest = never\n\
+         \x20 disable netbios = yes\n\
+         \x20 smb ports = 445\n\
+         \x20 interfaces = {dev}\n\
+         \x20 bind interfaces only = yes\n\
+         \x20 hosts allow = {mac}\n\
+         \x20 hosts deny = ALL\n\
+         \x20 server min protocol = SMB3\n\
+         \x20 load printers = no\n\
+         \x20 printing = bsd\n\
+         \x20 printcap name = /dev/null\n\
+         \x20 disable spoolss = yes\n\
+         \x20 log level = 0\n\
+         \x20 allow insecure wide links = yes\n\
+         \x20 vfs objects = fruit streams_xattr\n\
+         \x20 fruit:metadata = stream\n\
+         \x20 fruit:nfs_aces = no\n\
+         [{SHARE}]\n\
+         \x20 path = {ROOT}\n\
+         \x20 valid users = {USER}\n\
+         \x20 read only = no\n\
+         \x20 force user = root\n\
+         \x20 force group = root\n\
+         \x20 follow symlinks = yes\n\
+         \x20 wide links = yes\n\
+         \x20 case sensitive = yes\n"
+    );
+    let changed = std::fs::read_to_string(CONF).ok().as_deref() != Some(conf.as_str());
+    if changed {
+        std::fs::write(CONF, &conf)?;
+    }
+    if sh(&format!("id -u {USER}")).is_err() {
+        sh(&format!("useradd --system --no-create-home --shell /usr/sbin/nologin {USER}"))?;
+    }
+    // The password goes on stdin, not the command line.
+    let mut child = Command::new("smbpasswd")
+        .args(["-a", "-s", USER])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        io::Write::write_all(&mut stdin, format!("{password}\n{password}\n").as_bytes())?;
+    }
+    child.wait()?;
+    if changed || sh("systemctl is-active -q smbd").is_err() {
+        sh("systemctl enable -q smbd && systemctl restart smbd")?;
+    }
+    ENABLED.store(true, Ordering::SeqCst);
+    sync_containers();
+    Ok(())
+}
+
+/// Keep `containers/<name>` pointing at each running container's root
+/// filesystem (called from the domain sync, which follows Docker events).
+pub fn sync_containers() {
+    if !ENABLED.load(Ordering::SeqCst) {
+        return;
+    }
+    let dir = format!("{ROOT}/containers");
+    let mut wanted = std::collections::BTreeMap::new();
+    for c in crate::docker::containers().unwrap_or_default() {
+        let Some(name) = c.name().filter(|n| !n.is_empty() && !n.contains('/') && !n.starts_with('.')) else { continue };
+        if let Some(rootfs) = rootfs(&c.id) {
+            wanted.insert(name.to_string(), rootfs);
         }
     }
-    if changed || sh("systemctl is-active -q nfs-server").is_err() {
-        sh("systemctl enable -q nfs-server && systemctl restart nfs-server")?;
+    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let target = std::fs::read_link(entry.path()).ok();
+        if target.as_ref().map(|t| t.to_string_lossy().into_owned()) != wanted.get(&name).cloned() {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
-    sh("exportfs -ra")?;
-    Ok(())
+    for (name, rootfs) in wanted {
+        let link = format!("{dir}/{name}");
+        if std::fs::symlink_metadata(&link).is_err() {
+            let _ = std::os::unix::fs::symlink(&rootfs, &link);
+        }
+    }
+}
+
+/// Where a running container's root filesystem is mounted in the VM:
+/// containerd's image store (Docker 29's default), or overlay2's merged dir.
+fn rootfs(id: &str) -> Option<String> {
+    let snapshotter = format!("/var/lib/docker/rootfs/overlayfs/{id}");
+    if mounted(&snapshotter) {
+        return Some(snapshotter);
+    }
+    let inspect = crate::docker::inspect(id).ok()?;
+    let merged = inspect["GraphDriver"]["Data"]["MergedDir"].as_str()?.to_string();
+    mounted(&merged).then_some(merged)
 }

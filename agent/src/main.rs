@@ -13,7 +13,7 @@
 //!   host-token <hex>\n      the token requests to the Mac carry (mac.rs); replies "ok"
 //!   machine-ssh <name>\n    connect to a machine's sshd, starting it if needed (mac.rs)
 //!   proxy\n                 then JSON until EOF: Docker's and apt's proxy (proxy.rs)
-//!   files\n                 export volumes and machines over NFS for ~/Berth (files.rs)
+//!   files <password>\n      share volumes, machines and containers over SMB for ~/Berth (files.rs)
 //!   touch\n                 followed by newline-separated paths until EOF: raise
 //!                           inotify events for files changed on the Mac
 //!   info version\n          a hash of this binary (the host compares it with its own)
@@ -186,8 +186,8 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
     if header == "proxy" {
         return proxy::handle(host);
     }
-    if header == "files" {
-        let reply = match files::ensure() {
+    if let Some(password) = header.strip_prefix("files ") {
+        let reply = match files::ensure(password) {
             Ok(()) => "ok".to_string(),
             Err(err) => format!("error: {err}"),
         };

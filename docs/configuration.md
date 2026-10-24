@@ -36,7 +36,7 @@ means the default. Changes apply on the next start (`berth stop --shutdown
 | `ipv6` | `false` | IPv6 subnets for Docker networks, NAT'd out of the VM. Changing it restarts dockerd, which stops running containers; a suspended VM boots instead of resuming |
 | `stop` | `"shutdown"` | `"suspend"`: `berth stop` saves the VM's state and the next start resumes it (see below) |
 | `proxy` | `"auto"` | the HTTP(S) proxy Docker uses for pulls and pushes (and apt in the VM): `"auto"` follows the Mac's settings (System Settings › Network › Proxies, checked every 15 s), `"none"`, or an `http://` or `https://` URL. A proxy on the Mac's own `localhost` works. PAC files aren't followed. Containers don't get it: pass `HTTP_PROXY` yourself |
-| `finder` | `true` | Docker volumes and machines' files in Finder at `~/Berth`, over NFS from the VM, while berth runs; needs the IP route helper |
+| `finder` | `true` | Docker volumes, machines' files and running containers' root filesystems in Finder at `~/Berth`, over SMB from the VM, while berth runs |
 
 ## Suspend instead of shutdown
 
@@ -85,6 +85,7 @@ These are for testing and debugging; set them for `berth start`.
 | `~/.berth/snapshots/` | snapshots (excluded from Time Machine) |
 | `~/.berth/guest/` | the guest agent, the exported kernel, boot markers, and `ca-certificates.pem`: the CA certificates the Mac trusts beyond Apple's roots, which the VM adds to its trust store before Docker starts (containers don't get them) |
 | `~/.berth/bin/` | the bundled `docker`, Compose, Buildx and `kubectl` |
+| `~/.berth/files-password` | the password of the VM's SMB share for `~/Berth` (only you can read it) |
 | `~/.berth/cache/` | the downloaded Debian image (kept by `berth delete`; excluded from Time Machine) |
 | `~/.berth/run/` | sockets (`docker.sock`, `podman.sock`, `ssh.sock`, `machine-ssh.sock`, the control socket) and the daemon's pid file |
 | `~/.berth/tls/` | the local CA for `https://*.berth.local` |
