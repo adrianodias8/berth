@@ -16,7 +16,9 @@
 //! files on the Mac (bind mounts).
 //!
 //! Layout: ~/.berth/snapshots/<name>/{meta.json, disk file, state.vzvmsave,
-//! efi-vars, boot/}; a pending restore is ~/.berth/data/restore.json.
+//! efi-vars, machine-id, mac-address, boot/}; a pending restore is
+//! ~/.berth/data/restore.json. The snapshots folder is excluded from Time
+//! Machine: its clones would be backed up as full copies.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,6 +30,8 @@ use crate::paths::Paths;
 use crate::vm::Resources;
 
 const STATE: &str = "state.vzvmsave";
+/// Files in ~/.berth/data a snapshot keeps besides the disk.
+const IDENTITY: [&str; 2] = ["machine-id", "mac-address"];
 
 /// One pause/save/clone/resume at a time: a second one resuming the VM in
 /// the middle would pair a saved memory with a later disk.
@@ -115,6 +119,12 @@ fn save_files(paths: &Paths, dir: &Path) -> Result<String> {
     if paths.efi_vars().exists() {
         clone(&paths.efi_vars(), &dir.join("efi-vars"))?;
     }
+    // The saved state refers to the VM's identity and its network card.
+    for file in IDENTITY {
+        if paths.data().join(file).exists() {
+            clone(&paths.data().join(file), &dir.join(file))?;
+        }
+    }
     let boot = paths.guest().join("boot");
     if boot.is_dir() {
         copy_dir(&boot, &dir.join("boot"))?;
@@ -136,6 +146,13 @@ fn new_partial(paths: &Paths, name: &str) -> Result<PathBuf> {
     let partial = root(paths).join(format!(".{name}.partial"));
     let _ = fs::remove_dir_all(&partial);
     fs::create_dir_all(&partial)?;
+    // A sticky exclusion (an xattr on the folder): no root needed.
+    let _ = std::process::Command::new("tmutil")
+        .arg("addexclusion")
+        .arg(root(paths))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
     Ok(partial)
 }
 
@@ -306,6 +323,11 @@ pub fn prepare_restore(paths: &Paths, name: &str) -> Result<Meta> {
     clone(&dir.join(&meta.disk), &disk)?;
     if dir.join("efi-vars").exists() {
         clone(&dir.join("efi-vars"), &paths.efi_vars())?;
+    }
+    for file in IDENTITY {
+        if dir.join(file).exists() {
+            clone(&dir.join(file), &paths.data().join(file))?;
+        }
     }
     if dir.join("boot").is_dir() {
         copy_dir(&dir.join("boot"), &paths.guest().join("boot"))?;

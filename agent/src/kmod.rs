@@ -78,7 +78,10 @@ fn set_home_type(from: &str, to: &str) -> io::Result<bool> {
     if updated == fstab {
         return Ok(false);
     }
-    std::fs::write("/etc/fstab.berth-tmp", &updated)?;
+    // Durable before the rename: a torn fstab is a VM that doesn't boot.
+    let mut tmp = std::fs::File::create("/etc/fstab.berth-tmp")?;
+    io::Write::write_all(&mut tmp, updated.as_bytes())?;
+    tmp.sync_all()?;
     std::fs::rename("/etc/fstab.berth-tmp", "/etc/fstab")?;
     Ok(true)
 }
@@ -153,11 +156,16 @@ pub fn run() {
     let helper_hash = fnv(HELPER.bytes());
     if safe_boot() {
         // The last normal boot didn't come up: back to what cloud-init set up,
-        // and no polling driver (it needs the helper) until berth changes it.
-        let _ = std::fs::create_dir_all("/var/lib/berth");
-        let _ = std::fs::write(HELPER_FAILED, &helper_hash);
+        // and, if the helper was in use, no polling driver (it needs the
+        // helper) until berth changes it. Something else may have kept the
+        // boot from coming up; then the helper isn't to blame.
         match set_home_type("berth", "virtiofs") {
-            Ok(_) => eprintln!("berth-agent: kmod: safe boot: home mounts as plain virtiofs again"),
+            Ok(true) => {
+                let _ = std::fs::create_dir_all("/var/lib/berth");
+                let _ = std::fs::write(HELPER_FAILED, &helper_hash);
+                eprintln!("berth-agent: kmod: safe boot: home mounts as plain virtiofs again");
+            }
+            Ok(false) => eprintln!("berth-agent: kmod: safe boot: the mount helper wasn't in use"),
             Err(err) => eprintln!("berth-agent: kmod: safe boot: restoring /etc/fstab: {err}"),
         }
         if let Some(marker) = marker() {

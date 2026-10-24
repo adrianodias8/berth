@@ -134,14 +134,36 @@ async fn keep_clock() {
 }
 
 async fn sync_clock() {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    let Ok(mut guest) = guest_stream(&format!("clock {:.6}", now.as_secs_f64())).await else { return };
-    let mut reply = String::new();
-    let _ = guest.read_to_string(&mut reply).await;
-    if let Ok(drift) = reply.trim().parse::<f64>()
-        && drift.abs() > 1.0
-    {
-        eprintln!("clock: guest was {drift:.1}s off, corrected");
+    // NTP-style: the guest's clock read halfway through a round trip is
+    // compared with the midpoint of ours. The quickest of a few samples
+    // wins; under load all can be slow, and then nothing is changed.
+    let unix = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+    let mut best: Option<(f64, f64)> = None; // (round trip, offset)
+    for _ in 0..3 {
+        let t0 = unix();
+        let Ok(mut guest) = guest_stream("time").await else { return };
+        let mut reply = String::new();
+        let _ = guest.read_to_string(&mut reply).await;
+        let t1 = unix();
+        let Ok(theirs) = reply.trim().parse::<f64>() else {
+            // An older agent (just after a restore): it sets what we send.
+            let Ok(mut guest) = guest_stream(&format!("clock {:.6}", unix())).await else { return };
+            let _ = guest.read_to_string(&mut String::new()).await;
+            return;
+        };
+        let sample = (t1 - t0, (t0 + t1) / 2.0 - theirs);
+        if best.is_none_or(|b| sample.0 < b.0) {
+            best = Some(sample);
+        }
+    }
+    let Some((rtt, offset)) = best else { return };
+    if rtt > 0.05 || offset.abs() < 0.005 {
+        return;
+    }
+    let Ok(mut guest) = guest_stream(&format!("clock-offset {offset:.6}")).await else { return };
+    let _ = guest.read_to_string(&mut String::new()).await;
+    if offset.abs() > 1.0 {
+        eprintln!("clock: guest was {:.1}s off, corrected", -offset);
     }
 }
 
@@ -151,8 +173,18 @@ async fn sync_clock() {
 async fn watchdog() {
     let paths = Paths::new();
     let safe = paths.guest().join("boot/safe-boot");
-    if std::env::var_os("BERTH_FIRST_BOOT").is_some() {
-        return; // provisioning starts the agent only after installing Docker
+    // Until the agent has come up once, provisioning may still be running
+    // (it starts the agent only after installing Docker), even on a later
+    // start if the first one was interrupted: just note when it's done.
+    let provisioned = paths.data().join("provisioned");
+    if std::env::var_os("BERTH_FIRST_BOOT").is_some() || !provisioned.exists() {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if guest_stream("info memory").await.is_ok() {
+                let _ = std::fs::write(&provisioned, "");
+                return;
+            }
+        }
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
     while std::time::Instant::now() < deadline {

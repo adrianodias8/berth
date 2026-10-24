@@ -16,9 +16,12 @@
 //!   exit\n                  quit; systemd starts the agent binary again (a newer one,
 //!                           after a resumed VM)
 //!   sync\n                  flush filesystems (before a disk-only snapshot); replies "ok"
-//!   clock <unix seconds>\n  set the clock if it's off by more than 50 ms (the VM's
-//!                           clock stops while the Mac sleeps, and after restoring a
-//!                           snapshot); replies with how far off it was, in seconds
+//!   time\n                  replies with the guest's clock, in unix seconds
+//!   clock-offset <secs>\n   move the clock by that much (the VM's clock stops while
+//!                           the Mac sleeps, and after restoring a snapshot): slewed
+//!                           under a second, stepped beyond; replies "ok"
+//!   clock <unix seconds>\n  older hosts: set the clock if it's off by more than 50 ms;
+//!                           replies with how far off it was, in seconds
 //!
 //! A failed connect just closes the stream. The agent also runs the container
 //! domain controller (domains.rs), its mDNS responder (mdns.rs), DNS for
@@ -116,6 +119,15 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
         unsafe { libc::sync() };
         return host.write_all(b"ok");
     }
+    if header == "time" {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+        return host.write_all(format!("{now:.6}").as_bytes());
+    }
+    if let Some(secs) = header.strip_prefix("clock-offset ") {
+        let offset: f64 = secs.trim().parse().map_err(|_| io::Error::other("bad offset"))?;
+        adjust_clock(offset)?;
+        return host.write_all(b"ok");
+    }
     if let Some(secs) = header.strip_prefix("clock ") {
         return set_clock(secs, host);
     }
@@ -177,8 +189,29 @@ fn force_stat_mode(fd: &OwnedFd) -> io::Result<u32> {
     Ok(u32::from(u16::from_ne_bytes([buf[28], buf[29]])) & 0o7777) // stx_mode
 }
 
-/// The VM's clock doesn't run while the Mac sleeps (and a restored snapshot
-/// wakes up with the time it was saved at); NTP polls too rarely to notice.
+/// Move the clock by `offset` seconds. Relative, so the time the request
+/// took to arrive doesn't matter. Under a second it's slewed (no time going
+/// backwards for running programs); beyond that, stepped.
+fn adjust_clock(offset: f64) -> io::Result<()> {
+    let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+    if offset.abs() >= 1.0 {
+        let nanos = (offset * 1e9).round() as i64;
+        tx.modes = libc::ADJ_SETOFFSET | libc::ADJ_NANO;
+        tx.time.tv_sec = nanos.div_euclid(1_000_000_000) as _;
+        tx.time.tv_usec = nanos.rem_euclid(1_000_000_000) as _; // ns with ADJ_NANO
+    } else {
+        tx.modes = libc::ADJ_OFFSET_SINGLESHOT;
+        tx.offset = (offset.clamp(-0.5, 0.5) * 1e6) as _; // µs
+    }
+    if unsafe { libc::adjtimex(&mut tx) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// For older hosts. The VM's clock doesn't run while the Mac sleeps (and a
+/// restored snapshot wakes up with the time it was saved at); NTP polls too
+/// rarely to notice.
 fn set_clock(secs: &str, mut host: UnixStream) -> io::Result<()> {
     let mac: f64 = secs.trim().parse().map_err(|_| io::Error::other("bad time"))?;
     let ours = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());

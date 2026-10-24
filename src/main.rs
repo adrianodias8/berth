@@ -298,6 +298,7 @@ fn snapshot(paths: &Paths, action: SnapshotCmd) -> Result<()> {
                     (None, err) => bail!("{}", err.unwrap_or_default()),
                 }
             } else {
+                let _lock = offline_lock(paths)?;
                 snapshots::create_stopped(paths, &name)?
             };
             let what = if meta.with_memory { "memory and disk" } else { "disk" };
@@ -347,7 +348,10 @@ fn snapshot(paths: &Paths, action: SnapshotCmd) -> Result<()> {
             if current_status(paths).is_some() {
                 stop(paths)?;
             }
-            snapshots::prepare_restore(paths, &meta.name)?;
+            {
+                let _lock = offline_lock(paths)?;
+                snapshots::prepare_restore(paths, &meta.name)?;
+            }
             start(paths)?;
             println!("Restored {name}.");
             Ok(())
@@ -358,6 +362,17 @@ fn snapshot(paths: &Paths, action: SnapshotCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The daemon's lock, for changing the VM's files while it's stopped: a
+/// `berth start` meanwhile would boot a half-copied disk.
+fn offline_lock(paths: &Paths) -> Result<std::fs::File> {
+    paths.create_dirs()?;
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(paths.pid_file())?;
+    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!("berth is starting or running; try again once it's stopped");
+    }
+    Ok(file)
 }
 
 fn request<T: serde::de::DeserializeOwned>(paths: &Paths, req: &Request) -> Result<T> {

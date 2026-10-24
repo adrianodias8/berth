@@ -636,7 +636,8 @@ impl Server {
     }
 
     fn child(&self, parent: u64, name: &[u8]) -> Result<PathBuf, i32> {
-        if name.is_empty() || name.contains(&b'/') {
+        // "." and ".." would name another node by a path key that isn't its own.
+        if name.is_empty() || name.contains(&b'/') || name == b"." || name == b".." {
             return Err(lerr::EINVAL);
         }
         Ok(self.path(parent)?.join(OsStr::from_bytes(name)))
