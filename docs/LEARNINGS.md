@@ -101,6 +101,49 @@ something here stops being true, fix it.
   took localhost forwarding from 5.8 to ~20 Gbit/s (OrbStack: ~30).
 - **UDP forwards:** reply tasks must abort when the forward is dropped, or the
   port stays bound.
+- **Host-network containers:**
+  - **Telling them apart:** their sockets sit in the guest's root network
+    namespace next to sshd, dockerd's port proxies, systemd-resolved, k3s and
+    the agent. The owning process's cgroup separates them cleanly
+    (`/system.slice/docker-<id>.scope` with the systemd driver; Podman
+    `libpod-<id>.scope`, nerdctl `nerdctl-<id>.scope`); a port exclusion list
+    would always be out of date. Map socket inodes from `/proc/net/*` to
+    processes through `/proc/<pid>/fd` only for new inodes.
+  - **UDP:** a client socket that sends without binding shows up unconnected
+    on an ephemeral port, like a server would. Ports in
+    `ip_local_port_range` are skipped for UDP.
+  - **Loopback addresses:** only 127.0.0.1 and ::1 map to the Mac;
+    127.0.0.53 (resolved) and specific guest addresses don't.
+  - **Mac servers on `localhost` from a host-network container** (OrbStack
+    documents this) aren't offered: the container's loopback is the guest's,
+    and redirecting connections to ports nobody listens on would need
+    rewriting the guest's loopback (iptables can't match "closed port").
+    `host.docker.internal` works in host-network containers (their resolver
+    is berth's DNS, and the guest's OUTPUT chain redirects 198.19.248.254).
+  - **macOS binds:** `[::]:80` and `127.0.0.1:80` can be bound at the same
+    time (the specific address wins), so a host-network server and a
+    loopback-published port on the same number coexist.
+- **IPv6 on Apple's NAT** (`VZNATNetworkDeviceAttachment`):
+  - the Mac sends router advertisements for a ULA /64 (`fdxx:…/64` on
+    `bridge100`), so the guest always has an IPv6 address and reaches the Mac
+    at the Mac's address in that prefix;
+  - on a Mac without IPv6 internet the advertised router lifetime is 0: no
+    default route, `Network unreachable` for global addresses. With IPv6
+    upstream the Mac is expected to route (vmnet does NAT66 for its prefix);
+    not verified yet on such a network;
+  - systemd-networkd (not the kernel) handles the advertisements, and with
+    `IPv6AcceptRA` unset it ignores them once IPv6 forwarding is on, which
+    Docker turns on for IPv6 networks. berth adds `IPv6AcceptRA=yes` for the
+    uplink when IPv6 is enabled.
+- **Docker IPv6** (29): a network created with IPv6 and no subnet gets a /64
+  from a ULA pool Docker derives itself (e.g. `fdbd:669f:fb69::/64`), and
+  `default-network-opts.bridge."com.docker.network.enable_ipv6"` turns IPv6 on
+  for every new bridge network. ip6tables (default on) masquerades each IPv6
+  subnet leaving through another interface. Existing networks keep their
+  settings until recreated.
+- **ULA sources prefer IPv4:** with only a ULA address, glibc's address
+  selection (RFC 6724) puts IPv4 first for global destinations, so dual-stack
+  names keep using IPv4 in containers.
 
 ## Docker, engines and tools
 

@@ -55,6 +55,24 @@ fix one, remove it here in the same change.
   container with no web server re-probes every port.
 - **`hostnet.rs` never retries if binding port 2401 fails at boot.**
 
+## Networking
+
+- **Host networking forwards TCP on the wildcard addresses, 127.0.0.1 and ::1,
+  and UDP on the wildcard addresses only.** A host-network server bound to one
+  specific guest address isn't forwarded; UDP on loopback or on an
+  ephemeral-range port isn't either. New servers appear on the Mac within the
+  2 s poll.
+- **Host-network containers can't reach Mac servers on `localhost`** (they
+  can through `host.docker.internal`); see LEARNINGS.
+- **IPv6 isn't routed from the Mac to containers.** Container IPv6 addresses
+  are reachable from the VM and other containers, not from the Mac (the root
+  helper routes IPv4 subnets only). Published ports work over IPv6 as before.
+- **No IPv6 for names:** berth's DNS and mDNS answer A records only
+  (`host.docker.internal`, `*.berth.local`), and there is no IPv6
+  `host.docker.internal`.
+- **IPv6 egress is unverified:** the test Mac has no IPv6 internet, so NAT66
+  from the VM to the internet hasn't been seen working.
+
 ## Host daemon (`src/`)
 
 - **A failed port bind is retried only on the next container event**

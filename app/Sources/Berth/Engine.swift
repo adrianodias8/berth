@@ -85,11 +85,14 @@ struct BerthConfig: Codable, Equatable {
     var memoryMib: Int?
     /// "berth" (its own share, macOS 27; the default) or "apple" (src/virtiofs.rs).
     var fileSharing: String?
+    /// IPv6 for containers (agent/src/ipv6.rs).
+    var ipv6: Bool?
 
     enum CodingKeys: String, CodingKey {
         case cpus
         case memoryMib = "memory_mib"
         case fileSharing = "file_sharing"
+        case ipv6
     }
 
     static func load() -> BerthConfig {

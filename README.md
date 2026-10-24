@@ -37,6 +37,13 @@ from its code.
 **Networking**
 - Published ports (`-p 8080:80`, TCP and UDP) on the Mac, IPv4 and IPv6, following
   Docker's bind address
+- Host networking: servers in `--net host` containers are on the Mac's
+  `localhost` at the port they open, no `-p` needed (loopback-only servers stay
+  loopback-only on the Mac)
+- IPv6 for containers, opt-in (`"ipv6": true` in `~/.berth/config.json`, or
+  Settings): Docker networks get IPv6 subnets, NAT'd out of the VM. Reaching the
+  internet over IPv6 needs IPv6 on the Mac; without it, IPv6 works between
+  containers, the VM and the Mac
 - Container domains with no setup: `<container>.berth.local`,
   `<service>.<project>.berth.local` for Compose, any subdomain, plus custom names
   from the `dev.berth.domains` (or `dev.orbstack.domains`) label; `berth domains`
@@ -121,8 +128,8 @@ its own. Closing the window keeps it in the menu bar.
 - **Images** (with pull and progress), **Volumes**, **Networks** (subnets, container
   counts, IP routing status)
 - **Machine**: a shell in the VM
-- **Settings**: CPUs and memory (written to `~/.berth/config.json`, applied on restart),
-  start on app launch, open at login, install the IP route helper, trust the HTTPS
+- **Settings**: CPUs, memory and IPv6 for containers (written to `~/.berth/config.json`,
+  applied on restart), start on app launch, open at login, install the IP route helper, trust the HTTPS
   certificate
 
 Launch arguments pick the starting screen, e.g.
@@ -181,6 +188,15 @@ Every connection into the guest goes through one vsock port. The host sends a
 one-line header (`unix /run/docker.sock` or `tcp 127.0.0.1:8080`) and the agent
 connects there and splices bytes. The daemon follows Docker's event stream to
 open and close host listeners as containers with published ports start and stop.
+
+Host-network containers publish nothing, so the agent watches the guest's own
+socket tables (`/proc/net/tcp*`, `udp*`) every 2 s and keeps the listening
+sockets owned by processes in a container cgroup (`docker-<id>.scope` and the
+like), which leaves out sshd, dockerd, k3s and the agent itself. When that set
+changes it asks the daemon to re-sync (a `sync` header on vsock 2401), and the
+daemon forwards those ports like published ones: all-interface servers on
+`[::]` through the guest's NAT address, loopback servers on the Mac's loopback
+through the agent.
 
 Domain names work differently, without the host daemon in the data path:
 
@@ -242,6 +258,8 @@ refuses any other name, so trusting it cannot be abused for real sites.
   - `mdns.rs`: multicast DNS responder
   - `dns.rs`: DNS server for containers
   - `hostnet.rs`: `host.docker.internal` forwarding to the Mac
+  - `listeners.rs`: host-network containers' listening ports
+  - `ipv6.rs`: the IPv6 setting (Docker's IPv6 options, router advertisements)
   - `web.rs`: web port detection, HTTP/HTTPS entry for domains
 - `src/snapshots.rs`: VM snapshots (disk clones, saved machine state, restore)
 - `src/tls.rs`: the local CA, per-name certificates, keychain trust
