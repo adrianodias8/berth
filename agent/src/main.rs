@@ -362,11 +362,26 @@ fn vsock_listen(port: u32) -> io::Result<OwnedFd> {
     }
 }
 
+/// Linux vsock lets the peer send only as much as the receive buffer
+/// (256 KB by default) before waiting for credit: too little for multi-Gbit
+/// transfers from the Mac.
+pub(crate) fn widen_vsock_buffer(fd: RawFd) {
+    const SO_VM_SOCKETS_BUFFER_SIZE: libc::c_int = 0;
+    const SO_VM_SOCKETS_BUFFER_MAX_SIZE: libc::c_int = 2;
+    let size: u64 = 4 << 20;
+    for opt in [SO_VM_SOCKETS_BUFFER_MAX_SIZE, SO_VM_SOCKETS_BUFFER_SIZE] {
+        unsafe {
+            libc::setsockopt(fd, libc::AF_VSOCK, opt, (&raw const size).cast(), size_of::<u64>() as libc::socklen_t);
+        }
+    }
+}
+
 fn vsock_accept(listener: &OwnedFd) -> io::Result<OwnedFd> {
     let raw = std::os::fd::AsRawFd::as_raw_fd(listener);
     let fd = unsafe { libc::accept4(raw, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    widen_vsock_buffer(fd);
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }

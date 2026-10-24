@@ -44,6 +44,7 @@ define_class!(
         ) -> Bool {
             // Dup as in connect_vsock: our copy outlives the connection object.
             let fd = unsafe { libc::dup(connection.fileDescriptor()) };
+            widen_buffers(fd);
             if fd < 0 {
                 return Bool::NO;
             }
@@ -489,6 +490,18 @@ pub async fn set_balloon_target(bytes: u64) -> Result<()> {
         .context("no balloon device")
 }
 
+/// A vsock connection is a Unix socket to the VM process, and macOS gives
+/// those 8 KB buffers: every large write went over in 8 KB pieces, which
+/// capped Mac -> VM traffic at ~3 Gbit/s.
+fn widen_buffers(fd: libc::c_int) {
+    let size: libc::c_int = 4 << 20;
+    for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        unsafe {
+            libc::setsockopt(fd, libc::SOL_SOCKET, opt, (&raw const size).cast(), size_of::<libc::c_int>() as libc::socklen_t);
+        }
+    }
+}
+
 /// Open a vsock connection to `port` in the guest. The returned fd is a
 /// duplicate owned by the caller; the VZ connection object is released.
 pub async fn connect_vsock(port: u32) -> Result<OwnedFd> {
@@ -508,6 +521,7 @@ pub async fn connect_vsock(port: u32) -> Result<OwnedFd> {
                     // Dup rather than close: the connection object closes its
                     // own fd when VZ releases it after this block returns.
                     let fd = unsafe { libc::dup(conn.fileDescriptor()) };
+                    widen_buffers(fd);
                     if fd < 0 {
                         Err(std::io::Error::last_os_error().to_string())
                     } else {

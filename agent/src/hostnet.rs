@@ -135,6 +135,7 @@ pub(crate) fn vsock_connect(cid: u32, port: u32) -> io::Result<OwnedFd> {
             return Err(io::Error::last_os_error());
         }
         let fd = OwnedFd::from_raw_fd(fd);
+        crate::widen_vsock_buffer(fd.as_raw_fd());
         let mut addr: libc::sockaddr_vm = std::mem::zeroed();
         addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
         addr.svm_port = port;
