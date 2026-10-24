@@ -137,6 +137,7 @@ async fn keep_clock() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     crate::macexec::push_token().await;
+    crate::proxy::push(&Paths::new()).await;
     tokio::spawn(async {
         // Retried: on a first boot apt may still be busy in the VM.
         for attempt in 0..20 {
@@ -152,6 +153,8 @@ async fn keep_clock() {
         tokio::time::sleep(Duration::from_secs(15)).await;
         sync_clock().await;
         crate::macexec::push_token().await;
+        // The Mac's proxy changes with its network.
+        crate::proxy::push(&Paths::new()).await;
     }
 }
 

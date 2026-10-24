@@ -12,6 +12,7 @@
 //!   engine <action> [name]\n enable|disable podman|nerdctl, status (engines.rs)
 //!   host-token <hex>\n      the token requests to the Mac carry (mac.rs); replies "ok"
 //!   machine-ssh <name>\n    connect to a machine's sshd, starting it if needed (mac.rs)
+//!   proxy\n                 then JSON until EOF: Docker's and apt's proxy (proxy.rs)
 //!   files\n                 export volumes and machines over NFS for ~/Berth (files.rs)
 //!   touch\n                 followed by newline-separated paths until EOF: raise
 //!                           inotify events for files changed on the Mac
@@ -48,6 +49,7 @@ mod mac;
 mod machines;
 mod mdns;
 mod memory;
+mod proxy;
 mod tunnel;
 mod web;
 
@@ -140,6 +142,9 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
     }
     if let Some(name) = header.strip_prefix("machine-ssh ") {
         return mac::machine_ssh(name, host);
+    }
+    if header == "proxy" {
+        return proxy::handle(host);
     }
     if header == "files" {
         let reply = match files::ensure() {

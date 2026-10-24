@@ -1,7 +1,16 @@
 # Configuration
 
 berth reads `~/.berth/config.json` when the VM starts. The app's Settings
-write the same file, so you rarely need to edit it. A missing file or key
+and `berth config` write the same file, so you rarely need to edit it:
+
+```sh
+berth config list               # every setting, defaults for those not set
+berth config set memory_mib 8192
+berth config get stop
+berth config unset cpus         # back to the default
+```
+
+`berth config set` checks the value. A missing file or key
 means the default. Changes apply on the next start (`berth stop --shutdown
 && berth start`, or Restart in the app).
 
@@ -12,7 +21,8 @@ means the default. Changes apply on the next start (`berth stop --shutdown
   "file_sharing": "berth",
   "ipv6": false,
   "stop": "shutdown",
-  "finder": true
+  "finder": true,
+  "proxy": "auto"
 }
 ```
 
@@ -23,6 +33,7 @@ means the default. Changes apply on the next start (`berth stop --shutdown
 | `file_sharing` | `"berth"` on macOS 27 | `"apple"` uses Apple's virtiofs for the home folder (`docs/file-sharing.md`). Before macOS 27 it's always Apple's |
 | `ipv6` | `false` | IPv6 subnets for Docker networks, NAT'd out of the VM. Changing it restarts dockerd, which stops running containers |
 | `stop` | `"shutdown"` | `"suspend"`: `berth stop` saves the VM's state and the next start resumes it (see below) |
+| `proxy` | `"auto"` | the HTTP(S) proxy Docker uses for pulls and pushes (and apt in the VM): `"auto"` follows the Mac's settings (System Settings › Network › Proxies, checked every 15 s), `"none"`, or a URL. A proxy on the Mac's own `localhost` works. PAC files aren't followed. Containers don't get it: pass `HTTP_PROXY` yourself |
 | `finder` | `true` | Docker volumes and machines' files in Finder at `~/Berth`, over NFS from the VM, while berth runs |
 
 ## Suspend instead of shutdown
@@ -40,6 +51,13 @@ start` resumes it in about 3 s, with containers still running.
   disk the same way.
 - `berth stop --shutdown` always shuts down, and the app's Restart uses it.
 - The saved state is as large as the memory the VM was using.
+
+## Proxy changes
+
+Docker reads its proxy when it starts, so a change restarts Docker in the
+VM, but only while no container runs: with `"auto"` the proxy changes with
+the Mac's network (a VPN, say), and that shouldn't stop your containers.
+Otherwise it applies as soon as none runs, or at the next start.
 
 ## Environment variables
 

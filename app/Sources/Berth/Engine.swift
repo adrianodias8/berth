@@ -91,6 +91,8 @@ struct BerthConfig: Codable, Equatable {
     var stop: String?
     /// Docker volumes and machines in Finder at ~/Berth (src/files.rs); default on.
     var finder: Bool?
+    /// "auto" (the Mac's proxy settings; the default), "none" or a URL (src/proxy.rs).
+    var proxy: String?
 
     enum CodingKeys: String, CodingKey {
         case cpus
@@ -99,6 +101,7 @@ struct BerthConfig: Codable, Equatable {
         case ipv6
         case stop
         case finder
+        case proxy
     }
 
     static func load() -> BerthConfig {

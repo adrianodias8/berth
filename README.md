@@ -54,6 +54,7 @@ from its code.
   Settings): Docker networks get IPv6 subnets, NAT'd out of the VM. Reaching the
   internet over IPv6 needs IPv6 on the Mac; without it, IPv6 works between
   containers, the VM and the Mac
+- Docker pulls and pushes use the Mac's proxy settings (`"proxy"`: auto, none or a URL)
 - Container domains with no setup: `<container>.berth.local`,
   `<service>.<project>.berth.local` for Compose, any subdomain, plus custom names
   from the `dev.berth.domains` (or `dev.orbstack.domains`) label; `berth domains`
@@ -190,6 +191,7 @@ berth tls trust           # trust the local CA for https://*.berth.local (one-ti
 berth k8s enable          # Kubernetes (k3s) with a `berth` kubectl context
 berth engine enable podman   # or nerdctl; berth engine status
 berth machine create dev  # an Ubuntu machine; then: berth machine shell dev
+berth config set memory_mib 8192   # settings; berth config list
 berth snapshot create before-migration   # then break things...
 berth snapshot restore before-migration  # ...and go back; also: list, delete
 berth import orbstack     # or docker-desktop: images, volumes, networks, containers

@@ -1,4 +1,5 @@
 mod cli_tools;
+mod config;
 mod context;
 mod daemon;
 mod engines;
@@ -13,6 +14,7 @@ mod memory;
 mod paths;
 mod ports;
 mod provision;
+mod proxy;
 mod routes;
 mod snapshots;
 mod sshconfig;
@@ -115,6 +117,11 @@ enum Cmd {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Settings in ~/.berth/config.json (docs/configuration.md)
+    Config {
+        #[command(subcommand)]
+        action: ConfigCmd,
+    },
     /// Open a shell in the VM, or run a command there
     Shell {
         #[arg(trailing_var_arg = true)]
@@ -180,6 +187,16 @@ enum MachineCmd {
     /// SSH's ProxyCommand for `<machine>.berth` (see ~/.berth/ssh/config)
     #[command(hide = true)]
     Proxy { host: String },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Every setting, with defaults for those not set
+    List,
+    Get { key: String },
+    Set { key: String, value: String },
+    /// Back to the default
+    Unset { key: String },
 }
 
 #[derive(Subcommand)]
@@ -310,6 +327,12 @@ fn main() -> Result<()> {
         Cmd::Snapshot { action } => snapshot(&paths, action),
         Cmd::Shell { command } => shell(&paths, &command),
         Cmd::Debug { container, command } => debug(&paths, &container, &command),
+        Cmd::Config { action } => match action {
+            ConfigCmd::List => config::list(&paths),
+            ConfigCmd::Get { key } => config::get(&paths, &key),
+            ConfigCmd::Set { key, value } => config::set(&paths, &key, &value),
+            ConfigCmd::Unset { key } => config::unset(&paths, &key),
+        },
         Cmd::Import { from, socket, images, volumes, containers, dry_run, project } => {
             if current_status(&paths).is_none() {
                 bail!("berth is not running: berth start");
