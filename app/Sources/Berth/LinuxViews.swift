@@ -114,7 +114,7 @@ struct MachinesView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .sheet(isPresented: $showCreate) { CreateMachineSheet { name, distro, arch, userData in create(name, distro, arch, userData) } }
+        .sheet(isPresented: $showCreate) { CreateMachineSheet { create($0) } }
         .task {
             while !Task.isCancelled {
                 await refresh()
@@ -139,13 +139,18 @@ struct MachinesView: View {
         }
     }
 
-    private func create(_ name: String, _ distro: String, _ arch: String, _ userData: String) {
+    private func create(_ new: NewMachine) {
+        let name = new.name
         busy = name
         Task {
             let user = NSUserName()
             do {
                 // Same arguments as `berth machine create` (src/machines.rs).
-                _ = try await Machines.call("create", [name, distro, user, String(getuid()), NSHomeDirectory(), arch, userData])
+                _ = try await Machines.call("create", [
+                    name, new.distro, user, String(getuid()), NSHomeDirectory(), new.arch, new.userData,
+                    new.isolated || new.isolateNetwork ? "1" : "", new.isolateNetwork ? "1" : "",
+                    new.mounts.map(\.path).joined(separator: "\n"),
+                ])
                 try? await Task.sleep(for: .seconds(3))
                 await refresh()
                 selection = name
@@ -157,9 +162,22 @@ struct MachinesView: View {
     }
 }
 
+struct NewMachine {
+    var name: String
+    var distro: String
+    var arch: String
+    var userData: String
+    var isolated: Bool
+    var isolateNetwork: Bool
+    var mounts: [URL]
+}
+
 struct CreateMachineSheet: View {
     @Environment(\.dismiss) private var dismiss
-    let create: (String, String, String, String) -> Void
+    let create: (NewMachine) -> Void
+    @State private var isolated = false
+    @State private var isolateNetwork = false
+    @State private var mounts: [URL] = []
     @State private var name = ""
     @State private var distro = "ubuntu:noble"
     @State private var arch = "arm64"
@@ -174,6 +192,16 @@ struct CreateMachineSheet: View {
 
     /// The chosen user data, read when creating.
     private var userData: String? { cloudInit.flatMap { try? String(contentsOf: $0, encoding: .utf8) } }
+
+    private func addMount() {
+        let panel = NSOpenPanel()
+        panel.message = "A folder to share with the machine (in your home, /Volumes or /tmp)"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = true
+        guard panel.runModal() == .OK else { return }
+        mounts += panel.urls.map { $0.resolvingSymlinksInPath() }
+    }
 
     private func chooseCloudInit() {
         let panel = NSOpenPanel()
@@ -207,6 +235,19 @@ struct CreateMachineSheet: View {
                 }
             }
             if let cloudInitError { Text(cloudInitError).font(.caption).foregroundStyle(.red) }
+            Toggle("Isolated from the Mac", isOn: $isolated)
+                .help("No home folder, mac command or SSH agent; only the folders below.")
+            if isolated || isolateNetwork {
+                LabeledContent("Shared folders") {
+                    HStack {
+                        Text(mounts.isEmpty ? "None" : mounts.map(\.lastPathComponent).joined(separator: ", ")).foregroundStyle(.secondary)
+                        if !mounts.isEmpty { Button("Clear") { mounts = [] } }
+                        Button("Add…") { addMount() }
+                    }
+                }
+            }
+            Toggle("Isolate its network too", isOn: $isolateNetwork)
+                .help("DNS and the internet only: not the Mac, the LAN or other private networks.")
             Text("Your user, sudo, and your Mac home folder are set up inside. Reachable at \(name.isEmpty ? "<name>" : name).berth.local; `ssh \(name.isEmpty ? "<name>" : name).berth` too.")
                 .font(.caption).foregroundStyle(.secondary)
         }
@@ -216,7 +257,11 @@ struct CreateMachineSheet: View {
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("Create") { create(name, distro, arch, userData ?? ""); dismiss() }
+                Button("Create") {
+                    create(NewMachine(name: name, distro: distro, arch: arch, userData: userData ?? "",
+                                      isolated: isolated, isolateNetwork: isolateNetwork, mounts: mounts))
+                    dismiss()
+                }
                     .keyboardShortcut(.defaultAction).disabled(!validName || cloudInitError != nil)
             }
             .padding()

@@ -11,6 +11,13 @@
 //! uses the image's "cloud" variant and seeds the user data for its
 //! NoCloud datasource.
 //!
+//! Isolated machines (`--isolated`) get none of the Mac: no home folder, no
+//! `mac` command or SSH agent, only the folders given with `--mount`.
+//! `--isolate-network` also keeps them off the Mac, the LAN and other
+//! private networks (DNS and the internet only). Both are recorded as
+//! comments in the machine's .nspawn file; the network rules are applied
+//! again at each boot.
+//!
 //! Integration with the Mac (mac.rs): /run/berth is bind-mounted in, with the
 //! `mac` command's and the SSH agent's sockets; `/usr/local/bin/mac` links to
 //! the agent; and sshd is installed on first `ssh <name>.berth`.
@@ -88,9 +95,56 @@ fn image_path(spec: &str, arch: &str, variant: &str) -> io::Result<String> {
         .ok_or_else(|| io::Error::other(format!("{distro} has no release {release}; try one of: {}", candidates.iter().map(|c| c.0).collect::<Vec<_>>().join(", "))))
 }
 
-fn create(name: &str, spec: &str, user: &str, uid: &str, home: &str, arch: &str, user_data: &str) -> io::Result<()> {
+/// How a machine is set apart from the Mac (the .nspawn file's comments).
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
+struct Isolation {
+    files: bool,
+    network: bool,
+}
+
+const ISOLATED: &str = "# berth: isolated";
+const ISOLATED_NETWORK: &str = "# berth: isolate-network";
+
+fn nspawn_path(name: &str) -> String {
+    format!("/etc/systemd/nspawn/{name}.nspawn")
+}
+
+fn isolation(name: &str) -> Isolation {
+    let config = std::fs::read_to_string(nspawn_path(name)).unwrap_or_default();
+    Isolation { files: config.lines().any(|l| l == ISOLATED), network: config.lines().any(|l| l == ISOLATED_NETWORK) }
+}
+
+/// Folders an isolated machine was given (`Bind=` lines).
+fn mounts(name: &str) -> Vec<String> {
+    std::fs::read_to_string(nspawn_path(name))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.strip_prefix("Bind=").map(str::to_string))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create(
+    name: &str,
+    spec: &str,
+    user: &str,
+    uid: &str,
+    home: &str,
+    arch: &str,
+    user_data: &str,
+    isolated: bool,
+    isolate_network: bool,
+    mounts: &[String],
+) -> io::Result<()> {
     if !valid_name(name) {
         return Err(io::Error::other("name: 1-12 characters, a-z 0-9 and -"));
+    }
+    // Folders for an isolated machine: ones the VM sees (home, /Volumes,
+    // /private/tmp...), as plain absolute paths for the .nspawn file.
+    for m in mounts {
+        if !m.starts_with('/') || m.contains(['\n', ':', '"']) || !Path::new(m).is_dir() {
+            return Err(io::Error::other(format!("--mount {m}: not a folder the VM can see (your home, /Volumes, /tmp)")));
+        }
     }
     let arch = match arch {
         "" | "arm64" | "aarch64" => "arm64",
@@ -143,18 +197,81 @@ fn create(name: &str, spec: &str, user: &str, uid: &str, home: &str, arch: &str,
 
     let ve = format!("ve-{name}");
     std::fs::create_dir_all("/etc/systemd/nspawn")?;
+    let mut marks = String::new();
+    let mut binds = String::new();
+    if isolated || isolate_network {
+        marks.push_str(&format!("{ISOLATED}\n"));
+        for m in mounts {
+            binds.push_str(&format!("Bind={m}\n"));
+        }
+    } else {
+        binds.push_str(&format!("Bind={home}\nBindReadOnly={}\n", crate::mac::DIR));
+    }
+    if isolate_network {
+        marks.push_str(&format!("{ISOLATED_NETWORK}\n"));
+    }
     std::fs::write(
-        format!("/etc/systemd/nspawn/{name}.nspawn"),
+        nspawn_path(name),
         format!(
-            "[Exec]\nBoot=yes\nPrivateUsers=no\n{}\n[Files]\nBind={home}\nBindReadOnly={}\n\n[Network]\nVirtualEthernetExtra={ve}:eth0\n",
-            kill_signal(name),
-            crate::mac::DIR
+            "{marks}[Exec]\nBoot=yes\nPrivateUsers=no\n{}\n[Files]\n{binds}\n[Network]\nVirtualEthernetExtra={ve}:eth0\n",
+            kill_signal(name)
         ),
     )?;
-    integrate_files(name);
+    if !(isolated || isolate_network) {
+        integrate_files(name);
+    }
     allow_forwarding();
+    isolate_network_of(name);
     sh(&format!("machinectl enable {name} >/dev/null 2>&1; machinectl start {name}"))?;
     Ok(())
+}
+
+/// For a machine marked isolate-network: DNS (the Mac's resolver) and the
+/// internet only. Its traffic to private ranges is dropped where the VM
+/// forwards it, and to the VM itself (where host.docker.internal is
+/// answered) except DHCP and replies. Rules go first, ahead of the
+/// machines' general ACCEPT; IPv6 isn't forwarded for it at all.
+fn isolate_network_of(name: &str) {
+    let ve = format!("ve-{name}");
+    // Remove ours first (a rename, or a boot that already added them).
+    let ours = |chain: &str, table_cmd: &str| {
+        let out = Command::new(table_cmd).args(["-w", "-S", chain]).output().ok()?;
+        Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| l.contains(&format!("-i {ve} ")) && l.contains("berth-isolate"))
+                .map(|l| l.replacen("-A ", "-D ", 1))
+                .collect::<Vec<_>>(),
+        )
+    };
+    for (cmd, chain) in [("iptables", "DOCKER-USER"), ("iptables", "INPUT"), ("ip6tables", "FORWARD"), ("ip6tables", "INPUT")] {
+        for rule in ours(chain, cmd).unwrap_or_default() {
+            let _ = Command::new(cmd).arg("-w").args(rule.split_whitespace().map(|w| w.trim_matches('"'))).output();
+        }
+    }
+    if !isolation(name).network {
+        return;
+    }
+    let dns = sh("ip -4 route show default | awk '{print $3; exit}'").unwrap_or_default().trim().to_string();
+    let tag = ["-m", "comment", "--comment", "berth-isolate"];
+    let insert = |cmd: &str, chain: &str, rule: &[&str]| {
+        let _ = Command::new(cmd).args(["-w", "-I", chain, "1", "-i", &ve]).args(rule).args(tag).output();
+    };
+    // Inserted at the top in reverse: the last one inserted runs first.
+    for range in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "198.18.0.0/15"] {
+        insert("iptables", "DOCKER-USER", &["-d", range, "-j", "DROP"]);
+    }
+    if dns.parse::<std::net::Ipv4Addr>().is_ok() {
+        for proto in ["udp", "tcp"] {
+            insert("iptables", "DOCKER-USER", &["-d", &dns, "-p", proto, "--dport", "53", "-j", "ACCEPT"]);
+        }
+    }
+    insert("iptables", "INPUT", &["-j", "DROP"]);
+    insert("iptables", "INPUT", &["-p", "udp", "--dport", "67", "-j", "ACCEPT"]);
+    insert("iptables", "INPUT", &["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]);
+    insert("ip6tables", "FORWARD", &["-j", "DROP"]);
+    insert("ip6tables", "INPUT", &["-j", "DROP"]);
+    insert("ip6tables", "INPUT", &["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]);
 }
 
 /// How nspawn asks the machine's init to shut down, as a .nspawn line. Its
@@ -247,6 +364,13 @@ pub fn integrate_all() {
         for _ in 0..900 {
             if Command::new("iptables").args(["-w", "-L", "DOCKER-USER", "-n"]).output().is_ok_and(|o| o.status.success()) {
                 allow_forwarding();
+                // After the general ACCEPT, so they come first.
+                for entry in std::fs::read_dir(MACHINES).into_iter().flatten().flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if valid_name(&name) {
+                        isolate_network_of(&name);
+                    }
+                }
                 return;
             }
             std::thread::sleep(std::time::Duration::from_secs(2));
@@ -254,7 +378,7 @@ pub fn integrate_all() {
     });
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || !valid_name(&name) || !entry.path().is_dir() {
+        if name.starts_with('.') || !valid_name(&name) || !entry.path().is_dir() || isolation(&name).files {
             continue;
         }
         integrate_files(&name);
@@ -386,7 +510,15 @@ pub fn handle(action: &str, mut host: UnixStream) -> io::Result<()> {
     let args: Vec<String> = serde_json::from_str(&body).unwrap_or_default();
     let arg = |i: usize| args.get(i).map(String::as_str).unwrap_or("");
     let result: io::Result<String> = match action {
-        "create" => create(arg(0), arg(1), arg(2), arg(3), arg(4), arg(5), arg(6)).map(|_| "ok".into()),
+        "create" => {
+            let mounts: Vec<String> = arg(9).lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+            create(arg(0), arg(1), arg(2), arg(3), arg(4), arg(5), arg(6), arg(7) == "1", arg(8) == "1", &mounts).map(|_| "ok".into())
+        }
+        "restart" => stop(arg(0)).and_then(|_| start(arg(0))).map(|_| "ok".into()),
+        "rename" => rename(arg(0), arg(1)).map(|_| "ok".into()),
+        "info" => info(arg(0)),
+        "logs" => logs(arg(0), arg(1).parse().unwrap_or(100)),
+        "copy-to" | "copy-from" => copy(action, arg(0), arg(1), arg(2), arg(3)).map(|_| "ok".into()),
         "start" => start(arg(0)).map(|_| "ok".into()),
         "stop" => stop(arg(0)).map(|_| "ok".into()),
         "delete" => {
@@ -402,7 +534,8 @@ pub fn handle(action: &str, mut host: UnixStream) -> io::Result<()> {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
-                let _ = std::fs::remove_file(format!("/etc/systemd/nspawn/{name}.nspawn"));
+                let _ = std::fs::remove_file(nspawn_path(name));
+                isolate_network_of(name); // no marker now: just removes its rules
                 std::fs::remove_dir_all(format!("{MACHINES}/{name}")).map(|_| "ok".into())
             }
         }
@@ -427,6 +560,137 @@ pub fn handle(action: &str, mut host: UnixStream) -> io::Result<()> {
     }
     let reply = result.unwrap_or_else(|e| format!("error: {e}"));
     host.write_all(reply.as_bytes())
+}
+
+fn exists(name: &str) -> io::Result<()> {
+    if !valid_name(name) || !Path::new(&format!("{MACHINES}/{name}")).is_dir() {
+        return Err(io::Error::other(format!("no machine {name}")));
+    }
+    Ok(())
+}
+
+fn running(name: &str) -> bool {
+    sh(&format!("machinectl show {name} -p State --value 2>/dev/null")).is_ok_and(|s| s.trim() == "running")
+}
+
+/// Rename a machine: its folder, unit, .nspawn file (and its interface
+/// name), hostname. Started again if it was running.
+fn rename(old: &str, new: &str) -> io::Result<()> {
+    exists(old)?;
+    if !valid_name(new) {
+        return Err(io::Error::other("new name: 1-12 characters, a-z 0-9 and -"));
+    }
+    if Path::new(&format!("{MACHINES}/{new}")).exists() {
+        return Err(io::Error::other(format!("machine {new} already exists")));
+    }
+    let was_running = running(old);
+    if was_running {
+        stop(old)?;
+    }
+    let _ = sh(&format!("machinectl disable {old} >/dev/null 2>&1"));
+    std::fs::rename(format!("{MACHINES}/{old}"), format!("{MACHINES}/{new}"))?;
+    let config = std::fs::read_to_string(nspawn_path(old)).unwrap_or_default();
+    std::fs::write(nspawn_path(new), config.replace(&format!("ve-{old}:"), &format!("ve-{new}:")))?;
+    let _ = std::fs::remove_file(nspawn_path(old));
+    let root = format!("{MACHINES}/{new}");
+    let _ = std::fs::write(format!("{root}/etc/hostname"), format!("{new}\n"));
+    if let Ok(hosts) = std::fs::read_to_string(format!("{root}/etc/hosts")) {
+        let renamed: Vec<String> = hosts
+            .lines()
+            .map(|l| if l.starts_with("127.0.1.1") { format!("127.0.1.1 {new}") } else { l.to_string() })
+            .collect();
+        let _ = std::fs::write(format!("{root}/etc/hosts"), renamed.join("\n") + "\n");
+    }
+    isolate_network_of(old);
+    isolate_network_of(new);
+    sh(&format!("machinectl enable {new} >/dev/null 2>&1"))?;
+    if was_running {
+        start(new)?;
+    }
+    Ok(())
+}
+
+/// `berth machine info`, as JSON.
+fn info(name: &str) -> io::Result<String> {
+    exists(name)?;
+    let root = format!("{MACHINES}/{name}");
+    let machine = list()?.into_iter().find(|m| m.name == name);
+    // e_machine of the machine's shell: 0xB7 arm64, 0x3E x86-64. Its
+    // symlinks (Alpine's /bin/sh -> /bin/busybox) are inside the machine.
+    let inside = |mut path: String| {
+        for _ in 0..8 {
+            let full = format!("{root}{path}");
+            match std::fs::read_link(&full) {
+                Ok(target) if target.is_absolute() => path = target.to_string_lossy().into_owned(),
+                Ok(target) => {
+                    let dir = Path::new(&path).parent().unwrap_or(Path::new("/"));
+                    path = dir.join(target).to_string_lossy().into_owned();
+                }
+                Err(_) => return std::fs::read(full).ok(),
+            }
+        }
+        None
+    };
+    let arch = inside("/bin/sh".into())
+        .or_else(|| inside("/usr/bin/sh".into()))
+        .and_then(|elf| elf.get(18).copied())
+        .map_or("unknown", |m| match m {
+            0xB7 => "arm64",
+            0x3E => "amd64 (Rosetta)",
+            _ => "unknown",
+        });
+    let disk = sh(&format!("du -sxh {root} 2>/dev/null | cut -f1")).unwrap_or_default();
+    let iso = isolation(name);
+    let json = serde_json::json!({
+        "name": name,
+        "state": machine.as_ref().map(|m| m.state.clone()),
+        "os": machine.as_ref().map(|m| m.os.clone()),
+        "addresses": machine.as_ref().map(|m| m.addresses.clone()),
+        "arch": arch,
+        "disk": disk.trim(),
+        "isolated": iso.files || iso.network,
+        "isolated_network": iso.network,
+        "mounts": if iso.files { mounts(name) } else { vec!["home folder".to_string()] },
+        "autostart": Path::new(&format!("/etc/systemd/system/machines.target.wants/systemd-nspawn@{name}.service")).exists(),
+    });
+    serde_json::to_string(&json).map_err(io::Error::other)
+}
+
+/// The machine's journal (or syslog where there's no systemd: Alpine).
+fn logs(name: &str, lines: u32) -> io::Result<String> {
+    exists(name)?;
+    let root = format!("{MACHINES}/{name}");
+    // nspawn makes journal folders even where nothing writes them (Alpine).
+    let journal = format!("{root}/var/log/journal");
+    if sh(&format!("find {journal} -name '*.journal' 2>/dev/null | head -1")).is_ok_and(|f| !f.trim().is_empty()) {
+        return sh(&format!("journalctl -D {journal} -n {lines} --no-pager 2>&1"));
+    }
+    if Path::new(&format!("{root}/var/log/messages")).exists() {
+        return sh(&format!("tail -n {lines} {root}/var/log/messages"));
+    }
+    if running(name) {
+        return sh(&format!("journalctl -M {name} -n {lines} --no-pager 2>&1"));
+    }
+    Ok("no logs found (start the machine, or look in /var/log inside it)\n".into())
+}
+
+/// Copy between the VM (the Mac's shared folders) and a running machine;
+/// files copied in belong to the machine's user (`owner`, "uid:gid").
+fn copy(action: &str, name: &str, from: &str, to: &str, owner: &str) -> io::Result<()> {
+    exists(name)?;
+    for p in [from, to] {
+        if !p.starts_with('/') || p.contains(['\n', '\'']) {
+            return Err(io::Error::other(format!("{p}: an absolute path, please")));
+        }
+    }
+    if !running(name) {
+        start(name)?;
+    }
+    sh(&format!("machinectl {action} {name} '{from}' '{to}'"))?;
+    if action == "copy-to" && owner.bytes().all(|b| b.is_ascii_digit() || b == b':') && !owner.is_empty() {
+        let _ = sh(&format!("nsenter -t \"$(machinectl show {name} -p Leader --value)\" -m -- chown -R {owner} '{to}'"));
+    }
+    Ok(())
 }
 
 /// Running machines and their addresses, for container-style domains.

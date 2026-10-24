@@ -196,7 +196,33 @@ enum MachineCmd {
         /// cloud-init user data to apply on first boot (the image's cloud variant)
         #[arg(long)]
         cloud_init: Option<std::path::PathBuf>,
+        /// No home folder, `mac` command or SSH agent from the Mac
+        #[arg(long)]
+        isolated: bool,
+        /// Share only this Mac folder (repeatable; implies --isolated)
+        #[arg(long = "mount", value_name = "FOLDER")]
+        mounts: Vec<std::path::PathBuf>,
+        /// Also keep it off the Mac, the LAN and private networks (DNS and
+        /// the internet only; implies --isolated)
+        #[arg(long)]
+        isolate_network: bool,
     },
+    /// Stop and start a machine
+    Restart { name: String },
+    /// Rename a machine (restarted if it was running)
+    Rename { name: String, new_name: String },
+    /// A machine's OS, architecture, addresses, disk use and isolation
+    Info { name: String },
+    /// A machine's system log
+    Logs {
+        name: String,
+        #[arg(short = 'n', long, default_value_t = 100)]
+        lines: u32,
+    },
+    /// Copy a file or folder from the Mac into a machine (to your home there)
+    Push { name: String, from: std::path::PathBuf, to: Option<String> },
+    /// Copy a file or folder from a machine to the Mac (to the current folder)
+    Pull { name: String, from: String, to: Option<std::path::PathBuf> },
     /// List machines
     List,
     /// Open a shell in a machine, or run a command there
@@ -347,9 +373,20 @@ fn main() -> Result<()> {
                 bail!("berth is not running");
             }
             match action {
-                MachineCmd::Create { name, distro, arch, cloud_init } => {
-                    machines::create(&paths, &name, &distro, &arch, cloud_init.as_deref())
-                }
+                MachineCmd::Create { name, distro, arch, cloud_init, isolated, mounts, isolate_network } => machines::create(
+                    &paths,
+                    &name,
+                    &distro,
+                    &arch,
+                    cloud_init.as_deref(),
+                    machines::Isolation { isolated: isolated || !mounts.is_empty() || isolate_network, network: isolate_network, mounts },
+                ),
+                MachineCmd::Restart { name } => machines::simple(&paths, "restart", &name),
+                MachineCmd::Rename { name, new_name } => machines::rename(&paths, &name, &new_name),
+                MachineCmd::Info { name } => machines::info(&paths, &name),
+                MachineCmd::Logs { name, lines } => machines::logs(&paths, &name, lines),
+                MachineCmd::Push { name, from, to } => machines::push(&paths, &name, &from, to.as_deref()),
+                MachineCmd::Pull { name, from, to } => machines::pull(&paths, &name, &from, to.as_deref()),
                 MachineCmd::List => machines::list(&paths),
                 MachineCmd::Shell { name, command } => {
                     let remote = machines::shell_command(&name, &command)?;

@@ -7,6 +7,9 @@ are in the commit messages.
 
 ### 2026-10-24
 - **Kubernetes:** LoadBalancer services on the Mac's localhost.
+- **Machines:** isolated machines (`--isolated`, `--mount`,
+  `--isolate-network`), and `restart`, `rename`, `info`, `logs`, `push`,
+  `pull`; also in the app's New Machine sheet.
 - **Finder:** running containers' root filesystems at `~/Berth/containers`;
   `~/Berth` is now SMB with a password (no helper needed), files show as yours.
 - **App:** import from OrbStack or Docker Desktop (Settings), and Intel /

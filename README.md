@@ -87,6 +87,12 @@ from its code.
 - Linux machines: `berth machine create dev --distro ubuntu:noble` (Debian,
   Fedora, Alpine, Arch, Rocky, Alma, openSUSE…) with your user, sudo, your Mac
   home, systemd, and `dev.berth.local`; `berth machine shell dev`
+  - Isolated machines: `--isolated` gives them none of the Mac (no home folder,
+    `mac` command or SSH agent), `--mount <folder>` shares only what you pick, and
+    `--isolate-network` also keeps them off the Mac, the LAN and private networks
+    (DNS and the internet only): for untrusted code and AI agents
+  - `berth machine restart|rename|info|logs`, and `push`/`pull` to copy files in
+    and out
   - Intel machines: `--arch amd64` runs an x86-64 distro on Rosetta
   - cloud-init: `--cloud-init user-data.yaml` applies it on first boot
     (packages, files, users, `runcmd`)
@@ -221,7 +227,9 @@ berth debug web           # a shell with tools inside container `web`, even a di
 berth shell               # SSH into the VM; `berth shell uname -a` runs a command
 berth nerdctl ps          # nerdctl in the VM (with `berth engine enable nerdctl`)
 berth tls status          # also: berth k8s status|disable, berth engine disable <name>
-berth machine list        # also: start, stop, delete, shell <name>
+berth machine list        # also: start, stop, restart, delete, shell, info, logs, rename <name>
+berth machine create box --isolated --mount ~/project --isolate-network
+berth machine push box ./data.csv         # and: berth machine pull box /tmp/out.txt
 berth stop                # --suspend: save the VM so the next start resumes it
 berth delete --yes        # wipe the VM disk (containers, images, volumes)
 ```
@@ -369,7 +377,7 @@ discussions) and the limits above:
 - **File sharing**: close the remaining Composer gap (fewer round trips per
   file); push invalidations to the guest instead of relying on FSEvents
   touches; prebuilt guest modules, so the polling driver needs no download
-- **Machines**: custom images, isolated machines; per-machine and per-volume snapshots
+- **Machines**: custom images; per-machine and per-volume snapshots
   next to the whole-VM ones
 - **Linux GUI apps**: first a console window (virtio-gpu 2D, clipboard via
   spice-vdagent), then per-app windows like WSLg (a compositor in the machine,
