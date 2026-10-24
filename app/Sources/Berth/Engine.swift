@@ -87,12 +87,15 @@ struct BerthConfig: Codable, Equatable {
     var fileSharing: String?
     /// IPv6 for containers (agent/src/ipv6.rs).
     var ipv6: Bool?
+    /// "shutdown" (default, like OrbStack) or "suspend": what `berth stop` does.
+    var stop: String?
 
     enum CodingKeys: String, CodingKey {
         case cpus
         case memoryMib = "memory_mib"
         case fileSharing = "file_sharing"
         case ipv6
+        case stop
     }
 
     static func load() -> BerthConfig {

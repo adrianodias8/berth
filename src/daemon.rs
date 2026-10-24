@@ -29,10 +29,11 @@ unsafe extern "C" {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Status,
-    /// Stop the VM: by default save its state for the next start to resume
-    /// (snapshots::suspend), falling back to a guest shutdown.
+    /// Stop the VM: shut the guest down, or unless `shutdown`, save its
+    /// state for the next start to resume (snapshots::suspend), falling back
+    /// to a shutdown.
     Stop {
-        #[serde(default)]
+        #[serde(default = "yes")]
         shutdown: bool,
     },
     Domains,
@@ -97,6 +98,10 @@ pub struct Status {
 }
 
 static STOPPING: AtomicBool = AtomicBool::new(false);
+
+fn yes() -> bool {
+    true
+}
 /// The VM resumed a snapshot's saved state: its clock is where it was saved.
 static RESTORED: AtomicBool = AtomicBool::new(false);
 

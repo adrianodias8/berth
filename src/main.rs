@@ -43,10 +43,14 @@ struct Cli {
 enum Cmd {
     /// Start the VM and Docker engine
     Start,
-    /// Stop the VM; the next start resumes it where it was (running
-    /// containers included) unless --shutdown
+    /// Stop the VM: shut it down, or with "stop": "suspend" in
+    /// ~/.berth/config.json (or --suspend) save it so the next start
+    /// resumes it, running containers included
     Stop {
-        /// Shut the guest down instead of saving its state
+        /// Save the VM's state for the next start to resume
+        #[arg(long, conflicts_with = "shutdown")]
+        suspend: bool,
+        /// Shut the guest down (the default unless the config says suspend)
         #[arg(long)]
         shutdown: bool,
     },
@@ -211,7 +215,10 @@ fn main() -> Result<()> {
     let paths = Paths::new();
     match command {
         Cmd::Start => start(&paths),
-        Cmd::Stop { shutdown } => stop_with(&paths, shutdown),
+        Cmd::Stop { suspend, shutdown } => {
+            let suspend = suspend || (!shutdown && stop_suspends(&paths));
+            stop_with(&paths, !suspend)
+        }
         Cmd::Status => status(&paths),
         Cmd::Domains => domains(&paths),
         Cmd::Engine { action } => {
@@ -455,6 +462,19 @@ fn use_docker_context(paths: &Paths) {
     }
 }
 
+/// Whether `berth stop` suspends by default ("stop": "suspend" in config.json).
+fn stop_suspends(paths: &Paths) -> bool {
+    #[derive(serde::Deserialize, Default)]
+    struct Config {
+        stop: Option<String>,
+    }
+    std::fs::read(paths.config())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Config>(&b).ok())
+        .and_then(|c| c.stop)
+        .is_some_and(|s| s == "suspend")
+}
+
 /// Stop with a guest shutdown (restores and other internal stops).
 fn stop(paths: &Paths) -> Result<()> {
     stop_with(paths, true)
@@ -479,7 +499,7 @@ fn stop_with(paths: &Paths, shutdown: bool) -> Result<()> {
         bail!("daemon still running; see {}", paths.daemon_log().display());
     }
     if snapshots::is_suspended(paths) {
-        println!(" suspended (the next start resumes it; berth stop --shutdown to shut down)");
+        println!(" suspended (the next start resumes it)");
     } else {
         println!(" stopped");
     }

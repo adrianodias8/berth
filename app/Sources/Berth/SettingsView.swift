@@ -52,6 +52,10 @@ struct SettingsView: View {
 
             SwiftUI.Section("Startup") {
                 Toggle("Start Berth when the app opens", isOn: $autoStart)
+                Toggle("Keep containers running across stops (resume on start)", isOn: Binding(
+                    get: { config.stop == "suspend" },
+                    set: { config.stop = $0 ? "suspend" : nil; save(restart: false) }
+                ))
                 Toggle("Open at login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { _, on in
                         do {
