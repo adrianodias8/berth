@@ -199,10 +199,11 @@ struct Uplink {
     ours: BTreeSet<Ipv4Addr>,
 }
 
-/// The interface carrying the default route, i.e. the one facing the Mac.
-fn uplink() -> io::Result<Uplink> {
+/// The name of the interface carrying the default route, i.e. the one
+/// facing the Mac.
+pub(crate) fn uplink_name() -> io::Result<String> {
     let routes = std::fs::read_to_string("/proc/net/route")?;
-    let ifname = routes
+    routes
         .lines()
         .skip(1)
         .find_map(|l| {
@@ -210,7 +211,11 @@ fn uplink() -> io::Result<Uplink> {
             let name = f.next()?;
             (f.next()? == "00000000").then(|| name.to_string())
         })
-        .ok_or_else(|| io::Error::other("no default route"))?;
+        .ok_or_else(|| io::Error::other("no default route"))
+}
+
+fn uplink() -> io::Result<Uplink> {
+    let ifname = uplink_name()?;
     let out = Command::new("ip").args(["-j", "-4", "addr", "show", "dev", &ifname]).output()?;
     let addrs: Vec<IpAddr> = serde_json::from_slice(&out.stdout).map_err(io::Error::other)?;
     let infos = addrs.into_iter().filter(|a| a.ifname == ifname).flat_map(|a| a.addr_info);

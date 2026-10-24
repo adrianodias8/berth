@@ -62,6 +62,8 @@ pub fn setup() {
 ///   IPs from outside the bridge (raw PREROUTING); the Mac routes container
 ///   subnets to us on purpose. Only written for docker-ce: docker.io 26
 ///   refuses to start on unknown keys.
+/// - IPv6 for containers when the `ipv6` setting is on (ipv6.rs), docker-ce
+///   only as well.
 pub fn configure_docker() -> io::Result<()> {
     let mut config: serde_json::Map<String, serde_json::Value> = match std::fs::read(DOCKER_CONFIG) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other)?,
@@ -72,6 +74,11 @@ pub fn configure_docker() -> io::Result<()> {
     config.insert("dns".into(), serde_json::json!([DNS_IP.to_string()]));
     if crate::engine::installed("docker-ce") {
         config.insert("allow-direct-routing".into(), serde_json::Value::Bool(true));
+        let ipv6 = crate::ipv6::enabled();
+        crate::ipv6::apply(&mut config, ipv6);
+        if let Err(err) = crate::ipv6::configure_network(ipv6) {
+            eprintln!("berth-agent: ipv6: {err}");
+        }
     }
     if config == before {
         return Ok(());

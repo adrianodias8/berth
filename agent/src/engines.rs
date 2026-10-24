@@ -202,7 +202,8 @@ pub fn watch_nerdctl_events() {
     }
 }
 
-fn notify_host_sync() {
+/// Ask the host to re-sync port forwarding (ports.rs on the host).
+pub(crate) fn notify_host_sync() {
     use crate::hostnet::{HOST_VSOCK_PORT, VMADDR_CID_HOST, vsock_connect};
     if let Ok(fd) = vsock_connect(VMADDR_CID_HOST, HOST_VSOCK_PORT) {
         let _ = UnixStream::from(fd).write_all(b"sync\n");

@@ -35,6 +35,11 @@ struct SettingsView: View {
                         Text("Apple's virtiofs").tag("apple")
                     }
                 }
+                VStack(alignment: .leading) {
+                    Toggle("IPv6 for containers", isOn: Binding(get: { config.ipv6 ?? false }, set: { config.ipv6 = $0 ? true : nil }))
+                    Text("Docker networks get IPv6 subnets. Internet access over IPv6 needs IPv6 on this Mac.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 if config != saved {
                     HStack {
                         Text("Restart Berth to apply.").foregroundStyle(.secondary)

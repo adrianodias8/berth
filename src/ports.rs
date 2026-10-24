@@ -1,6 +1,12 @@
 //! Publish container ports on the Mac. Follows the Docker event stream and
 //! keeps one host listener per published TCP port, forwarding each connection
 //! to the same port inside the guest (where dockerd's proxy picks it up).
+//!
+//! Host-network containers (`--net host`) publish nothing: their servers
+//! listen in the guest's own network namespace. The agent watches for those
+//! (agent/src/listeners.rs), asks for a sync when they change, and lists them
+//! with `info listeners`; they are forwarded the same way, on the address they
+//! bind (all interfaces or loopback), so they appear on the Mac's localhost.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -23,7 +29,59 @@ enum Proto {
 /// Host listen address, port and protocol.
 type Key = (&'static str, u16, Proto);
 
-static FORWARDS: Mutex<BTreeMap<Key, JoinHandle<()>>> = Mutex::new(BTreeMap::new());
+/// Where a forwarded connection goes in the guest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Route {
+    /// Try the guest's NAT address first: the server listens on all guest
+    /// interfaces. Otherwise only the agent (vsock) can reach it.
+    direct: bool,
+    /// The address the agent connects to on the vsock path.
+    guest: &'static str,
+}
+
+/// Published ports: dockerd's proxy listens on 127.0.0.1 in the guest, and
+/// also on the NAT address when published on all interfaces.
+fn published_route(bind: &str) -> Route {
+    Route { direct: bind == "::", guest: "127.0.0.1" }
+}
+
+static FORWARDS: Mutex<BTreeMap<Key, (Route, JoinHandle<()>)>> = Mutex::new(BTreeMap::new());
+
+/// A listening socket of a host-network container, as the agent reports it.
+#[derive(Deserialize, Debug)]
+struct Listener {
+    proto: String,
+    port: u16,
+    /// "0.0.0.0", "::", "127.0.0.1" or "::1".
+    bind: String,
+}
+
+/// Where a host-network listener appears on the Mac. Wildcard binds map to
+/// the dual-stack `[::]`; loopback ones stay loopback (and on the same
+/// family, so a server on `localhost` that binds both gets both). UDP is
+/// relayed to the guest's NAT address, so only wildcard binds work.
+fn listener_forward(l: &Listener) -> Option<(Key, Route)> {
+    let (bind, route) = match (l.proto.as_str(), l.bind.as_str()) {
+        ("tcp", "0.0.0.0") => ("::", Route { direct: true, guest: "127.0.0.1" }),
+        ("tcp", "::") => ("::", Route { direct: true, guest: "[::1]" }),
+        ("tcp", "127.0.0.1") => ("127.0.0.1", Route { direct: false, guest: "127.0.0.1" }),
+        ("tcp", "::1") => ("::1", Route { direct: false, guest: "[::1]" }),
+        ("udp", "0.0.0.0" | "::") => ("::", Route { direct: true, guest: "127.0.0.1" }),
+        _ => return None,
+    };
+    let proto = if l.proto == "udp" { Proto::Udp } else { Proto::Tcp };
+    Some(((bind, l.port, proto), route))
+}
+
+/// Everything to forward: published ports first; a host-network listener
+/// only where no published port already holds that Mac address and port.
+fn plan(published: Vec<Key>, listeners: &[Listener]) -> BTreeMap<Key, Route> {
+    let mut wanted: BTreeMap<Key, Route> = published.into_iter().map(|key| (key, published_route(key.0))).collect();
+    for (key, route) in listeners.iter().filter_map(listener_forward) {
+        wanted.entry(key).or_insert(route);
+    }
+    wanted
+}
 
 /// Events after which published ports or network subnets may have changed:
 /// container start/die/pause/unpause and any network event.
@@ -69,6 +127,7 @@ fn display((bind, port, proto): Key) -> String {
     let suffix = if proto == Proto::Udp { "/udp" } else { "" };
     match bind {
         "::" => format!("*:{port}{suffix}"),
+        "::1" => format!("[::1]:{port}{suffix}"),
         _ => format!("{bind}:{port}{suffix}"),
     }
 }
@@ -144,7 +203,14 @@ async fn sync() -> Result<()> {
     let sources = containers.iter().flat_map(|c| &c.mounts).filter(|m| m.kind == "bind").map(|m| m.source.as_str());
     crate::watch::set_roots(crate::watch::bind_roots(sources, &home));
 
-    let mut wanted: Vec<Key> = containers
+    // Host-network containers' servers; absent from an older agent.
+    let mut listeners = String::new();
+    if let Ok(mut guest) = guest_stream("info listeners").await {
+        let _ = guest.read_to_string(&mut listeners).await;
+    }
+    let listeners: Vec<Listener> = serde_json::from_str(&listeners).unwrap_or_default();
+
+    let mut published: Vec<Key> = containers
         .iter()
         .flat_map(|c| &c.ports)
         .filter_map(|p| {
@@ -164,21 +230,20 @@ async fn sync() -> Result<()> {
         .collect();
     // The Kubernetes API, for the `berth` kubectl context.
     if crate::routes::K8S_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        wanted.push(("127.0.0.1", crate::k8s::API_PORT, Proto::Tcp));
+        published.push(("127.0.0.1", crate::k8s::API_PORT, Proto::Tcp));
     }
-    wanted.sort();
-    wanted.dedup();
+    let wanted = plan(published, &listeners);
 
     let mut forwards = FORWARDS.lock().unwrap();
-    forwards.retain(|key, task| {
-        let keep = wanted.contains(key);
+    forwards.retain(|key, (route, task)| {
+        let keep = wanted.get(key) == Some(route);
         if !keep {
             task.abort();
             eprintln!("ports: stopped forwarding {}", display(*key));
         }
         keep
     });
-    for key in wanted {
+    for (key, route) in wanted {
         if forwards.contains_key(&key) {
             continue;
         }
@@ -187,9 +252,7 @@ async fn sync() -> Result<()> {
         let task = match key.2 {
             Proto::Tcp => bind_tcp(key.0, key.1).and_then(|std| {
                 std.set_nonblocking(true)?;
-                // Ports Docker binds on all guest interfaces can be reached on
-                // the guest's NAT address; loopback-only ones only via the agent.
-                Ok(tokio::spawn(forward(TcpListener::from_std(std)?, key.1, key.0 == "::")))
+                Ok(tokio::spawn(forward(TcpListener::from_std(std)?, key.1, route)))
             }),
             Proto::Udp => bind_udp(key.0, key.1).and_then(|std| {
                 std.set_nonblocking(true)?;
@@ -199,7 +262,7 @@ async fn sync() -> Result<()> {
         match task {
             Ok(task) => {
                 eprintln!("ports: forwarding {}", display(key));
-                forwards.insert(key, task);
+                forwards.insert(key, (route, task));
             }
             Err(err) => eprintln!("ports: cannot listen on {}: {err}", display(key)),
         }
@@ -311,8 +374,9 @@ async fn forward_udp(socket: tokio::net::UdpSocket, port: u16) {
     }
 }
 
-async fn forward(listener: TcpListener, port: u16, direct: bool) {
-    let target = format!("tcp 127.0.0.1:{port}");
+async fn forward(listener: TcpListener, port: u16, route: Route) {
+    let target = format!("tcp {}:{port}", route.guest);
+    let direct = route.direct;
     loop {
         let (mut client, _) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -394,4 +458,47 @@ async fn docker_get_from(target: &str, path: &str) -> Result<BufReader<UnixStrea
         }
     }
     Ok(reader)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listener(proto: &str, port: u16, bind: &str) -> Listener {
+        Listener { proto: proto.into(), port, bind: bind.into() }
+    }
+
+    #[test]
+    fn host_listeners_keep_their_scope() {
+        let all = Route { direct: true, guest: "127.0.0.1" };
+        assert_eq!(listener_forward(&listener("tcp", 80, "0.0.0.0")), Some((("::", 80, Proto::Tcp), all)));
+        assert_eq!(
+            listener_forward(&listener("tcp", 80, "::")),
+            Some((("::", 80, Proto::Tcp), Route { direct: true, guest: "[::1]" }))
+        );
+        assert_eq!(
+            listener_forward(&listener("tcp", 5173, "::1")),
+            Some((("::1", 5173, Proto::Tcp), Route { direct: false, guest: "[::1]" }))
+        );
+        assert_eq!(
+            listener_forward(&listener("tcp", 3000, "127.0.0.1")),
+            Some((("127.0.0.1", 3000, Proto::Tcp), Route { direct: false, guest: "127.0.0.1" }))
+        );
+        assert_eq!(listener_forward(&listener("udp", 5000, "::")), Some((("::", 5000, Proto::Udp), all)));
+        // Loopback UDP can't be relayed to the NAT address.
+        assert_eq!(listener_forward(&listener("udp", 5000, "127.0.0.1")), None);
+        assert_eq!(listener_forward(&listener("sctp", 1, "::")), None);
+    }
+
+    #[test]
+    fn published_ports_win() {
+        let published = vec![("127.0.0.1", 80, Proto::Tcp), ("::", 8080, Proto::Tcp)];
+        let listeners = [listener("tcp", 8080, "0.0.0.0"), listener("tcp", 80, "0.0.0.0"), listener("tcp", 8080, "::")];
+        let plan = plan(published, &listeners);
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[&("127.0.0.1", 80, Proto::Tcp)], published_route("127.0.0.1"));
+        assert_eq!(plan[&("::", 8080, Proto::Tcp)], published_route("::"));
+        // The host-network server on 80 still gets the wildcard address.
+        assert_eq!(plan[&("::", 80, Proto::Tcp)], Route { direct: true, guest: "127.0.0.1" });
+    }
 }

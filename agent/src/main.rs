@@ -6,6 +6,7 @@
 //!   info domains\n          (replies with the domain table as JSON)
 //!   info network\n          (replies with the guest address and Docker subnets)
 //!   info memory\n           (replies with MemTotal/MemAvailable/PSI, see memory.rs)
+//!   info listeners\n        (replies with host-network containers' listening ports, listeners.rs)
 //!   k8s <action>\n          enable|disable|status|kubeconfig (k8s.rs)
 //!   machine <action>\n      then JSON args until EOF: create|start|stop|delete|list (machines.rs)
 //!   engine <action> [name]\n enable|disable podman|nerdctl, status (engines.rs)
@@ -18,8 +19,9 @@
 //!
 //! A failed connect just closes the stream. The agent also runs the container
 //! domain controller (domains.rs), its mDNS responder (mdns.rs), DNS for
-//! containers (dns.rs), host.docker.internal forwarding (hostnet.rs) and web
-//! access to domains: port detection and HTTPS (web.rs).
+//! containers (dns.rs), host.docker.internal forwarding (hostnet.rs), web
+//! access to domains: port detection and HTTPS (web.rs), and the watcher for
+//! host-network containers' ports (listeners.rs).
 
 mod boot;
 mod dns;
@@ -28,8 +30,10 @@ mod domains;
 mod engine;
 mod engines;
 mod hostnet;
+mod ipv6;
 mod k8s;
 mod kmod;
+mod listeners;
 mod machines;
 mod mdns;
 mod memory;
@@ -64,6 +68,7 @@ fn main() {
     thread::spawn(move || mdns::run(t2));
     thread::spawn(move || dns::run(t3));
     thread::spawn(hostnet::run);
+    thread::spawn(listeners::run);
 
     let listener = match vsock_listen(PORT) {
         Ok(fd) => fd,
@@ -113,6 +118,10 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
         Some(("engine", args)) => engines::handle(args, host),
         Some(("info", "nerdctl")) => {
             serde_json::to_writer(&mut host, &engines::nerdctl_containers()).map_err(io::Error::other)?;
+            Ok(())
+        }
+        Some(("info", "listeners")) => {
+            serde_json::to_writer(&mut host, &listeners::current()).map_err(io::Error::other)?;
             Ok(())
         }
         Some(("info", "memory")) => {

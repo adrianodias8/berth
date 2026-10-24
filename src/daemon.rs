@@ -399,7 +399,8 @@ fn bridge(listener: UnixListener, target: &'static str, name: &'static str) {
 ///   memory-pressure             the guest is stalling on memory: deflate the
 ///                               balloon now (memory.rs)
 ///   sync                        containers changed outside Docker's event
-///                               stream (nerdctl): re-sync port forwarding
+///                               stream (nerdctl), or host-network containers
+///                               opened or closed ports: re-sync port forwarding
 async fn serve_host_connections(max_memory: u64) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     if vm::INCOMING.set(tx).is_err() {
