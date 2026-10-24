@@ -162,7 +162,15 @@ struct ImagesView: View {
             }
             TableColumn("ID") { Text($0.shortID).monospaced().foregroundStyle(.secondary) }.width(110)
             TableColumn("Size") { Text(formatBytes($0.size)).monospacedDigit() }.width(90)
-            TableColumn("Created") { Text(Date(timeIntervalSince1970: TimeInterval($0.created)), style: .relative) }.width(120)
+            TableColumn("Created") { image in
+                // Reproducible builds (distroless, ko, nix) stamp 1970: no date.
+                if image.created > 0 {
+                    Text(Date(timeIntervalSince1970: TimeInterval(image.created)), style: .relative)
+                } else {
+                    Text("—").foregroundStyle(.secondary)
+                }
+            }
+            .width(120)
             TableColumn("") { image in
                 if image.displayTags.contains(where: inUse.contains) {
                     Text("in use").font(.caption).foregroundStyle(.secondary)

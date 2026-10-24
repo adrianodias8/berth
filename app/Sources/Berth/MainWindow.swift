@@ -30,6 +30,7 @@ struct MainWindow: View {
     // `-openSection Images` etc. on the command line (NSArgumentDomain) picks
     // the starting screen; handy for scripted screenshots.
     @State private var section = Section(rawValue: UserDefaults.standard.string(forKey: "openSection") ?? "") ?? .containers
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         NavigationSplitView {
@@ -75,7 +76,11 @@ struct MainWindow: View {
             }
         }
         .sheet(isPresented: $showOnboarding) { OnboardingView() }
-        .onAppear { if !onboarded { showOnboarding = true } }
+        .onAppear {
+            if !onboarded { showOnboarding = true }
+            // `-openSettings YES`, with the launch arguments above.
+            if UserDefaults.standard.bool(forKey: "openSettings") { openSettings() }
+        }
         .onChange(of: onboarded) { if !onboarded { showOnboarding = true } }
     }
 }

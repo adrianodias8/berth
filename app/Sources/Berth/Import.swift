@@ -41,7 +41,7 @@ struct ImportSheet: View {
             }
         }
         .padding()
-        .frame(width: 560)
+        .frame(width: 480)
     }
 
     /// The CLI, its output shown as it comes (an import can take a while).

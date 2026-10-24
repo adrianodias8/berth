@@ -204,8 +204,11 @@ its own. Closing the window keeps it in the menu bar.
   Desktop. New machines can be Intel (Rosetta) and take a cloud-init file
 
 Launch arguments pick the starting screen, e.g.
-`open target/Berth.app --args -openSection Images` or
-`--args -openContainer web -openTab Logs`.
+`open target/Berth.app --args -openSection Images`,
+`--args -openContainer web -openTab Logs` (or `-openTab Debug` for the debug shell),
+`--args -openSettings YES` (with `-openSheet Import`), or
+`--args -openSection Machines -openMachine dev -openSheet MachineInfo` (also
+`MachineLogs`, `NewMachine`).
 
 ## Use
 

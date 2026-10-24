@@ -4,9 +4,11 @@ import SwiftUI
 struct ContainerDetail: View {
     @EnvironmentObject var engine: Engine
     let container: Container
-    @State private var tab = Tab(rawValue: UserDefaults.standard.string(forKey: "openTab") ?? "") ?? .info
+    // `-openTab Debug`: the Terminal tab on its debug shell.
+    @State private var tab = Tab(rawValue: UserDefaults.standard.string(forKey: "openTab") ?? "")
+        ?? (UserDefaults.standard.string(forKey: "openTab") == "Debug" ? .terminal : .info)
     /// `berth debug`: the VM's tools in the container, for images without a shell.
-    @State private var debugShell = false
+    @State private var debugShell = UserDefaults.standard.string(forKey: "openTab") == "Debug"
 
     enum Tab: String, CaseIterable {
         case info = "Info", logs = "Logs", terminal = "Terminal", files = "Files", stats = "Stats"
@@ -51,9 +53,10 @@ struct ContainerDetail: View {
                             .padding(.horizontal, 16)
                             .help("Debug shell: a root shell with the VM's tools (bash, ps, curl, apt) in the container's namespaces, even for images without a shell. Its files are at /container.")
                             if debugShell {
-                                MachineTerminal(args: ["debug", container.id]).id("debug-\(container.id)")
+                                // By name: it's the debug shell's prompt.
+                                MachineTerminal(args: ["debug", container.name]).id("debug-\(container.id)").terminalInset()
                             } else {
-                                ContainerTerminal(containerID: container.id)
+                                ContainerTerminal(containerID: container.id).terminalInset()
                             }
                         }
                     } else {

@@ -110,6 +110,14 @@ final class ExecSession: NSObject, TerminalViewDelegate, @unchecked Sendable {
     func rangeChanged(source: TerminalView, startY: Int, endY: Int) {}
 }
 
+extension View {
+    /// A little room around a terminal, in its own black, so text doesn't
+    /// touch the window's edge.
+    func terminalInset() -> some View {
+        padding(.horizontal, 8).padding(.vertical, 6).background(Color.black)
+    }
+}
+
 /// A shell via the berth CLI: the VM (`berth shell`) or a machine
 /// (`berth machine shell <name>`).
 struct MachineTerminal: NSViewRepresentable {

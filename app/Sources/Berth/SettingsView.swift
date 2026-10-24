@@ -7,7 +7,7 @@ struct SettingsView: View {
     @State private var config = BerthConfig.load()
     @State private var saved = BerthConfig.load()
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
-    @State private var showImport = false
+    @State private var showImport = UserDefaults.standard.string(forKey: "openSheet") == "Import"
     /// "auto", "none" or "url"; the URL itself lives in `proxyURL` while
     /// it's being typed.
     @State private var proxyMode = { () -> String in
@@ -65,7 +65,7 @@ struct SettingsView: View {
                     }
                     .onChange(of: proxyMode) { _, _ in syncProxy() }
                     if proxyMode == "url" {
-                        TextField("http://host:port", text: $proxyURL)
+                        TextField("Proxy URL", text: $proxyURL, prompt: Text("http://host:port"))
                             .textFieldStyle(.roundedBorder)
                             .onChange(of: proxyURL) { _, _ in syncProxy() }
                         if !proxyURL.isEmpty && !proxyURLValid {
@@ -81,7 +81,7 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 VStack(alignment: .leading) {
-                    Toggle("Volumes and machines in Finder", isOn: Binding(get: { config.finder ?? true }, set: { config.finder = $0 ? nil : false }))
+                    Toggle("Files in Finder (~/Berth)", isOn: Binding(get: { config.finder ?? true }, set: { config.finder = $0 ? nil : false }))
                     Text("Volumes, machines and running containers' files, at ~/Berth while Berth runs.")
                         .font(.caption).foregroundStyle(.secondary)
                 }

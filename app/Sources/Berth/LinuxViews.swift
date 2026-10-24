@@ -39,7 +39,8 @@ enum Machines {
 struct MachinesView: View {
     @EnvironmentObject var engine: Engine
     @State private var machines: [LinuxMachine] = []
-    @State private var selection: String? = "berth-vm"
+    // `-openMachine dev` picks it; `-openSheet NewMachine|MachineInfo|MachineLogs`.
+    @State private var selection: String? = UserDefaults.standard.string(forKey: "openMachine") ?? "berth-vm"
     @State private var showCreate = false
     /// Machines with an action under way, and ones being created (minutes).
     @State private var busy: Set<String> = []
@@ -108,7 +109,7 @@ struct MachinesView: View {
             Divider()
             Group {
                 if selection == "berth-vm" {
-                    MachineTerminal(args: ["shell"]).id("vm")
+                    MachineTerminal(args: ["shell"]).id("vm").terminalInset()
                 } else if let name = selection, let m = machines.first(where: { $0.name == name }) {
                     if m.isRunning {
                         VStack(spacing: 0) {
@@ -120,7 +121,7 @@ struct MachinesView: View {
                             }
                             .padding(10)
                             Divider()
-                            MachineTerminal(args: ["machine", "shell", m.name]).id(m.name)
+                            MachineTerminal(args: ["machine", "shell", m.name]).id(m.name).terminalInset()
                         }
                     } else {
                         VStack(spacing: 12) {
@@ -173,6 +174,14 @@ struct MachinesView: View {
             }
         }
         .navigationTitle("Machines")
+        .onAppear {
+            switch UserDefaults.standard.string(forKey: "openSheet") {
+            case "NewMachine": showCreate = true
+            case "MachineInfo": if let m = selection, m != "berth-vm" { showReport(m, ["info", m], title: m) }
+            case "MachineLogs": if let m = selection, m != "berth-vm" { showReport(m, ["logs", m, "-n", "300"], title: "\(m) logs") }
+            default: break
+            }
+        }
     }
 
     private func refresh() async {
