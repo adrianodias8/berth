@@ -699,7 +699,15 @@ fn poll_driver_ready(paths: &crate::paths::Paths) -> bool {
 /// The tunnel's device tag (fuse/tunnel.rs, agent/src/tunnel.rs).
 const TUNNEL_TAG: &str = "berth-tunnel";
 
-fn device(root: &std::path::Path, poll_driver: bool) -> Retained<NSObject> {
+/// Mac folders besides home the VM sees at the same path (the agent mounts
+/// them, agent/src/shares.rs): external drives, and the temp folders
+/// `-v /tmp/...` and `$TMPDIR` bind mounts use (src/dockerapi.rs maps
+/// /tmp and /var/folders to these). Always all of them, whether or not
+/// they exist: a saved VM state only resumes on the same devices.
+pub const EXTRA_SHARES: [(&str, &str); 3] =
+    [("berth-volumes", "/Volumes"), ("berth-tmp", "/private/tmp"), ("berth-folders", "/private/var/folders")];
+
+fn device(root: &std::path::Path, tag: &'static str, poll_driver: bool) -> Retained<NSObject> {
     let num = |var: &str, default: f64| std::env::var(var).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(default);
     let policy = CachePolicy {
         entry: Duration::from_secs_f64(num("BERTH_FS_ENTRY_TIMEOUT", 1.0)),
@@ -712,7 +720,7 @@ fn device(root: &std::path::Path, poll_driver: bool) -> Retained<NSObject> {
     // serving thread becomes the limit for parallel work.
     let threaded = num("BERTH_FS_THREADS", if poll_driver { 1.0 } else { 0.0 }) != 0.0;
     eprintln!(
-        "virtiofs: sharing {} as '{TAG}' ({}; {policy:?}, {request_queues} request queues, {})",
+        "virtiofs: sharing {} as '{tag}' ({}; {policy:?}, {request_queues} request queues, {})",
         root.display(),
         if poll_driver { "polling driver" } else { "built-in driver" },
         if threaded { "threaded" } else { "single-threaded" }
@@ -726,7 +734,7 @@ fn device(root: &std::path::Path, poll_driver: bool) -> Retained<NSObject> {
         Some(&DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(DispatchQoS::UserInteractive))),
     );
     let device = FsDevice::new(Backend::Files(Arc::new(Server::new(root.to_path_buf(), policy))), queue.clone(), threaded);
-    configure(device, queue, TAG, request_queues, poll_driver)
+    configure(device, queue, tag, request_queues, poll_driver)
 }
 
 /// The tunnel device: connections from the VM to the Mac's loopback.
@@ -782,7 +790,10 @@ pub fn attach(config: &objc2_virtualization::VZVirtualMachineConfiguration, root
     let poll_driver = share == HomeShare::Berth { poll_driver: true };
     let mut devices = Vec::new();
     if let HomeShare::Berth { poll_driver } = share {
-        devices.push(device(root, poll_driver));
+        devices.push(device(root, TAG, poll_driver));
+        for (tag, path) in EXTRA_SHARES {
+            devices.push(device(std::path::Path::new(path), tag, poll_driver));
+        }
     }
     devices.push(tunnel_device(poll_driver));
     {

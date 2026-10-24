@@ -50,6 +50,7 @@ mod machines;
 mod mdns;
 mod memory;
 mod proxy;
+mod shares;
 mod tunnel;
 mod web;
 
@@ -84,6 +85,7 @@ fn main() {
     thread::spawn(boot::export_kernel);
     thread::spawn(kmod::run);
     thread::spawn(install_guest_files);
+    thread::spawn(shares::mount_all);
     mac::run();
     thread::spawn(machines::integrate_all);
     thread::spawn(move || domains::run(t1));

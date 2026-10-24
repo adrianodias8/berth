@@ -388,9 +388,9 @@ pub fn run(paths: Paths) -> Result<()> {
 
 async fn serve(paths: Paths, cpus: usize, memory: u64) -> Result<()> {
     let control = UnixListener::bind(paths.control_socket())?;
-    bridge(UnixListener::bind(paths.docker_socket())?, DOCKER_TARGET, "docker");
+    crate::dockerapi::bridge(UnixListener::bind(paths.docker_socket())?, DOCKER_TARGET, "docker");
     bridge(UnixListener::bind(paths.ssh_socket())?, SSH_TARGET, "ssh");
-    bridge(UnixListener::bind(paths.podman_socket())?, PODMAN_TARGET, "podman");
+    crate::dockerapi::bridge(UnixListener::bind(paths.podman_socket())?, PODMAN_TARGET, "podman");
     crate::macexec::serve_machine_ssh(UnixListener::bind(paths.machine_ssh_socket())?);
     crate::watch::start();
     tokio::spawn(ports::run());

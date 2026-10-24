@@ -14,6 +14,15 @@ How the VM sees your Mac's home folder, and how to work on it.
 tag `home` and is mounted at your home path, so `docker run -v
 ~/project:/app` sees the same paths as on the Mac.
 
+Three more folders are shared the same way and mounted by the agent after
+boot, at the same paths: `/Volumes` (external drives), `/private/tmp` and
+`/private/var/folders` (`$TMPDIR`). On the Mac `/tmp` and `/var/folders` are
+symlinks into `/private`, which the Docker CLI passes on unresolved, and in
+the VM `/tmp` is the VM's own: so berth's Docker socket bridge
+(`src/dockerapi.rs`) rewrites bind sources under `/tmp` and `/var/folders`
+in container-create requests to their `/private` paths. File change
+forwarding (hot reload) covers all four.
+
 Apple's share: no control over caching (every lookup crosses to the Mac),
 and files show as root-owned in containers, so tools that set group
 ownership (`rsync -g`, DDEV's `composer create-project`) fail.

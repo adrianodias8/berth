@@ -302,6 +302,19 @@ fn build_config(paths: &Paths, res: &Resources) -> Result<Retained<VZVirtualMach
             let share = VZSingleDirectoryShare::initWithDirectory(VZSingleDirectoryShare::alloc(), &home_dir);
             home.setShare(Some(&share));
             shares.push(Retained::into_super(home));
+            for (tag, path) in crate::virtiofs::EXTRA_SHARES {
+                let dev = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                    VZVirtioFileSystemDeviceConfiguration::alloc(),
+                    &NSString::from_str(tag),
+                );
+                let dir = VZSharedDirectory::initWithURL_readOnly(
+                    VZSharedDirectory::alloc(),
+                    &file_url(std::path::Path::new(path)),
+                    false,
+                );
+                dev.setShare(Some(&VZSingleDirectoryShare::initWithDirectory(VZSingleDirectoryShare::alloc(), &dir)));
+                shares.push(Retained::into_super(dev));
+            }
         }
         if VZLinuxRosettaDirectoryShare::availability() == VZLinuxRosettaAvailability::Installed {
             let rosetta = VZLinuxRosettaDirectoryShare::initWithError(VZLinuxRosettaDirectoryShare::alloc())

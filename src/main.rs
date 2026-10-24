@@ -2,6 +2,7 @@ mod cli_tools;
 mod config;
 mod context;
 mod daemon;
+mod dockerapi;
 mod engines;
 mod files;
 mod fuse;

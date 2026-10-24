@@ -6,6 +6,8 @@ are in the commit messages.
 ## Unreleased
 
 ### 2026-10-24
+- **More of the Mac in containers:** `/Volumes`, `/tmp` and `$TMPDIR`
+  (`/var/folders`) bind mounts work, at the same paths.
 - **Fixed:** files created with O_EXCL|O_NOFOLLOW on bind mounts (busybox
   tar's extraction) failed with EINVAL on berth's share.
 - **Review fixes:** ~/.ssh/config is never replaced when it can't be read and

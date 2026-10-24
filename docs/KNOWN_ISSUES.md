@@ -11,6 +11,9 @@ fix one, remove it here in the same change.
   which is usual but not guaranteed (eviction past 4096 cached files is
   skipped only for removed nodes). Reopening by name is refused rather than
   getting the wrong file.
+- **Only the Docker API's container create is rewritten** for `/tmp` and
+  `/var/folders` bind sources: Podman's own (libpod) API and machines don't
+  get the mapping (use `/private/tmp/...`), and machines see only home.
 - **Missing operations.** RENAME2 with `RENAME_NOREPLACE` returns EINVAL
   (macOS `renamex_np(RENAME_EXCL)` could do it); MKNOD is ENOSYS, so `bind()`
   of a Unix socket in a shared folder fails. No xattrs, no locks beyond what

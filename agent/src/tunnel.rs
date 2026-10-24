@@ -34,26 +34,19 @@ impl Drop for Slot {
 /// Mount the tunnel share (polling driver if it's there, else the built-in).
 pub fn mount() -> bool {
     *MOUNTED.get_or_init(|| {
-        if mounted() {
+        if crate::shares::mounted(MOUNT) {
             return true; // the agent restarted
         }
         let _ = std::fs::create_dir_all(MOUNT);
         let _ = std::process::Command::new("modprobe").args(["-q", "virtiofs_poll"]).status();
-        let (tag, dir) = (c"berth-tunnel", c"/run/berth-tunnel");
-        for fstype in [c"virtiofs_poll", c"virtiofs"] {
-            if unsafe { libc::mount(tag.as_ptr(), dir.as_ptr(), fstype.as_ptr(), 0, std::ptr::null()) } == 0 {
-                eprintln!("berth-agent: tunnel: mounted ({})", fstype.to_string_lossy());
-                return true;
+        match crate::shares::mount("berth-tunnel", MOUNT) {
+            Ok(fstype) => {
+                eprintln!("berth-agent: tunnel: mounted ({fstype})");
+                true
             }
+            Err(_) => false,
         }
-        false
     })
-}
-
-/// Whether the share is already mounted at MOUNT (field 5 of mountinfo).
-fn mounted() -> bool {
-    std::fs::read_to_string("/proc/self/mountinfo")
-        .is_ok_and(|info| info.lines().any(|l| l.split(' ').nth(4) == Some(MOUNT)))
 }
 
 /// A connection to the Mac's 127.0.0.1:<port> (or ::1) through the tunnel,

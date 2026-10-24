@@ -70,7 +70,9 @@ from its code.
   containers use the Mac's DNS, so VPN and split DNS apply
 
 **Development**
-- Bind mounts of your home directory at the same path, served by berth's own
+- Bind mounts from your home folder, external drives (`/Volumes`), `/tmp` and
+  `$TMPDIR` (`/var/folders`, what testcontainers uses), at the same paths, served
+  by berth's own
   file sharing on macOS 27 (Apple's virtiofs before): 3x faster than Apple's on
   small files and close to OrbStack (20k files extracted in 2.4-2.7 s; OrbStack
   2.3 s, Apple's 7.9 s; reading them back is still 2.4x slower), real file
@@ -338,6 +340,8 @@ refuses any other name, so trusting it cannot be abused for real sites.
 - `src/files.rs` (agent: `files.rs`): `~/Berth` in Finder over NFS
 - `guest/berth-debug.sh`: `berth debug`
 - `src/import.rs`: `berth import` from OrbStack or Docker Desktop
+- `src/dockerapi.rs`: the Docker socket bridge (maps `/tmp`, `/var/folders` bind sources);
+  agent `shares.rs` mounts `/Volumes`, `/private/tmp`, `/private/var/folders`
 - `src/config.rs`: `berth config`; `src/proxy.rs` (agent: `proxy.rs`): Docker's proxy
 - `src/context.rs`: the `berth` docker context
 - agent: `boot.rs` (direct boot, kernel export), `docker.rs` (Docker API client),

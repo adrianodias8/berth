@@ -212,12 +212,14 @@ fn outermost(roots: BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
 
 /// Bind-mount sources worth watching: directories inside the shared home.
 pub fn bind_roots<'a>(sources: impl Iterator<Item = &'a str>, home: &Path) -> BTreeSet<PathBuf> {
+    let shared: Vec<&Path> =
+        std::iter::once(home).chain(crate::virtiofs::EXTRA_SHARES.iter().map(|(_, p)| Path::new(*p))).collect();
     sources
         .map(PathBuf::from)
         // A file mount is watched through its directory.
         .map(|p| if p.is_dir() { p } else { p.parent().map_or(p.clone(), Path::to_path_buf) })
-        // Never the whole home directory (a file mounted straight from ~).
-        .filter(|p| p.starts_with(home) && p != home)
+        // Inside a shared folder, never a whole one (a file mounted straight from ~).
+        .filter(|p| shared.iter().any(|root| p.starts_with(root) && p != root))
         .collect()
 }
 
