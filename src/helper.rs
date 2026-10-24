@@ -22,6 +22,10 @@ pub const SOCKET: &str = "/var/run/dev.berth.helper.sock";
 const LABEL: &str = "dev.berth.helper";
 const BINARY: &str = "/Library/PrivilegedHelperTools/dev.berth.helper";
 const PLIST: &str = "/Library/LaunchDaemons/dev.berth.helper.plist";
+/// The routes the helper has added, so a helper that was killed (no chance
+/// to clean up) has its routes removed by the next one. In /var/run, which a
+/// reboot empties, like the routes themselves.
+const ROUTES: &str = "/var/run/dev.berth.helper.routes";
 
 /// Private ranges a container subnet may come from.
 const ALLOWED: [(Ipv4Addr, u8); 5] = [
@@ -39,7 +43,7 @@ pub struct Route {
 }
 
 /// Bumped when the helper gains abilities, so berth can ask for a reinstall.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 #[derive(Serialize, Deserialize)]
 pub struct SetRoutes {
@@ -221,6 +225,15 @@ pub fn serve(uid: u32) -> Result<()> {
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
         set
     };
+    // Routes a previous helper left behind (killed, or crashed).
+    if let Ok(bytes) = std::fs::read(ROUTES)
+        && let Ok(stale) = serde_json::from_slice::<Vec<Route>>(&bytes)
+    {
+        for route in &stale {
+            delete_route(route);
+        }
+    }
+    let _ = std::fs::remove_file(ROUTES);
     let installed = std::sync::Arc::new(std::sync::Mutex::new(BTreeSet::<Route>::new()));
     {
         let installed = installed.clone();
@@ -230,6 +243,7 @@ pub fn serve(uid: u32) -> Result<()> {
             for route in installed.lock().unwrap().iter() {
                 delete_route(route);
             }
+            let _ = std::fs::remove_file(ROUTES);
             let _ = std::fs::remove_file(SOCKET);
             std::process::exit(0);
         });
@@ -318,6 +332,9 @@ fn reconcile(wanted: &[Route], installed: &mut BTreeSet<Route>) -> Reply {
         }
     }
     reply.active = installed.iter().cloned().collect();
+    if let Ok(json) = serde_json::to_vec(&reply.active) {
+        let _ = std::fs::write(ROUTES, json);
+    }
     reply
 }
 
@@ -396,7 +413,7 @@ fn validate(route: &Route, table: &[(Cidr, String)], installed: &BTreeSet<Route>
     }
     let gateway: Ipv4Addr = route.gateway.parse().context("bad gateway")?;
     match interface_for(gateway) {
-        Some(iface) if iface.starts_with("bridge") => {}
+        Some(iface) if iface.starts_with("bridge") && vm_bridge(&iface) => {}
         Some(iface) => bail!("gateway {gateway} is on {iface}, not a VM bridge"),
         None => bail!("gateway {gateway} is not reachable"),
     }
@@ -407,6 +424,22 @@ fn validate(route: &Route, table: &[(Cidr, String)], installed: &BTreeSet<Route>
         bail!("overlaps existing route {existing} on {iface}");
     }
     Ok(())
+}
+
+/// A bridge made by vmnet for VMs: its members are all VM interfaces
+/// (vmenet*), unlike Thunderbolt Bridge's (en*).
+fn vm_bridge(iface: &str) -> bool {
+    let Ok(out) = Command::new("/sbin/ifconfig").arg(iface).output() else { return false };
+    only_vm_members(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn only_vm_members(ifconfig: &str) -> bool {
+    let members: Vec<&str> = ifconfig
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("member: "))
+        .filter_map(|m| m.split_whitespace().next())
+        .collect();
+    !members.is_empty() && members.iter().all(|m| m.starts_with("vmenet"))
 }
 
 fn interface_for(ip: Ipv4Addr) -> Option<String> {
@@ -595,6 +628,17 @@ pub fn set_routes(routes: Vec<Route>, docker_socket: Option<String>, cli_dir: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vm_bridges_only() {
+        let vmnet = "bridge100: flags=8a63\n\tinet 192.168.64.1 netmask 0xffffff00\n\tmember: vmenet0 flags=20803<LEARNING>\n";
+        let thunderbolt = "bridge0: flags=8863\n\tmember: en1 flags=3<LEARNING>\n\tmember: en2 flags=3<LEARNING>\n";
+        let mixed = "bridge101:\n\tmember: vmenet1 flags=3\n\tmember: en5 flags=3\n";
+        assert!(only_vm_members(vmnet));
+        assert!(!only_vm_members(thunderbolt));
+        assert!(!only_vm_members(mixed));
+        assert!(!only_vm_members("bridge102: flags=8822\n"));
+    }
 
     #[test]
     fn cidr_rules() {

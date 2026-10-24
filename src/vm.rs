@@ -134,7 +134,7 @@ impl Resources {
         }
         if let Some(mib) = config.memory_mib {
             // VZ requires a multiple of 1 MiB; keep it within the host too.
-            res.memory = (mib << 20).clamp(min_mem.max(1 << 30), max_mem.min(host_memory_bytes()));
+            res.memory = mib.saturating_mul(1 << 20).clamp(min_mem.max(1 << 30), max_mem.min(host_memory_bytes()));
         }
         res
     }
@@ -160,8 +160,9 @@ fn ns_error(err: &NSError) -> anyhow::Error {
 
 /// Boot the guest's own kernel directly when the agent has exported it (see
 /// agent/src/boot.rs), skipping EFI firmware and GRUB. A "trying" marker is
-/// left for the agent to clear once up; if it's still there at the next start,
-/// that direct boot failed, and we use EFI until a new kernel is exported.
+/// left for the agent to clear once up, counting the attempts that didn't get
+/// there. One can be a stop before the guest was up; after two in a row,
+/// direct boot is taken to fail, and we use EFI until a new kernel is exported.
 fn direct_boot(paths: &Paths) -> Option<Retained<VZBootLoader>> {
     let dir = paths.guest().join("boot");
     let (kernel, initrd, trying, failed) =
@@ -169,7 +170,8 @@ fn direct_boot(paths: &Paths) -> Option<Retained<VZBootLoader>> {
     // A safe boot needs our command line, so it boots directly whatever the
     // markers say (if it fails too, the next start uses EFI).
     let safe = safe_boot(paths);
-    if trying.exists() && !safe {
+    let attempts: u32 = fs::read_to_string(&trying).map_or(0, |s| s.trim().parse().unwrap_or(1));
+    if attempts >= 2 && !safe {
         eprintln!("boot: last direct boot didn't come up; using EFI");
         let _ = fs::rename(&trying, &failed);
     }
@@ -187,7 +189,7 @@ fn direct_boot(paths: &Paths) -> Option<Retained<VZBootLoader>> {
     } else {
         cmdline
     };
-    fs::write(&trying, "").ok()?;
+    fs::write(&trying, (attempts + 1).to_string()).ok()?;
     unsafe {
         let boot = VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &file_url(&kernel));
         boot.setInitialRamdiskURL(Some(&file_url(&initrd)));

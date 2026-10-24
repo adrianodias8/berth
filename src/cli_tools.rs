@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 use crate::paths::Paths;
 
@@ -19,6 +19,15 @@ const COMPOSE: &str = "v5.6.1";
 const BUILDX: &str = "v0.38.1";
 /// Matches the k3s version in agent/src/k8s.rs.
 const KUBECTL: &str = "v1.37.1";
+
+// SHA-256 of each download, pinned with its version: a server serving
+// something else (or a checksum file beside it changed) fails the download.
+// Changing a version means updating its hash: `shasum -a 256` of the file,
+// checked against what the project publishes.
+const DOCKER_SHA256: &str = "ea8a2ce5ac31f9f5f3fb711a7a485e1e46cc7a69798a629a70306f6e6af25b7a";
+const COMPOSE_SHA256: &str = "fcce41226abd2b7b2936094e688bbd61284673dddafea542e08cb9a3b4423a8b";
+const BUILDX_SHA256: &str = "6f20ba2437865311ef99015bf5d1039c3c8e4d2177c1c64aa41b134b5ecd3012";
+const KUBECTL_SHA256: &str = "fd65982c97ddad3106754b69ffa196d0e543aa591930ae52aed1adfb92f8c77f";
 
 /// Names linked into /usr/local/bin by the helper (see helper.rs).
 pub const SYSTEM_LINKS: [&str; 5] = ["docker", "docker-compose", "kubectl", "podman", "nerdctl"];
@@ -36,93 +45,59 @@ pub fn ensure(paths: &Paths) -> Result<()> {
     if fs::read_to_string(&stamp).ok().as_deref() != Some(want.as_str()) {
         eprintln!("Downloading Docker CLI {DOCKER}, Compose {COMPOSE}, Buildx {BUILDX} and kubectl {KUBECTL}...");
         fetch_docker(&bin)?;
-        fetch_verified(
+        fetch_verified_sha256(
             &bin.join("docker-compose"),
             &format!("https://github.com/docker/compose/releases/download/{COMPOSE}/docker-compose-darwin-aarch64"),
-            Checksum::Sha256File(format!(
-                "https://github.com/docker/compose/releases/download/{COMPOSE}/docker-compose-darwin-aarch64.sha256"
-            )),
+            COMPOSE_SHA256,
         )?;
-        let asset = format!("buildx-{BUILDX}.darwin-arm64");
-        fetch_verified(
+        fetch_verified_sha256(
             &bin.join("docker-buildx"),
-            &format!("https://github.com/docker/buildx/releases/download/{BUILDX}/{asset}"),
-            Checksum::GitHubAsset { repo: "docker/buildx", tag: BUILDX, name: asset.clone() },
+            &format!("https://github.com/docker/buildx/releases/download/{BUILDX}/buildx-{BUILDX}.darwin-arm64"),
+            BUILDX_SHA256,
         )?;
-        let kubectl = format!("https://dl.k8s.io/release/{KUBECTL}/bin/darwin/arm64/kubectl");
-        fetch_verified(&bin.join("kubectl"), &kubectl, Checksum::Sha256File(format!("{kubectl}.sha256")))?;
+        fetch_verified_sha256(
+            &bin.join("kubectl"),
+            &format!("https://dl.k8s.io/release/{KUBECTL}/bin/darwin/arm64/kubectl"),
+            KUBECTL_SHA256,
+        )?;
         fs::write(&stamp, want)?;
     }
     link_plugins(paths, &bin)
 }
 
-/// The CLI ships as a tarball with no published checksum; HTTPS only.
+/// The CLI ships as a tarball: checked, unpacked into a folder of its own,
+/// then the binary renamed into place (never a half-written `docker`).
 fn fetch_docker(bin: &Path) -> Result<()> {
     let tmp = bin.join("docker.tgz");
-    curl(&format!("https://download.docker.com/mac/static/stable/aarch64/docker-{DOCKER}.tgz"), &tmp)?;
-    let status = Command::new("tar").args(["-xzf"]).arg(&tmp).args(["-C"]).arg(bin).args(["--strip-components", "1", "docker/docker"]).status()?;
+    let unpack = bin.join(".docker-unpack");
+    let _ = fs::remove_dir_all(&unpack);
+    let result = (|| {
+        fetch_verified_sha256(&tmp, &format!("https://download.docker.com/mac/static/stable/aarch64/docker-{DOCKER}.tgz"), DOCKER_SHA256)?;
+        fs::create_dir(&unpack)?;
+        let status = Command::new("tar").arg("-xzf").arg(&tmp).arg("-C").arg(&unpack).args(["--strip-components", "1", "docker/docker"]).status()?;
+        if !status.success() {
+            bail!("extracting the docker CLI failed");
+        }
+        fs::rename(unpack.join("docker"), bin.join("docker"))?;
+        Ok(())
+    })();
     fs::remove_file(&tmp).ok();
-    if !status.success() {
-        bail!("extracting the docker CLI failed");
-    }
-    Ok(())
+    fs::remove_dir_all(&unpack).ok();
+    result
 }
 
-enum Checksum {
-    /// A `<hash> *<name>` file next to the binary.
-    Sha256File(String),
-    /// The digest GitHub records for a release asset. (Buildx's provenance
-    /// digests predate Docker's macOS code signing, so they don't match.)
-    GitHubAsset { repo: &'static str, tag: &'static str, name: String },
-}
-
-/// Download `url` to `dest`, checking it against a known SHA-256.
+/// Download `url` to `dest` (executable), checking it against a known SHA-256.
 pub fn fetch_verified_sha256(dest: &Path, url: &str, sha256: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let tmp = dest.with_extension("download");
     curl(url, &tmp)?;
     if !sha256_file(&tmp)?.eq_ignore_ascii_case(sha256) {
         fs::remove_file(&tmp).ok();
         bail!("checksum mismatch for {url}");
     }
-    fs::rename(&tmp, dest)?;
-    Ok(())
-}
-
-fn fetch_verified(dest: &Path, url: &str, checksum: Checksum) -> Result<()> {
-    let tmp = dest.with_extension("download");
-    curl(url, &tmp)?;
-    let expected = match checksum {
-        Checksum::Sha256File(sum_url) => {
-            let text = curl_text(&sum_url)?;
-            text.split_whitespace().next().context("empty checksum file")?.to_string()
-        }
-        Checksum::GitHubAsset { repo, tag, name } => {
-            let release: serde_json::Value = serde_json::from_str(&curl_text(&format!(
-                "https://api.github.com/repos/{repo}/releases/tags/{tag}"
-            ))?)?;
-            asset_digest(&release, &name).context("release asset has no digest")?
-        }
-    };
-    let actual = sha256_file(&tmp)?;
-    if !actual.eq_ignore_ascii_case(&expected) {
-        fs::remove_file(&tmp).ok();
-        bail!("checksum mismatch for {url}");
-    }
-    use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
     fs::rename(&tmp, dest)?;
     Ok(())
-}
-
-/// `assets[name == name].digest`, without its "sha256:" prefix.
-fn asset_digest(release: &serde_json::Value, name: &str) -> Option<String> {
-    release["assets"]
-        .as_array()?
-        .iter()
-        .find(|a| a["name"] == name)?["digest"]
-        .as_str()?
-        .strip_prefix("sha256:")
-        .map(str::to_string)
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -149,14 +124,6 @@ fn curl(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn curl_text(url: &str) -> Result<String> {
-    let out = Command::new("curl").args(["--fail", "--silent", "--location", url]).output()?;
-    if !out.status.success() {
-        bail!("downloading {url} failed");
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 /// A symlink whose target no longer exists (e.g. into an uninstalled app).
 pub fn is_dangling(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) && !path.exists()
@@ -181,16 +148,6 @@ fn link_plugins(paths: &Paths, bin: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn finds_release_asset_digest() {
-        let release = serde_json::json!({"assets": [
-            {"name": "other", "digest": "sha256:000"},
-            {"name": "buildx-v1.darwin-arm64", "digest": "sha256:6f20ba"}
-        ]});
-        assert_eq!(asset_digest(&release, "buildx-v1.darwin-arm64").as_deref(), Some("6f20ba"));
-        assert_eq!(asset_digest(&release, "missing"), None);
-    }
 
     #[test]
     fn dangling_links() {

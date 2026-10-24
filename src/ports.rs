@@ -44,10 +44,11 @@ struct Route {
     guest: &'static str,
 }
 
-/// Published ports: dockerd's proxy listens on 127.0.0.1 in the guest, and
-/// also on the NAT address when published on all interfaces.
+/// Published ports: dockerd's proxy listens on 127.0.0.1 in the guest (::1
+/// for a `-p [::1]:...` publish), and also on the NAT address when published
+/// on all interfaces.
 fn published_route(bind: &str) -> Route {
-    Route { direct: bind == "::", guest: "127.0.0.1" }
+    Route { direct: bind == "::", guest: if bind == "::1" { "[::1]" } else { "127.0.0.1" } }
 }
 
 static FORWARDS: Mutex<BTreeMap<Key, (Route, JoinHandle<()>)>> = Mutex::new(BTreeMap::new());
@@ -368,7 +369,8 @@ fn bind_address(ip: &str) -> Option<&'static str> {
     match ip {
         "" | "0.0.0.0" | "::" if localhost_only() => Some("127.0.0.1"),
         "" | "0.0.0.0" | "::" => Some("::"),
-        "127.0.0.1" | "::1" => Some("127.0.0.1"),
+        "127.0.0.1" => Some("127.0.0.1"),
+        "::1" => Some("::1"),
         // Bound to a specific guest address; nothing sensible on the host.
         _ => None,
     }
@@ -586,6 +588,7 @@ mod tests {
         assert_eq!(plan.len(), 3, "{plan:?}");
         assert_eq!(plan[&("127.0.0.1", 80, Proto::Tcp)], published_route("127.0.0.1"));
         assert_eq!(plan[&("::", 8080, Proto::Tcp)], published_route("::"));
+        assert_eq!(published_route("::1").guest, "[::1]");
         // The host-network server on 80 still gets ::1; 8080 is all taken.
         assert_eq!(plan[&("::1", 80, Proto::Tcp)], Route { direct: true, guest: "127.0.0.1" });
     }

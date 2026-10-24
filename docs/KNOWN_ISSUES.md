@@ -90,12 +90,9 @@ fix one, remove it here in the same change.
 
 ## Host daemon (`src/`)
 
-- **Direct boot gets turned off** if berth stops after the "trying" marker
-  is written but before the guest clears it.
-- **Small edge cases:**
-  - an absurd `memory_mib` put in config.json by hand wraps around
-    (`berth config set` checks it);
-  - a Docker binding only on `::1` maps to 127.0.0.1.
+- **A direct boot that fails costs one more failed start** before EFI takes
+  over: an unfinished attempt can also be a stop during boot, so it takes
+  two in a row.
 
 - **`~/Berth` (SMB) gives root in the VM** to whoever has the share's
   password (`~/.berth/files-password`, readable only by the Mac user). Links
@@ -104,20 +101,12 @@ fix one, remove it here in the same change.
 
 ## Root helper and downloads
 
-- **Routes leak if the helper is killed.** The helper keeps its route list
-  in memory only, so after SIGKILL or a crash the routes stay until berth
-  asks for the same subnet again.
-- **The route gateway may be any `bridge*` interface,** including
-  Thunderbolt Bridge, not only berth's vmnet bridge. Verify against the VM's
-  subnet.
 - **`/usr/local/bin` links point into `~/.berth/bin`, which the user can
   write.** Root and other accounts on the Mac then run binaries that user
   controls. Fine on a single-user Mac; consider root-owned copies.
-- **Downloads:**
-  - the Docker CLI tarball is checked only by HTTPS, and extracted in place
-    rather than to a temp folder and renamed;
-  - other checksums come from the same origin as the files;
-  - pin SHA-256s per version, as the podman-remote download already does.
+- **Downloads:** the VM's base image and machine images are checked against
+  checksum files from the same origin (the CLIs and podman-remote have
+  pinned SHA-256s).
 
 ## App (`app/`)
 
