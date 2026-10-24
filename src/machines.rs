@@ -26,12 +26,26 @@ fn call(paths: &Paths, action: &str, args: &[&str]) -> Result<String> {
     }
 }
 
-pub fn create(paths: &Paths, name: &str, distro: &str) -> Result<()> {
+pub fn create(paths: &Paths, name: &str, distro: &str, arch: &str, cloud_init: Option<&std::path::Path>) -> Result<()> {
     let user = std::env::var("USER")?;
     let uid = unsafe { libc::getuid() }.to_string();
     let home = paths.home.to_string_lossy();
-    println!("Creating {name} ({})...", if distro.is_empty() { "ubuntu:noble" } else { distro });
-    call(paths, "create", &[name, distro, &user, &uid, &home])?;
+    let user_data = match cloud_init {
+        Some(path) => {
+            let data = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            if !data.starts_with("#cloud-config") && !data.starts_with("#!") {
+                bail!("{}: cloud-init user data starts with #cloud-config (or #! for a script)", path.display());
+            }
+            data
+        }
+        None => String::new(),
+    };
+    let distro_name = if distro.is_empty() { "ubuntu:noble" } else { distro };
+    println!("Creating {name} ({distro_name}, {arch}{})...", if user_data.is_empty() { "" } else { ", cloud-init" });
+    call(paths, "create", &[name, distro, &user, &uid, &home, arch, &user_data])?;
+    if !user_data.is_empty() {
+        println!("cloud-init runs on this first boot: berth machine shell {name} -- cloud-init status --wait");
+    }
     println!("Machine {name} is running. Open a shell: berth machine shell {name}");
     println!("Domain: {name}.berth.local");
     Ok(())

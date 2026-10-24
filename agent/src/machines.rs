@@ -6,6 +6,11 @@
 //! config applies) and ve-<name> outside, which systemd-networkd's stock
 //! 80-container-ve.network serves with DHCP and NAT.
 //!
+//! `--arch amd64` machines run on Rosetta: the VM registers it for x86-64
+//! with binfmt's F flag, so it works inside machines too. `--cloud-init`
+//! uses the image's "cloud" variant and seeds the user data for its
+//! NoCloud datasource.
+//!
 //! Integration with the Mac (mac.rs): /run/berth is bind-mounted in, with the
 //! `mac` command's and the SSH agent's sockets; `/usr/local/bin/mac` links to
 //! the agent; and sshd is installed on first `ssh <name>.berth`.
@@ -55,18 +60,19 @@ fn allow_forwarding() {
 }
 
 /// `distro[:release]` → the image directory path from the index.
-fn image_path(spec: &str) -> io::Result<String> {
+fn image_path(spec: &str, arch: &str, variant: &str) -> io::Result<String> {
     let (distro, release) = spec.split_once(':').unwrap_or((spec, ""));
     let index = sh(&format!("curl -fsSL {IMAGES}/meta/1.0/index-system"))?;
     let candidates: Vec<(&str, &str)> = index
         .lines()
         .filter_map(|l| {
             let f: Vec<&str> = l.split(';').collect();
-            (f.len() >= 6 && f[0] == distro && f[2] == "arm64" && f[3] == "default").then(|| (f[1], f[5]))
+            (f.len() >= 6 && f[0] == distro && f[2] == arch && f[3] == variant).then(|| (f[1], f[5]))
         })
         .collect();
     if candidates.is_empty() {
-        return Err(io::Error::other(format!("no arm64 image for {distro}")));
+        let what = if variant == "cloud" { " with cloud-init" } else { "" };
+        return Err(io::Error::other(format!("no {arch} image{what} for {distro}")));
     }
     // Without a release, the newest stable one: not a development branch
     // (alpine edge, debian forky/sid) unless that's all there is.
@@ -82,16 +88,25 @@ fn image_path(spec: &str) -> io::Result<String> {
         .ok_or_else(|| io::Error::other(format!("{distro} has no release {release}; try one of: {}", candidates.iter().map(|c| c.0).collect::<Vec<_>>().join(", "))))
 }
 
-fn create(name: &str, spec: &str, user: &str, uid: &str, home: &str) -> io::Result<()> {
+fn create(name: &str, spec: &str, user: &str, uid: &str, home: &str, arch: &str, user_data: &str) -> io::Result<()> {
     if !valid_name(name) {
         return Err(io::Error::other("name: 1-12 characters, a-z 0-9 and -"));
+    }
+    let arch = match arch {
+        "" | "arm64" | "aarch64" => "arm64",
+        "amd64" | "x86_64" | "x86-64" => "amd64",
+        other => return Err(io::Error::other(format!("arch: arm64 or amd64, not {other}"))),
+    };
+    if arch == "amd64" && !Path::new("/proc/sys/fs/binfmt_misc/rosetta").exists() {
+        return Err(io::Error::other("amd64 machines need Rosetta, which isn't set up in the VM"));
     }
     let root = format!("{MACHINES}/{name}");
     if Path::new(&root).exists() {
         return Err(io::Error::other(format!("machine {name} already exists")));
     }
     ensure_tools()?;
-    let path = image_path(if spec.is_empty() { DEFAULT_DISTRO } else { spec })?;
+    let variant = if user_data.is_empty() { "default" } else { "cloud" };
+    let path = image_path(if spec.is_empty() { DEFAULT_DISTRO } else { spec }, arch, variant)?;
     let tarball = format!("{MACHINES}/.{name}.tar.xz");
     sh(&format!(
         "set -e; mkdir -p {MACHINES}; curl -fsSL -o {tarball} '{IMAGES}{path}rootfs.tar.xz'; \
@@ -115,9 +130,16 @@ fn create(name: &str, spec: &str, user: &str, uid: &str, home: &str) -> io::Resu
              || dnf install -y -q sudo 2>/dev/null || pacman -Sy --noconfirm sudo 2>/dev/null || zypper -q in -y sudo 2>/dev/null || true; \
          mkdir -p /etc/sudoers.d; echo '{user} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/berth; chmod 440 /etc/sudoers.d/berth; \
          command -v bash >/dev/null && (chsh -s \"$(command -v bash)\" {user} 2>/dev/null || true); \
-         echo {name} > /etc/hostname"
+         echo {name} > /etc/hostname; \
+         grep -qw {name} /etc/hosts 2>/dev/null || echo '127.0.1.1 {name}' >> /etc/hosts"
     );
     sh(&format!("systemd-nspawn -q -D {root} --pipe /bin/sh -c '{}'", setup.replace('\'', "'\\''")))?;
+    if !user_data.is_empty() {
+        seed_cloud_init(&root, name, user_data)?;
+    }
+    if arch == "amd64" {
+        rosetta_friendly_services(&root)?;
+    }
 
     let ve = format!("ve-{name}");
     std::fs::create_dir_all("/etc/systemd/nspawn")?;
@@ -151,6 +173,38 @@ pub fn stop(name: &str) -> io::Result<()> {
         return Err(io::Error::other("bad name"));
     }
     sh(&format!("systemctl stop systemd-nspawn@{name}.service")).map(|_| ())
+}
+
+/// x86-64 systemd sandboxes many services with a seccomp filter for x86-64
+/// syscalls and MemoryDenyWriteExecute, but under Rosetta the kernel sees
+/// arm64 syscalls and the translator writes code: those services die
+/// (journald, networkd, resolved: no network). A drop-in for every service
+/// lifts both.
+fn rosetta_friendly_services(root: &str) -> io::Result<()> {
+    let dir = format!("{root}/etc/systemd/system/service.d");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(
+        format!("{dir}/90-berth-rosetta.conf"),
+        "# berth: this machine runs on Rosetta (see agent/src/machines.rs).\n\
+         [Service]\nSystemCallArchitectures=\nSystemCallFilter=\nMemoryDenyWriteExecute=no\n",
+    )
+}
+
+/// The NoCloud seed cloud-init reads on the machine's first boot.
+fn seed_cloud_init(root: &str, name: &str, user_data: &str) -> io::Result<()> {
+    let seed = format!("{root}/var/lib/cloud/seed/nocloud");
+    std::fs::create_dir_all(&seed)?;
+    std::fs::write(format!("{seed}/user-data"), user_data)?;
+    std::fs::write(format!("{seed}/meta-data"), format!("instance-id: berth-{name}\nlocal-hostname: {name}\n"))?;
+    // cloud-init's fallback matches the NIC by permanent MAC address, which
+    // a veth doesn't have: networkd would leave eth0 alone. By name instead.
+    std::fs::write(format!("{seed}/network-config"), "version: 2\nethernets:\n  eth0:\n    dhcp4: true\n")?;
+    // The images switch it off until something configures it.
+    let _ = std::fs::remove_file(format!("{root}/etc/cloud/cloud-init.disabled"));
+    // Without a hint, cloud-init in a container may not look for NoCloud.
+    std::fs::create_dir_all(format!("{root}/etc/cloud/cloud.cfg.d"))?;
+    std::fs::write(format!("{root}/etc/cloud/cloud.cfg.d/90-berth.cfg"), "datasource_list: [ NoCloud, None ]\n")?;
+    Ok(())
 }
 
 pub fn start(name: &str) -> io::Result<()> {
@@ -331,7 +385,7 @@ pub fn handle(action: &str, mut host: UnixStream) -> io::Result<()> {
     let args: Vec<String> = serde_json::from_str(&body).unwrap_or_default();
     let arg = |i: usize| args.get(i).map(String::as_str).unwrap_or("");
     let result: io::Result<String> = match action {
-        "create" => create(arg(0), arg(1), arg(2), arg(3), arg(4)).map(|_| "ok".into()),
+        "create" => create(arg(0), arg(1), arg(2), arg(3), arg(4), arg(5), arg(6)).map(|_| "ok".into()),
         "start" => start(arg(0)).map(|_| "ok".into()),
         "stop" => stop(arg(0)).map(|_| "ok".into()),
         "delete" => {

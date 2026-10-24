@@ -171,6 +171,12 @@ enum MachineCmd {
         /// distro[:release] from images.linuxcontainers.org, e.g. debian:trixie, fedora:44, alpine
         #[arg(long, default_value = "")]
         distro: String,
+        /// amd64 for an Intel (x86-64) machine, run with Rosetta
+        #[arg(long, default_value = "arm64")]
+        arch: String,
+        /// cloud-init user data to apply on first boot (the image's cloud variant)
+        #[arg(long)]
+        cloud_init: Option<std::path::PathBuf>,
     },
     /// List machines
     List,
@@ -299,7 +305,9 @@ fn main() -> Result<()> {
                 bail!("berth is not running");
             }
             match action {
-                MachineCmd::Create { name, distro } => machines::create(&paths, &name, &distro),
+                MachineCmd::Create { name, distro, arch, cloud_init } => {
+                    machines::create(&paths, &name, &distro, &arch, cloud_init.as_deref())
+                }
                 MachineCmd::List => machines::list(&paths),
                 MachineCmd::Shell { name, command } => {
                     let remote = machines::shell_command(&name, &command)?;

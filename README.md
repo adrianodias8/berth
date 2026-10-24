@@ -80,6 +80,9 @@ from its code.
 - Linux machines: `berth machine create dev --distro ubuntu:noble` (Debian,
   Fedora, Alpine, Arch, Rocky, Alma, openSUSE…) with your user, sudo, your Mac
   home, systemd, and `dev.berth.local`; `berth machine shell dev`
+  - Intel machines: `--arch amd64` runs an x86-64 distro on Rosetta
+  - cloud-init: `--cloud-init user-data.yaml` applies it on first boot
+    (packages, files, users, `runcmd`)
   - `ssh dev.berth` (and VS Code's Remote-SSH, which uses it): berth adds
     `Include ~/.berth/ssh/config` to `~/.ssh/config` and sets up sshd in the
     machine on first use, starting the machine if it's stopped

@@ -44,6 +44,9 @@ fix one, remove it here in the same change.
 - **Label domains can claim any `.local` name**, such as `nas.local` (they
   can't take a name berth generated for another container). Consider an
   opt-in for names outside `berth.local`.
+- **Intel (amd64) machines** run with systemd's per-service syscall filters
+  and MemoryDenyWriteExecute lifted (a drop-in in the machine): x86-64
+  filters don't fit Rosetta, which runs on arm64 syscalls and writes code.
 - **The machines' sshd is installed on first `ssh <name>.berth`** with the
   distro's package manager: it needs the internet, and the first connection
   waits for it.
