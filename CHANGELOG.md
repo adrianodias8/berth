@@ -7,6 +7,7 @@ are in the commit messages.
 
 ### 2026-10-24
 - **Kubernetes:** LoadBalancer services on the Mac's localhost.
+- **CLI:** `berth restart`, `berth info`, `berth logs`, `berth completions`.
 - **Certificates:** Docker in the VM trusts the CAs the Mac trusts.
 - **More of the Mac in containers:** `/Volumes`, `/tmp` and `$TMPDIR`
   (`/var/folders`) bind mounts work, at the same paths.

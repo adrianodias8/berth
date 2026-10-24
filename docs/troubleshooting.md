@@ -1,7 +1,9 @@
 # Troubleshooting
 
 Start with `berth status`: it shows the VM, Docker, file sharing, the IP
-route helper and the forwarded ports. Logs are in `~/.berth/log/`:
+route helper and the forwarded ports. `berth info` adds versions, settings
+and paths (paste it into a bug report), and `berth logs [-f] [console|helper]`
+shows the logs, which are in `~/.berth/log/`:
 `daemon.log` is the host side, `console.log` is the VM's console (kernel
 and boot messages). `berth shell` opens a shell in the VM.
 

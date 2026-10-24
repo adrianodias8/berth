@@ -62,8 +62,25 @@ enum Cmd {
         #[arg(long)]
         shutdown: bool,
     },
+    /// Stop (shutting down, so settings apply) and start again
+    Restart,
     /// Show VM and Docker status
     Status,
+    /// Versions, settings, paths and what's installed, for bug reports
+    Info,
+    /// Show berth's logs: daemon (the Mac side), console (the VM's), helper
+    Logs {
+        #[arg(default_value = "daemon", value_parser = ["daemon", "console", "helper"])]
+        which: String,
+        /// Keep printing new lines
+        #[arg(short, long)]
+        follow: bool,
+        /// Lines from the end
+        #[arg(short = 'n', long, default_value_t = 100)]
+        lines: usize,
+    },
+    /// Shell completions: berth completions zsh > ~/.zfunc/_berth (bash, zsh, fish)
+    Completions { shell: clap_complete::Shell },
     /// List container domain names and their addresses
     Domains,
     /// Container engines next to Docker: Podman and containerd/nerdctl
@@ -284,6 +301,29 @@ fn main() -> Result<()> {
             stop_with(&paths, !suspend)
         }
         Cmd::Status => status(&paths),
+        Cmd::Restart => {
+            stop(&paths)?;
+            start(&paths)
+        }
+        Cmd::Info => info(&paths),
+        Cmd::Logs { which, follow, lines } => {
+            let file = match which.as_str() {
+                "console" => paths.console_log(),
+                "helper" => std::path::PathBuf::from("/var/log/dev.berth.helper.log"),
+                _ => paths.daemon_log(),
+            };
+            let mut tail = Command::new("tail");
+            tail.arg("-n").arg(lines.to_string());
+            if follow {
+                tail.arg("-F");
+            }
+            Err(tail.arg(file).exec().into())
+        }
+        Cmd::Completions { shell } => {
+            use clap::CommandFactory;
+            clap_complete::generate(shell, &mut Cli::command(), "berth", &mut std::io::stdout());
+            Ok(())
+        }
         Cmd::Domains => domains(&paths),
         Cmd::Engine { action } => {
             if current_status(&paths).is_none() {
@@ -639,6 +679,33 @@ fn https_state(paths: &Paths) -> String {
 
 fn ready(ok: bool) -> &'static str {
     if ok { "ready" } else { "not ready" }
+}
+
+/// What a bug report needs, running or not.
+fn info(paths: &Paths) -> Result<()> {
+    let os = Command::new("sw_vers").arg("-productVersion").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    let arch = Command::new("uname").arg("-m").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    println!("berth:    {} (agent {})", env!("CARGO_PKG_VERSION"), &provision::agent_version()[..12.min(provision::agent_version().len())]);
+    println!("macOS:    {os} ({arch})");
+    println!("binary:   {}", std::env::current_exe()?.display());
+    match current_status(paths) {
+        Some(s) => println!("VM:       {} ({} CPUs, {} GiB max), Docker {}", s.vm, s.cpus, s.memory >> 30, ready(s.docker)),
+        None => println!(
+            "VM:       stopped{}",
+            if snapshots::is_suspended(paths) { " (suspended: the next start resumes it)" } else { "" }
+        ),
+    }
+    println!(
+        "Files:    {} sharing{}",
+        virtiofs::configured_share(paths),
+        if paths.guest().join("kmod-ready").exists() { ", polling driver built" } else { "" }
+    );
+    let helper = std::path::Path::new(helper::SOCKET).exists();
+    println!("Helper:   {}", if helper { "installed" } else { "not installed (sudo berth helper install)" });
+    println!("Snapshots: {}", snapshots::list(paths).len());
+    println!("Data:     {}", paths.root.display());
+    println!("Settings ({}):", paths.config().display());
+    config::list(paths)
 }
 
 fn status(paths: &Paths) -> Result<()> {

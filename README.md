@@ -202,7 +202,10 @@ Launch arguments pick the starting screen, e.g.
 ```sh
 berth start               # first start downloads Debian and installs Docker (a few minutes)
 docker context use berth  # or: docker --context berth ps
-berth status
+berth status              # berth info: versions, settings, paths (for bug reports)
+berth restart             # stop (shutting down) and start: applies settings
+berth logs -f             # daemon log; also: berth logs console|helper
+berth completions zsh > ~/.zfunc/_berth   # or bash, fish
 berth domains             # container names and addresses
 berth tls trust           # trust the local CA for https://*.berth.local (one-time, asks for password)
 berth k8s enable          # Kubernetes (k3s) with a `berth` kubectl context
