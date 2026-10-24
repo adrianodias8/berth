@@ -91,6 +91,30 @@ fn module_dir(release: &str) -> PathBuf {
 }
 
 /// `~/.berth/guest/kmod-ready`, next to the agent binary.
+/// Running berth's own kernel (guest/kernel), which has the polling driver
+/// built in.
+pub fn berth_kernel() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease").is_ok_and(|r| r.trim().ends_with("-berth"))
+}
+
+/// berth's kernel has everything built in; modprobe still wants its
+/// /lib/modules directory (modules.builtin), which the host stages as
+/// ~/.berth/guest/kernel-modules.tar (vm.rs).
+fn install_berth_modules() -> io::Result<()> {
+    let Some(tar) = marker().map(|m| m.with_file_name("kernel-modules.tar")) else { return Ok(()) };
+    let release = release();
+    let stamp = format!("/lib/modules/{release}/.berth-modules");
+    let size = std::fs::metadata(&tar)?.len().to_string();
+    if std::fs::read_to_string(&stamp).is_ok_and(|s| s == size) {
+        return Ok(());
+    }
+    sh(Command::new("tar").arg("-xf").arg(&tar).args(["-C", "/"]))?;
+    sh(Command::new("depmod").arg(&release))?;
+    std::fs::write(stamp, size)?;
+    eprintln!("berth-agent: kmod: installed module data for {release}");
+    Ok(())
+}
+
 fn marker() -> Option<PathBuf> {
     Some(std::env::current_exe().ok()?.parent()?.join("kmod-ready"))
 }
@@ -194,6 +218,13 @@ pub fn run() {
     if let Err(err) = install_mount_helper() {
         eprintln!("berth-agent: kmod: mount helper: {err}");
         report(Some(&format!("mount helper: {err}")));
+        return;
+    }
+    if berth_kernel() {
+        if let Err(err) = install_berth_modules() {
+            eprintln!("berth-agent: kmod: module data: {err}");
+        }
+        report(None);
         return;
     }
     let release = release();

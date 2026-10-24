@@ -24,11 +24,13 @@ fix one, remove it here in the same change.
   the guest kernel does locally.
 - **Stale eviction queue.** Entries for forgotten nodes stay queued, so
   eviction can start early.
-- **Module build needs network and ~200 MB.** The agent fetches kernel
-  headers and gcc with apt. Offline, or on a kernel Debian no longer ships
-  headers for, the share runs on the built-in driver (slower). Shipping
-  prebuilt modules per Debian kernel would avoid both. `berth status` and the app
-  say when that happens, and why.
+- **On the Debian kernel, the polling driver is built at runtime** (needs
+  the network and ~200 MB of headers and gcc; slower share until then).
+  berth's own kernel, the default when shipped, has it built in
+  (`guest/kernel/README.md`). `berth status` and the app say when the share
+  is on the slower driver, and why.
+- **berth's kernel needs updates shipped with berth:** Debian's security
+  fixes for 6.12 reach it only when it's rebuilt and released.
 - **Safe mode needs direct boot.** If the guest kernel was never exported
   (EFI boot only), a broken mount setup can't be rescued automatically.
 - **A snapshot restore takes ~16 s**, mostly stopping the current VM. A

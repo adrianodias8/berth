@@ -158,6 +158,67 @@ fn ns_error(err: &NSError) -> anyhow::Error {
     anyhow!("{}", err.localizedDescription())
 }
 
+/// This start boots berth's own kernel (guest/kernel): its polling virtio-fs
+/// driver is built in (virtiofs.rs presents the device for it).
+pub static BERTH_KERNEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// berth's kernel, shipped next to the binary: the app's
+/// Contents/Resources/kernel, or target/kernel for a development build.
+pub fn bundled_kernel() -> Option<std::path::PathBuf> {
+    // Through the /usr/local/bin link to where the binary really is.
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let dir = exe.parent()?;
+    [dir.join("../Resources/kernel"), dir.join("../kernel")]
+        .into_iter()
+        .filter_map(|d| d.canonicalize().ok())
+        .find(|d| d.join("Image").exists() && d.join("release").exists())
+}
+
+/// `"kernel": "debian"` in config.json: the VM's own Debian kernel instead.
+fn debian_kernel_chosen(paths: &Paths) -> bool {
+    std::fs::read(paths.config())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|c| c["kernel"] == "debian")
+}
+
+/// berth's kernel with the command line the Debian kernel was exported with
+/// (its root partition), no initrd: everything it needs is built in. Like
+/// direct boot, it counts attempts that didn't come up; after two in a row
+/// that kernel release is set aside and the Debian kernel boots instead.
+fn berth_kernel_boot(paths: &Paths, cmdline: &str) -> Option<Retained<VZBootLoader>> {
+    if debian_kernel_chosen(paths) || safe_boot(paths) {
+        return None;
+    }
+    let kernel = bundled_kernel()?;
+    let release = fs::read_to_string(kernel.join("release")).ok()?.trim().to_string();
+    let dir = paths.guest().join("boot");
+    let (trying, failed) = (dir.join("berth-trying"), dir.join("berth-failed"));
+    let attempts: u32 = fs::read_to_string(&trying).map_or(0, |s| s.trim().parse().unwrap_or(1));
+    if attempts >= 2 {
+        eprintln!("boot: berth's kernel {release} didn't come up; using the VM's Debian kernel");
+        let _ = fs::write(&failed, &release);
+        let _ = fs::remove_file(&trying);
+    }
+    if fs::read_to_string(&failed).is_ok_and(|f| f.trim() == release) {
+        return None;
+    }
+    // Module metadata for modprobe, installed by the agent (agent/src/kmod.rs).
+    let modules = kernel.join("modules.tar");
+    let staged = paths.guest().join("kernel-modules.tar");
+    if fs::read(&modules).ok() != fs::read(&staged).ok() {
+        fs::copy(&modules, &staged).ok()?;
+    }
+    fs::write(&trying, (attempts + 1).to_string()).ok()?;
+    BERTH_KERNEL.store(true, std::sync::atomic::Ordering::SeqCst);
+    eprintln!("boot: berth's kernel {release}");
+    unsafe {
+        let boot = VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &file_url(&kernel.join("Image")));
+        boot.setCommandLine(&NSString::from_str(cmdline.trim()));
+        Some(Retained::into_super(boot))
+    }
+}
+
 /// Boot the guest's own kernel directly when the agent has exported it (see
 /// agent/src/boot.rs), skipping EFI firmware and GRUB. A "trying" marker is
 /// left for the agent to clear once up, counting the attempts that didn't get
@@ -176,7 +237,13 @@ fn direct_boot(paths: &Paths) -> Option<Retained<VZBootLoader>> {
         let _ = fs::rename(&trying, &failed);
     }
     let cmdline = fs::read_to_string(dir.join("cmdline")).ok()?;
-    if (failed.exists() && !safe) || !kernel.exists() || !initrd.exists() || cmdline.trim().is_empty() {
+    if cmdline.trim().is_empty() {
+        return None;
+    }
+    if let Some(boot) = berth_kernel_boot(paths, &cmdline) {
+        return Some(boot);
+    }
+    if (failed.exists() && !safe) || !kernel.exists() || !initrd.exists() {
         return None;
     }
     let cmdline = if safe {

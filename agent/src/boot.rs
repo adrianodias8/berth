@@ -55,6 +55,13 @@ pub fn export_kernel() {
         return;
     }
     let _ = std::fs::create_dir_all(&dir);
+    // berth's own kernel (vm.rs) came up: clear its marker, and keep the
+    // Debian kernel's export as it is, for when it's chosen or needed.
+    if crate::kmod::berth_kernel() {
+        let _ = std::fs::remove_file(dir.join("berth-trying"));
+        let _ = std::fs::remove_file(dir.join("kmod-trying"));
+        return;
+    }
     let _ = std::fs::remove_file(dir.join("trying"));
     // Same for the host's polling-driver attempt (vm.rs): we're up, so the
     // home share mounted.

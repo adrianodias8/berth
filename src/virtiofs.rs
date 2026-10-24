@@ -701,6 +701,11 @@ fn poll_driver_ready(paths: &crate::paths::Paths) -> bool {
         let _ = std::fs::remove_file(&ready);
         return false;
     }
+    // berth's kernel has it built in.
+    if crate::vm::BERTH_KERNEL.load(std::sync::atomic::Ordering::SeqCst) {
+        let _ = std::fs::write(&trying, "");
+        return true;
+    }
     let read = |p: &std::path::Path| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string());
     let ok = matches!((read(&ready), read(&release)), (Some(a), Some(b)) if !a.is_empty() && a == b);
     if ok {

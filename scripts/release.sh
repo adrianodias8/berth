@@ -17,6 +17,9 @@ profile="${BERTH_NOTARY_PROFILE:-}"
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)
 build=$(git -C "$root" rev-list --count HEAD)
+if [ ! -f "$root/target/kernel/Image" ]; then
+    echo "warning: no berth kernel in target/kernel (guest/kernel/build.sh): this release boots the VM's Debian kernel" >&2
+fi
 "$root/scripts/build-app.sh"
 
 dist="$root/target/dist"

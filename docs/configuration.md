@@ -35,6 +35,7 @@ means the default. Changes apply on the next start (`berth restart`, or Restart 
 | `ipv6` | `false` | IPv6 subnets for Docker networks, NAT'd out of the VM. Changing it restarts dockerd, which stops running containers; a suspended VM boots instead of resuming |
 | `stop` | `"shutdown"` | `"suspend"`: `berth stop` saves the VM's state and the next start resumes it (see below) |
 | `proxy` | `"auto"` | the HTTP(S) proxy Docker uses for pulls and pushes (and apt in the VM): `"auto"` follows the Mac's settings (System Settings › Network › Proxies, checked every 15 s), `"none"`, or an `http://` or `https://` URL. A proxy on the Mac's own `localhost` works. PAC files aren't followed. Containers don't get it: pass `HTTP_PROXY` yourself |
+| `kernel` | `"berth"` | `"debian"`: boot the VM's own Debian kernel instead of berth's tuned one (`guest/kernel/README.md`); applies on the next start |
 | `ports` | `"all"` | `"localhost"`: published ports listen only on the Mac's loopback (`-p 8080:80` stays off the LAN); applies to new forwards right away |
 | `finder` | `true` | Docker volumes, machines' files and running containers' root filesystems in Finder at `~/Berth`, over SMB from the VM, while berth runs |
 

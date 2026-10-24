@@ -26,6 +26,14 @@ if [ ! -f "$root/target/AppIcon.icns" ] || [ "$root/app/Resources/make-icon.swif
 fi
 cp "$root/target/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 
+# berth's guest kernel, when built (guest/kernel/build.sh; it takes a while,
+# so it isn't part of this script). Without it the VM boots its Debian kernel.
+rm -rf "$app/Contents/Resources/kernel"
+if [ -f "$root/target/kernel/Image" ]; then
+    mkdir -p "$app/Contents/Resources/kernel"
+    cp "$root/target/kernel/Image" "$root/target/kernel/release" "$root/target/kernel/modules.tar" "$app/Contents/Resources/kernel/"
+fi
+
 # Inner binary first (it needs the virtualization entitlement), then the bundle.
 codesign --force --sign - --entitlements "$root/berth.entitlements" "$app/Contents/Helpers/berth"
 codesign --force --sign - "$app"

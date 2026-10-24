@@ -20,12 +20,34 @@ permissions:
   contents: write
 
 jobs:
+  # berth's guest kernel (guest/kernel), on an arm64 Linux runner: the same
+  # build script as `guest/kernel/build.sh` runs in a container locally.
+  kernel:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          mkdir -p target/kernel
+          docker run --rm -v "$PWD/guest:/guest:ro" -v "$PWD/target/kernel:/out" \
+            -v berth-kernel-build:/build debian:trixie bash /guest/kernel/inside.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel
+          path: target/kernel
+
   release:
+    needs: kernel
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # the build number is the commit count
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel
+          path: target/kernel
 
       - name: Rust
         run: |
