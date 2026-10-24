@@ -10,10 +10,11 @@ use serde::Deserialize;
 
 const SOCKET: &str = "/run/docker.sock";
 
-/// Engine sockets to read: Docker always, Podman when its socket is enabled.
+/// Engine sockets to read: Docker always, Podman when it has containers
+/// running (asking it otherwise starts its service for nothing).
 fn sockets() -> Vec<&'static str> {
     let mut sockets = vec![SOCKET];
-    if crate::engines::podman_enabled() {
+    if crate::engines::podman_running() {
         sockets.push(crate::engines::PODMAN_SOCKET);
     }
     sockets
@@ -115,6 +116,19 @@ pub fn get_from(socket: &str, path: &str) -> io::Result<BufReader<UnixStream>> {
         if reader.read_line(&mut line)? == 0 || line == "\r\n" {
             return Ok(reader);
         }
+    }
+}
+
+/// Podman's running containers as its Docker-compatible API lists them,
+/// for the host's port forwarding; `[]` without asking when it has none.
+pub fn podman_containers() -> String {
+    if !crate::engines::podman_running() {
+        return "[]".into();
+    }
+    let mut body = String::new();
+    match get_bounded(crate::engines::PODMAN_SOCKET, "/containers/json").and_then(|mut r| r.read_to_string(&mut body)) {
+        Ok(_) => body,
+        Err(_) => "[]".into(),
     }
 }
 

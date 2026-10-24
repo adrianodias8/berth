@@ -56,6 +56,17 @@ pub fn podman_enabled() -> bool {
     std::path::Path::new("/etc/systemd/system/sockets.target.wants/podman.socket").exists()
 }
 
+/// Podman is on and has containers running: each runs under a `conmon`
+/// (Docker's and nerdctl's run under containerd shims). Checked before
+/// asking Podman's API, which would start its service (socket activation)
+/// and keep it running while asked.
+pub fn podman_running() -> bool {
+    podman_enabled()
+        && std::fs::read_dir("/proc").is_ok_and(|procs| {
+            procs.flatten().any(|p| std::fs::read(p.path().join("comm")).is_ok_and(|c| c == b"conmon\n"))
+        })
+}
+
 /// Containers use berth's DNS (for *.berth.local and the Mac's resolvers),
 /// and Podman's own host.containers.internal / host.docker.internal point at
 /// the Mac rather than the VM (see hostnet.rs).

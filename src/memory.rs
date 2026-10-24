@@ -26,6 +26,11 @@ const SHRINK_STEP: u64 = GIB;
 /// Ignore changes smaller than this to avoid churn.
 const HYSTERESIS: u64 = 256 * MIB;
 const TICK: Duration = Duration::from_secs(2);
+/// Once nothing has changed for STEADY_AFTER ticks: each sample wakes the VM
+/// (a vsock round trip), and stalls are reported as they happen anyway
+/// (on_pressure).
+const STEADY_TICK: Duration = Duration::from_secs(10);
+const STEADY_AFTER: u32 = 5;
 /// After a pressure event, don't shrink again for this long.
 const HOLD_OFF: Duration = Duration::from_secs(30);
 
@@ -93,10 +98,14 @@ pub async fn on_pressure(max: u64) {
 
 pub async fn run(max: u64) {
     TARGET.store(max, Ordering::Relaxed);
+    let mut steady = 0;
+    let mut last_used = 0;
     loop {
-        tokio::time::sleep(TICK).await;
+        tokio::time::sleep(if steady >= STEADY_AFTER { STEADY_TICK } else { TICK }).await;
         let Ok(sample) = sample().await else { continue };
         GUEST_USED.store(sample.used(), Ordering::Relaxed);
+        let moved = sample.used().abs_diff(last_used) >= HYSTERESIS;
+        last_used = sample.used();
         let current = TARGET.load(Ordering::Relaxed);
         // Inflating while the guest zeroes allocated pages would make macOS
         // back every ballooned page (see agent/src/memory.rs).
@@ -107,6 +116,7 @@ pub async fn run(max: u64) {
         if next != current && vm::set_balloon_target(next).await.is_ok() {
             TARGET.store(next, Ordering::Relaxed);
         }
+        steady = if next != current || moved { 0 } else { steady + 1 };
     }
 }
 

@@ -23,7 +23,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::task::JoinHandle;
 
-use crate::daemon::{DOCKER_TARGET, PODMAN_TARGET, guest_stream, is_disconnect};
+use crate::daemon::{DOCKER_TARGET, guest_stream, is_disconnect};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Proto {
@@ -148,19 +148,9 @@ fn display((bind, port, proto): Key) -> String {
 }
 
 pub async fn run() {
-    // Podman containers publish ports too; follow its event stream as well
-    // (the socket only answers while Podman is enabled).
-    tokio::spawn(async {
-        loop {
-            if let Ok(events) = docker_get_from(PODMAN_TARGET, EVENTS_PATH).await {
-                let mut lines = events.lines();
-                while let Ok(Some(_)) = lines.next_line().await {
-                    let _ = sync().await;
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
-    });
+    // Podman containers publish ports too: the agent follows its events and
+    // asks for a sync (trigger), as for nerdctl. Following Podman's own event
+    // stream from here would keep its service running all the time.
     // Retry ports that couldn't be bound (something on the Mac held them).
     tokio::spawn(async {
         loop {
@@ -216,10 +206,12 @@ async fn sync_now() -> Result<()> {
     let mut body = String::new();
     docker_get("/containers/json").await?.read_to_string(&mut body).await?;
     let mut containers: Vec<Container> = serde_json::from_str(&body)?;
-    // Podman's Docker-compatible list has the same shape; absent if disabled.
+    // Podman's Docker-compatible list has the same shape. Through the agent,
+    // which asks Podman only when it has containers running (asking starts
+    // its service).
     let mut podman = String::new();
-    if let Ok(mut reader) = docker_get_from(PODMAN_TARGET, "/containers/json").await
-        && reader.read_to_string(&mut podman).await.is_ok()
+    if let Ok(mut guest) = guest_stream("info podman").await
+        && guest.read_to_string(&mut podman).await.is_ok()
         && let Ok(more) = serde_json::from_str::<Vec<Container>>(&podman)
     {
         containers.extend(more);

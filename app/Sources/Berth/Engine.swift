@@ -186,6 +186,7 @@ final class Engine: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private var eventsTask: Task<Void, Never>?
     private var refreshPending = false
+    private var polls = 0
 
     init() {
         pollTask = Task { [weak self] in
@@ -309,7 +310,10 @@ final class Engine: ObservableObject {
         default:
             break
         }
-        if state == .running, domains.isEmpty || Int.random(in: 0..<5) == 0 {
+        // Container domains come with Docker events (refreshAll); machines'
+        // change without one, so every 30 s too. Each request wakes the VM.
+        polls += 1
+        if state == .running, domains.isEmpty || polls % 15 == 0 {
             domains = (try? await Control.request("domains")) ?? domains
         }
     }

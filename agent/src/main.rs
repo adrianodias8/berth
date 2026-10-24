@@ -259,6 +259,7 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
             serde_json::to_writer(&mut host, &engines::nerdctl_containers()).map_err(io::Error::other)?;
             Ok(())
         }
+        Some(("info", "podman")) => host.write_all(docker::podman_containers().as_bytes()),
         Some(("info", "listeners")) => {
             serde_json::to_writer(&mut host, &listeners::current()).map_err(io::Error::other)?;
             Ok(())

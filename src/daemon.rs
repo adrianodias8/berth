@@ -653,7 +653,13 @@ pub async fn guest_stream(target: &str) -> Result<UnixStream> {
     Ok(stream)
 }
 
+/// Docker answers its ping. A success counts for a while: the app asks for
+/// status every 2 s, and each ping wakes the VM.
 async fn docker_ready() -> bool {
+    static READY_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    if READY_AT.lock().unwrap().is_some_and(|t| t.elapsed() < Duration::from_secs(10)) {
+        return true;
+    }
     let probe = async {
         let mut guest = guest_stream(DOCKER_TARGET).await?;
         guest.write_all(b"GET /_ping HTTP/1.0\r\n\r\n").await?;
@@ -661,7 +667,9 @@ async fn docker_ready() -> bool {
         guest.read_to_end(&mut buf).await?;
         anyhow::Ok(buf.starts_with(b"HTTP/1.0 200") || buf.starts_with(b"HTTP/1.1 200"))
     };
-    matches!(tokio::time::timeout(Duration::from_secs(2), probe).await, Ok(Ok(true)))
+    let ready = matches!(tokio::time::timeout(Duration::from_secs(2), probe).await, Ok(Ok(true)));
+    *READY_AT.lock().unwrap() = ready.then(std::time::Instant::now);
+    ready
 }
 
 /// Graceful guest shutdown with a hard-stop fallback.

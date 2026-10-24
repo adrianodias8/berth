@@ -44,6 +44,25 @@ something here stops being true, fix it.
   - the classes aren't in objc2-virtualization 0.3.2: declare them with
     `extern_class!`/`extern_protocol!` and look them up at runtime.
 
+- **Rosetta's translation cache isn't worth it here (measured 2026-10-24).**
+  `VZLinuxRosettaUnixSocketCachingOptions` plus `rosettad daemon` in the
+  guest works: it binds `<cache>/uds/rosetta.sock` (link
+  `/run/rosettad` to it). But containers only reach it through a bind mount
+  berth would have to inject into every container, rosettad dies on large
+  binaries (Node's: "Not all x86 entry points were contained in a code
+  segment"), and the gain is ~20 ms per process: `php -v` 0.15 -> 0.13 s,
+  `composer --version` 0.33 -> 0.32 s, CPU-bound PHP unchanged, while a
+  binary's first run takes ~1 s longer.
+- **Idle wakeups (2026-10-24):** measure per thread in the guest with
+  `/proc/*/task/*/schedstat` (third field) and on the Mac with `top -stats
+  idlew` on the VM process. What woke an idle VM was mostly berth itself:
+  - the agent following Podman's API event stream kept its socket-activated
+    service running (~60 wakeups/s), so Podman events come from the journal
+    and Podman is asked only when a `conmon` runs;
+  - the app's status poll pinged Docker every 2 s.
+  Guest: 118 -> 56 runs/s; VM + daemon idle CPU 2.97 % -> 1.37 %. The rest is
+  mostly Docker's own containerd and dockerd.
+
 ## Snapshots
 
 - **What works:** `VZVirtualMachineConfiguration.validateSaveRestoreSupport`

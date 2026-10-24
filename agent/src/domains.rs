@@ -126,17 +126,13 @@ fn sync(table: &Shared) -> io::Result<()> {
 pub fn run(table: Shared) {
     let _ = TABLE_REF.set(table.clone());
     thread::spawn(crate::engines::watch_nerdctl_events);
-    // Podman's events don't reach the Docker stream we follow below.
+    // Podman's events don't reach the Docker stream we follow below. They're
+    // read from the journal, where Podman logs them: following its API's
+    // event stream would keep Podman's socket-activated service running,
+    // waking ~60 times a second, even with no Podman containers.
     thread::spawn(|| loop {
-        if crate::engines::podman_enabled()
-            && let Ok(mut events) =
-                docker::get_from(crate::engines::PODMAN_SOCKET, &format!("/events?filters={}", percent_encode(EVENT_FILTERS)))
-        {
-            let mut line = String::new();
-            while events.read_line(&mut line).is_ok_and(|n| n > 0) {
-                line.clear();
-                request_sync();
-            }
+        if crate::engines::podman_enabled() {
+            follow_podman_events();
         }
         thread::sleep(Duration::from_secs(5));
     });
@@ -158,6 +154,47 @@ pub fn run(table: Shared) {
         }
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// Request a sync for each Podman event that changes addresses, until
+/// journalctl ends (or Podman is turned off).
+fn follow_podman_events() {
+    // The same field repeated matches any of these events.
+    let args = [
+        "--follow",
+        "--lines=0",
+        "--output=cat",
+        "--quiet",
+        "SYSLOG_IDENTIFIER=podman",
+        "PODMAN_EVENT=start",
+        "PODMAN_EVENT=died",
+        "PODMAN_EVENT=remove",
+        "PODMAN_EVENT=rename",
+        "PODMAN_EVENT=connect",
+        "PODMAN_EVENT=disconnect",
+    ];
+    let Ok(mut child) = std::process::Command::new("journalctl")
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let Some(stdout) = child.stdout.take() else { return };
+    // A container started while we weren't following. Each event also has
+    // the host re-sync its port forwarding (src/ports.rs).
+    request_sync();
+    crate::engines::notify_host_sync();
+    for line in io::BufReader::new(stdout).lines() {
+        if line.is_err() || !crate::engines::podman_enabled() {
+            break;
+        }
+        request_sync();
+        crate::engines::notify_host_sync();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Only events that change addresses: healthchecks and execs produce a
