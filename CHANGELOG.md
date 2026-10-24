@@ -10,6 +10,8 @@ are in the commit messages.
 - **Machines and the Mac:** `ssh <machine>.berth` (VS Code Remote-SSH), the
   `mac` command inside machines, and the Mac's SSH agent in machines and at
   `/run/host-services/ssh-auth.sock`.
+- **Import:** `berth import orbstack|docker-desktop` copies images, volumes,
+  networks and containers (optionally one Compose project).
 - **Alpine machines** stop with `berth machine stop` and with the VM (busybox
   init gets SIGUSR2, not systemd's signal).
 - **Security:** the guest agent only takes orders from the Mac (vsock CID 2).

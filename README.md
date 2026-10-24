@@ -22,6 +22,12 @@ from its code.
   container still running; by default it shuts down, like OrbStack
 - Docker's own engine (docker-ce 29) with the Docker API at `~/.berth/run/docker.sock`,
   `/var/run/docker.sock` (via the helper) and a `berth` docker context made current on start
+- Moving over: `berth import orbstack` (or `docker-desktop`) copies images,
+  volumes (contents, owners and modes), networks and containers from the other
+  engine while it runs, and changes nothing there. Containers arrive stopped,
+  with their Compose labels, so `docker compose up -d` picks them up.
+  `--project <name>` imports one Compose project; `--dry-run` lists what would
+  come over; `--images`/`--volumes`/`--containers` pick parts
 - Official `docker`, Compose, Buildx and `kubectl` CLIs in `~/.berth/bin`, linked
   wherever none work, so berth doesn't depend on another Docker app
 - x86-64 images through Rosetta
@@ -186,6 +192,7 @@ berth engine enable podman   # or nerdctl; berth engine status
 berth machine create dev  # an Ubuntu machine; then: berth machine shell dev
 berth snapshot create before-migration   # then break things...
 berth snapshot restore before-migration  # ...and go back; also: list, delete
+berth import orbstack     # or docker-desktop: images, volumes, networks, containers
 berth debug web           # a shell with tools inside container `web`, even a distroless one
 berth shell               # SSH into the VM; `berth shell uname -a` runs a command
 berth stop                # --suspend: save the VM so the next start resumes it
@@ -311,6 +318,7 @@ refuses any other name, so trusting it cannot be abused for real sites.
   command, the SSH agent, `ssh <machine>.berth`
 - `src/files.rs` (agent: `files.rs`): `~/Berth` in Finder over NFS
 - `guest/berth-debug.sh`: `berth debug`
+- `src/import.rs`: `berth import` from OrbStack or Docker Desktop
 - `src/tls.rs`: the local CA, per-name certificates, keychain trust
 - `src/provision.rs`: image download and checksum, disk clone, SSH key, cloud-init seed
 - `guest/user-data.yaml`: guest provisioning (Docker, mounts, Rosetta binfmt, agent unit)

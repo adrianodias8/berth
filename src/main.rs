@@ -5,6 +5,7 @@ mod engines;
 mod files;
 mod fuse;
 mod helper;
+mod import;
 mod k8s;
 mod macexec;
 mod machines;
@@ -89,6 +90,30 @@ enum Cmd {
         container: String,
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
+    },
+    /// Copy images, volumes, networks and containers from OrbStack or Docker
+    /// Desktop (which must be running; nothing in it is changed)
+    Import {
+        /// orbstack or docker-desktop
+        from: String,
+        /// Another engine's Docker socket instead
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+        /// Only images (combine with --volumes, --containers)
+        #[arg(long)]
+        images: bool,
+        #[arg(long)]
+        volumes: bool,
+        /// Networks and containers (containers are created stopped)
+        #[arg(long)]
+        containers: bool,
+        /// Show what would be imported
+        #[arg(long)]
+        dry_run: bool,
+        /// Only one Compose project: its containers and the images,
+        /// volumes and networks they use
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Open a shell in the VM, or run a command there
     Shell {
@@ -285,6 +310,18 @@ fn main() -> Result<()> {
         Cmd::Snapshot { action } => snapshot(&paths, action),
         Cmd::Shell { command } => shell(&paths, &command),
         Cmd::Debug { container, command } => debug(&paths, &container, &command),
+        Cmd::Import { from, socket, images, volumes, containers, dry_run, project } => {
+            if current_status(&paths).is_none() {
+                bail!("berth is not running: berth start");
+            }
+            let all = !(images || volumes || containers);
+            let source = import::source_socket(&paths, &from, socket)?;
+            import::run(
+                &paths,
+                &source,
+                import::Options { images: all || images, volumes: all || volumes, containers: all || containers, dry_run, project },
+            )
+        }
         Cmd::Delete { yes } => delete(&paths, yes),
         Cmd::Tls { action: TlsCmd::Trust } => tls::trust(&paths),
         Cmd::Tls { action: TlsCmd::Untrust } => tls::untrust(&paths),

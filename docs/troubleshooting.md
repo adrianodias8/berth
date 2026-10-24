@@ -42,6 +42,18 @@ and boot messages). `berth shell` opens a shell in the VM.
   multicast.
 - **HTTPS warnings on `.berth.local`.** Run `berth tls trust` once.
 
+## Importing
+
+- **"OrbStack isn't running"**: `berth import` reads the other engine's
+  Docker API, so start it first (`orb start`, or open Docker Desktop).
+  Starting OrbStack points `/var/run/docker.sock` at it; the next
+  `berth start` points it back.
+- **A container was skipped.** Its settings may need something berth doesn't
+  have (a device, a runtime); the reason is printed. Its image and volumes
+  are still imported.
+- **Images already in berth under the same tag aren't replaced.** Remove
+  berth's copy first to take the other engine's.
+
 ## Machines
 
 - **`ssh <machine>.berth` takes a while the first time.** berth installs
