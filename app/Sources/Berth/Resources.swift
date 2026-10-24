@@ -11,6 +11,8 @@ struct FilesView: View {
     @State private var loading = false
     @State private var selection: FileEntry.ID?
     @State private var preview: (name: String, text: String)?
+    /// A View or Download that failed: shown under the listing, which stays.
+    @State private var actionError: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -48,6 +50,14 @@ struct FilesView: View {
                     guard let name = ids.first, let entry = entries.first(where: { $0.id == name }) else { return }
                     if entry.isDirectory || entry.isLink { navigate(to: join(path, entry.name)) } else { view(entry) }
                 }
+                if let actionError {
+                    HStack {
+                        Text(actionError).font(.caption).foregroundStyle(.red).lineLimit(2)
+                        Spacer()
+                        Button { self.actionError = nil } label: { Image(systemName: "xmark") }.buttonStyle(.borderless)
+                    }
+                    .padding(8)
+                }
             }
         }
         .task(id: containerID) { load() }
@@ -72,6 +82,7 @@ struct FilesView: View {
 
     private func navigate(to newPath: String) {
         path = newPath
+        actionError = nil
         load()
     }
 
@@ -96,8 +107,9 @@ struct FilesView: View {
                 let limited = data.prefix(512 * 1024)
                 let text = String(data: limited, encoding: .utf8) ?? "(binary file, \(formatBytes(Int64(data.count))))"
                 preview = (entry.name, text)
+                actionError = nil
             } catch {
-                self.error = error.localizedDescription
+                actionError = "\(entry.name): \(error.localizedDescription)"
             }
         }
     }
@@ -109,8 +121,9 @@ struct FilesView: View {
         Task {
             do {
                 try await Docker.readFile(containerID, path: join(path, entry.name)).write(to: url)
+                actionError = nil
             } catch {
-                self.error = error.localizedDescription
+                actionError = "\(entry.name): \(error.localizedDescription)"
             }
         }
     }

@@ -174,6 +174,11 @@ final class Engine: ObservableObject {
     @Published var networks: [DockerNetwork] = []
     @Published var domains: [BerthDomain] = []
     @Published var lastError: String?
+    /// The snapshot being created, restored or deleted, kept here rather
+    /// than in the view so leaving the screen mid-operation doesn't allow a
+    /// second one; and the last one's error.
+    @Published var snapshotBusy: String?
+    @Published var snapshotError: String?
 
     private var pollTask: Task<Void, Never>?
     private var eventsTask: Task<Void, Never>?

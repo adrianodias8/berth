@@ -118,11 +118,16 @@ enum UnixHTTP {
     ) -> AsyncThrowingStream<Data, Error> {
         AsyncThrowingStream { continuation in
             let box = SocketBox()
-            continuation.onTermination = { _ in box.socket?.shutdownBoth() }
+            continuation.onTermination = { _ in box.cancel() }
             Thread.detachNewThread {
                 do {
                     let sock = try UnixSocket(path: socketPath)
-                    box.socket = sock
+                    // Cancelled while connecting: nothing would ever shut
+                    // this socket down, and the read below would block.
+                    guard box.set(sock) else {
+                        continuation.finish()
+                        return
+                    }
                     try sock.write(requestData(method, path, json: json))
                     var head = Data()
                     var body: Data?
@@ -210,8 +215,30 @@ enum UnixHTTP {
     }
 }
 
+/// The socket a stream reads from, set by its thread and shut down by its
+/// cancellation, whichever comes first.
 final class SocketBox: @unchecked Sendable {
-    var socket: UnixSocket?
+    private let lock = NSLock()
+    private var socket: UnixSocket?
+    private var cancelled = false
+
+    /// False (and the socket shut down) if the stream was already cancelled.
+    func set(_ sock: UnixSocket) -> Bool {
+        let ok = lock.withLock {
+            if !cancelled { socket = sock }
+            return !cancelled
+        }
+        if !ok { sock.shutdownBoth() }
+        return ok
+    }
+
+    func cancel() {
+        let sock = lock.withLock {
+            cancelled = true
+            return socket
+        }
+        sock?.shutdownBoth()
+    }
 }
 
 /// Split Docker's multiplexed stdout/stderr stream (8-byte frame headers).

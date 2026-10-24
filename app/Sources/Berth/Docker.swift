@@ -312,14 +312,56 @@ enum Docker {
         s.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&=+?#"))) ?? s
     }
 
-    private static func firstTarEntry(_ tar: Data) throws -> Data {
+    /// The archive's file: skips PAX (`x`, `g`) and GNU long-name (`L`, `K`)
+    /// entries before it, which Docker adds for long names and xattrs; a PAX
+    /// `size` overrides the header's.
+    static func firstTarEntry(_ tar: Data) throws -> Data {
         let bytes = [UInt8](tar)
-        guard bytes.count >= 512 else { throw SocketError.message("empty archive") }
-        let sizeField = String(decoding: bytes[124..<136].prefix { $0 != 0 && $0 != 0x20 }, as: UTF8.self)
-        guard let size = Int(sizeField, radix: 8) else { throw SocketError.message("bad tar header") }
-        let type = bytes[156]
-        guard type == 0 || type == 0x30 else { throw SocketError.message("not a regular file") }
-        guard bytes.count >= 512 + size else { throw SocketError.message("truncated archive") }
-        return Data(bytes[512..<(512 + size)])
+        var offset = 0
+        var paxSize: Int?
+        while offset + 512 <= bytes.count {
+            let header = bytes[offset..<offset + 512]
+            if header.allSatisfy({ $0 == 0 }) { break }
+            guard let headerSize = tarNumber(header.dropFirst(124).prefix(12)) else { throw SocketError.message("bad tar header") }
+            let type = header[header.startIndex + 156]
+            let dataStart = offset + 512
+            let size = (type == 0 || type == 0x30) ? (paxSize ?? headerSize) : headerSize
+            guard size >= 0, dataStart + size <= bytes.count else { throw SocketError.message("truncated archive") }
+            let data = bytes[dataStart..<dataStart + size]
+            switch type {
+            case 0, 0x30:
+                return Data(data)
+            case UInt8(ascii: "x"):
+                paxSize = paxRecords(data)["size"].flatMap { Int($0) }
+            case UInt8(ascii: "g"), UInt8(ascii: "L"), UInt8(ascii: "K"):
+                break
+            default:
+                throw SocketError.message("not a regular file")
+            }
+            offset = dataStart + (size + 511) / 512 * 512
+        }
+        throw SocketError.message("empty archive")
+    }
+
+    /// An octal tar number field, or base-256 (high bit set) for big values.
+    private static func tarNumber(_ field: ArraySlice<UInt8>) -> Int? {
+        guard let first = field.first else { return nil }
+        if first & 0x80 != 0 {
+            return field.dropFirst().reduce(Int(first & 0x7f)) { $0 << 8 | Int($1) }
+        }
+        let text = String(decoding: field.prefix { $0 != 0 }, as: UTF8.self).trimmingCharacters(in: .whitespaces)
+        return text.isEmpty ? 0 : Int(text, radix: 8)
+    }
+
+    /// PAX records: "<length> <key>=<value>\n" each.
+    private static func paxRecords(_ data: ArraySlice<UInt8>) -> [String: String] {
+        var records: [String: String] = [:]
+        for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
+            guard let space = line.firstIndex(of: " ") else { continue }
+            let record = line[line.index(after: space)...]
+            guard let eq = record.firstIndex(of: "=") else { continue }
+            records[String(record[..<eq])] = String(record[record.index(after: eq)...])
+        }
+        return records
     }
 }

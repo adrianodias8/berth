@@ -117,17 +117,9 @@ fix one, remove it here in the same change.
 - **Terminal sessions:** the exec session's fields are unsynchronized, and a
   quick tab switch during the exec upgrade can leak a thread and an fd.
   Sessions also end on every tab switch.
-- **Follow streams:** a stream cancelled before its socket is set keeps a
-  thread blocked.
-- **Docker archive endpoint:** file view and download fail on PAX headers
-  (long names, xattrs).
-- **`TLSTrust.cached` is written off the main actor.**
 - **UI:**
   - logs re-attach when a container's running state changes, which a very
     quick restart can slip between;
-  - a failed file preview replaces the table;
-  - snapshot actions' busy state lives in the view: leaving and coming back
-    mid-operation allows a second one;
   - the Kubernetes screen shows pods, not services;
   - the CLI's `machine push/pull`, `config unset`, `delete` and import's
     `--images/--volumes/--containers` aren't in the app.

@@ -39,8 +39,6 @@ struct SnapshotsView: View {
     @State private var snapshots: [Snapshot] = []
     @State private var selection: String?
     @State private var showCreate = false
-    @State private var busy: String?
-    @State private var error: String?
     @State private var confirmRestore: Snapshot?
     @State private var confirmDelete: Snapshot?
 
@@ -52,7 +50,7 @@ struct SnapshotsView: View {
                 } description: {
                     Text("A snapshot saves the whole VM: containers, volumes, images, machines and, while the Mac is unlocked, running processes. Take one before a risky change, then go back to it.")
                 } actions: {
-                    Button("Take Snapshot…") { showCreate = true }.disabled(busy != nil)
+                    Button("Take Snapshot…") { showCreate = true }.disabled(engine.snapshotBusy != nil)
                 }
             } else {
                 List(selection: $selection) {
@@ -67,18 +65,18 @@ struct SnapshotsView: View {
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
-                            if busy == s.name { ProgressView().controlSize(.small) }
+                            if engine.snapshotBusy == s.name { ProgressView().controlSize(.small) }
                         }
                         .tag(s.name)
                         .contextMenu {
-                            Button("Restore…") { confirmRestore = s }.disabled(busy != nil)
+                            Button("Restore…") { confirmRestore = s }.disabled(engine.snapshotBusy != nil)
                             Divider()
-                            Button("Delete…", role: .destructive) { confirmDelete = s }.disabled(busy != nil)
+                            Button("Delete…", role: .destructive) { confirmDelete = s }.disabled(engine.snapshotBusy != nil)
                         }
                     }
                 }
             }
-            if let error {
+            if let error = engine.snapshotError {
                 Text(error).font(.caption).foregroundStyle(.red).padding(8).frame(maxWidth: .infinity, alignment: .leading)
             }
         }
@@ -86,13 +84,13 @@ struct SnapshotsView: View {
         .toolbar {
             ToolbarItem {
                 Button { showCreate = true } label: { Label("Take Snapshot", systemImage: "plus") }
-                    .disabled(busy != nil)
+                    .disabled(engine.snapshotBusy != nil)
             }
             ToolbarItem {
                 Button { if let s = snapshots.first(where: { $0.name == selection }) { confirmRestore = s } } label: {
                     Label("Restore", systemImage: "clock.arrow.circlepath")
                 }
-                .disabled(selection == nil || busy != nil)
+                .disabled(selection == nil || engine.snapshotBusy != nil)
             }
         }
         .sheet(isPresented: $showCreate) {
@@ -120,7 +118,7 @@ struct SnapshotsView: View {
         .task {
             // Snapshots also come and go from the CLI.
             while !Task.isCancelled {
-                if busy == nil { reload() }
+                if engine.snapshotBusy == nil { reload() }
                 try? await Task.sleep(for: .seconds(5))
             }
         }
@@ -129,11 +127,13 @@ struct SnapshotsView: View {
     private func reload() { snapshots = Snapshots.list() }
 
     private func perform(_ name: String, _ args: [String]) {
-        busy = name
-        error = nil
+        guard engine.snapshotBusy == nil else { return }
+        engine.snapshotBusy = name
+        engine.snapshotError = nil
+        let engine = engine
         Task {
-            error = await Snapshots.run(args)
-            busy = nil
+            engine.snapshotError = await Snapshots.run(args)
+            engine.snapshotBusy = nil
             reload()
         }
     }

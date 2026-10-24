@@ -149,17 +149,28 @@ func webURL(for container: Container) -> URL? {
 enum TLSTrust {
     static var caPath: String { BerthPaths.root.appendingPathComponent("tls/ca.crt").path }
 
-    // Initialized from `evaluate()`, which must not touch `cached`: assigning a
-    // lazy static from inside its own initializer deadlocks dispatch_once.
-    nonisolated(unsafe) static var cached: Bool = evaluate()
+    // Read from any thread (link schemes in views, checks off the main
+    // thread), so behind a lock; evaluated on first use.
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var known: Bool?
+
+    static var cached: Bool {
+        lock.withLock {
+            if let known { return known }
+            let value = evaluate()
+            known = value
+            return value
+        }
+    }
 
     static var scheme: String { cached ? "https" : "http" }
 
     /// Re-check and remember the result.
     @discardableResult
     static func check() -> Bool {
-        cached = evaluate()
-        return cached
+        let value = evaluate()
+        lock.withLock { known = value }
+        return value
     }
 
     /// Our CA has user trust settings in the keychain. (A verify-cert style
