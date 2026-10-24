@@ -47,11 +47,11 @@ next to OrbStack or Docker Desktop. Only one of them should own
 | `src/` | the `berth` CLI, daemon and root helper (macOS) |
 | `agent/` | `berth-agent`, a static Linux binary embedded in `berth` and run in the VM |
 | `guest/user-data.yaml` | first-boot provisioning (cloud-init) |
-| `guest/kmod/virtiofs_poll/` | the polling virtio-fs guest driver (GPL-2.0, experimental) |
+| `guest/kmod/virtiofs_poll/` | the polling virtio-fs guest driver (GPL-2.0) |
 | `app/` | Berth.app (SwiftUI) |
 | `scripts/` | build and signing |
 | `bench/` | benchmarks against OrbStack; results in `bench/results/` |
-| `docs/` | `LEARNINGS.md` (platform quirks, numbers, dead ends), `file-sharing.md` |
+| `docs/` | `LEARNINGS.md` (platform quirks, numbers, dead ends), `file-sharing.md`, `configuration.md`, `troubleshooting.md`, `KNOWN_ISSUES.md` |
 
 The README's "How it works" section explains the data paths; read it, and
 `docs/LEARNINGS.md`, before changing networking, memory or file sharing.
@@ -72,8 +72,9 @@ The README's "How it works" section explains the data paths; read it, and
   one user.
 - **Dependencies:** prefer the standard library and the crates already in
   use. Pin downloaded tools to a version and a SHA-256.
-- **Behavior visible to users** (CLI, app, README): update the README in the
-  same change.
+- **Behavior visible to users** (CLI, app, README): update the README, and
+  `docs/configuration.md` for new settings, in the same change. Add a line to
+  `CHANGELOG.md`.
 
 ## Testing
 

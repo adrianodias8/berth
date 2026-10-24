@@ -285,7 +285,7 @@ something here stops being true, fix it.
 | idle CPU | similar | similar |
 | localhost forward | ~20 Gbit/s | ~30 Gbit/s |
 | bind-mount extract (20k files) | 7.9 s (Apple's) / 2.3 s (own share + polling) | 2.3 s |
-| DDEV composer install | 10.3 s (own share + polling) | 6.6 s |
+| DDEV composer install | 8.9–9.2 s (own share + polling) | 6.6 s |
 
 Neither returns workload memory to macOS within 2 minutes. Docker volumes are
 ~15x faster than any bind mount (they live on the VM's own disk).

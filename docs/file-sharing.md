@@ -50,8 +50,10 @@ guest app ─ syscall ─ Linux FUSE ─ virtio-fs driver ═ virtqueue ═ Virt
   - With the polling driver it serves concurrent requests on worker threads.
   - It saves and restores the server's state for VM snapshots.
 - **`src/watch.rs`**: forwards Mac-side changes into the guest.
-  - The guest agent `chmod`s each changed path to its current mode, which
-    refreshes cached attributes and raises inotify events.
+  - The guest agent re-reads each changed path's attributes from the Mac
+    (`statx` with `AT_STATX_FORCE_SYNC`), then `chmod`s it to its current
+    mode, which raises inotify events. Re-reading first matters: a watcher
+    woken by the event must already see the new size and contents.
   - Changes the guest made itself aren't echoed back.
 
 ### The polling guest driver
@@ -72,9 +74,10 @@ back into the guest. `guest/kmod/virtiofs_poll/` is Linux 6.12's
      as the guard.
 
 3. **No-op chmods answered in the guest.** A `chmod` to the mode a file
-   already has, while its cached attributes are valid, is answered from the
-   inode without a round trip (`skip_noop_chmod`, counter `noop_chmods`).
-   Composer chmods every file it writes two or three times.
+   already has, while its cached attributes are valid (not invalidated, size
+   not changing), is answered from the inode without a round trip
+   (`skip_noop_chmod`, counter `noop_chmods`). Composer chmods every file it
+   writes two or three times.
 
 A round trip went from ~180 µs to ~18 µs (Apple's share: ~34 µs).
 
@@ -149,15 +152,15 @@ Results (M2 Max, seconds; `bench/results/2026-10-23-ddev-drupal.md`):
 | extract 20k files | 7.5 | 7.3 | **2.4** | 2.3 |
 | delete 20k files | 2.7 | 2.7 | **1.4** | 1.5 |
 | 4 parallel extracts | 20.4 | 12.8 | 7.7 | – |
-| DDEV `composer install` | fails* | 16 | 8.6–9.5 | 6.6 |
-| DDEV `drush site:install` | fails* | 67 | 41–44 | 37 |
+| DDEV `composer install` | fails* | 16 | 8.9–9.2 | 6.6 |
+| DDEV `drush site:install` | fails* | 67 | 39–41 | 37 |
 
 \* `create-project` aborts on Apple's share (ownership), so the later steps
 can't run.
 
 ### Known limits
 
-- Composer is still ~1.5x behind OrbStack. It sends ~10 requests per file
+- Composer is still ~1.4x behind OrbStack. It sends ~10 requests per file
   (the guest kernel and Composer decide that), its unzip runs in parallel,
   and APFS serializes metadata changes. Creating a file on APFS costs ~53 µs
   on its own.

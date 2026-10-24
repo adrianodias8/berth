@@ -1580,7 +1580,7 @@ static bool virtio_fs_answer_locally(struct fuse_req *req)
 	struct timespec64 t;
 	u64 nodeid = req->in.h.nodeid, now;
 	u32 left_nsec;
-	bool same;
+	bool same, stale;
 
 	if (!READ_ONCE(skip_noop_chmod) || req->in.h.opcode != FUSE_SETATTR ||
 	    test_bit(FR_BACKGROUND, &req->flags) || !test_bit(FR_ISREPLY, &req->flags) ||
@@ -1597,16 +1597,24 @@ static bool virtio_fs_answer_locally(struct fuse_req *req)
 		return false;
 	fi = get_fuse_inode(inode);
 	now = get_jiffies_64();
-	/* Cached attributes count only if nothing marked them stale since. */
+	/*
+	 * Not while a write is changing the size. Attributes marked stale (by
+	 * the guest's own writes, typically, just before Composer's chmod) are
+	 * still right about the mode: answer, but with no validity left, so the
+	 * next stat fetches fresh ones instead of trusting the cached size and
+	 * times.
+	 */
+	stale = READ_ONCE(fi->inval_mask) & STATX_BASIC_STATS;
 	same = (inode->i_mode & 07777) == (in->mode & 07777) && time_before64(now, fi->i_time) &&
-	       !(READ_ONCE(fi->inval_mask) & STATX_BASIC_STATS) &&
 	       !test_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 	if (same) {
 		out = args->out_args[0].value;
 		memset(out, 0, sizeof(*out));
 		/* Keep the attributes' remaining validity, not a fresh timeout. */
-		out->attr_valid = div_u64_rem(jiffies64_to_nsecs(fi->i_time - now), NSEC_PER_SEC, &left_nsec);
-		out->attr_valid_nsec = left_nsec;
+		if (!stale) {
+			out->attr_valid = div_u64_rem(jiffies64_to_nsecs(fi->i_time - now), NSEC_PER_SEC, &left_nsec);
+			out->attr_valid_nsec = left_nsec;
+		}
 		attr = &out->attr;
 		attr->ino = fi->orig_ino;
 		attr->size = i_size_read(inode);

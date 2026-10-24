@@ -44,6 +44,11 @@ fix one, remove it here in the same change.
 - **Label domains can claim any `.local` name**, such as `nas.local` (they
   can't take a name berth generated for another container). Consider an
   opt-in for names outside `berth.local`.
+- **Alpine machines don't shut down with the VM** (OpenRC under nspawn), so
+  `berth stop` waits 20 s and then forces the VM off.
+- **The machines' sshd is installed on first `ssh <name>.berth`** with the
+  distro's package manager: it needs the internet, and the first connection
+  waits for it.
 - **Machine actions put the user name and home into `sh -c` and `.nspawn`
   files unquoted.** These values come only from the Mac user. Start/stop
   don't re-validate the machine name.
@@ -85,9 +90,10 @@ fix one, remove it here in the same change.
   - the ssh `ProxyCommand` path isn't quoted, so a home folder with spaces
     breaks it;
   - a Docker binding only on `::1` maps to 127.0.0.1.
-- **Anything in the VM can reach any loopback-only service on the Mac**
-  through `host.docker.internal` (as with OrbStack), including the forwarded
-  Kubernetes API on 6443. Worth stating in the README.
+
+- **`~/Berth` (NFS) trusts its client.** Any local user on the Mac can
+  mount the VM's export and gets root access to volumes and machines. Fine
+  on a single-user Mac; the export only accepts the Mac's VM-network address.
 
 ## Root helper and downloads
 

@@ -9,8 +9,9 @@
 //! copy-on-write (clonefile), so taking one is instant and it only costs
 //! space as the VM's disk changes afterwards.
 //!
-//! When the state can't be saved (the experimental file sharing device
-//! doesn't support it) or restored (the file is from another macOS build),
+//! When the state can't be saved (the Mac is locked: the state is encrypted
+//! with a key only available then) or restored (the file is from another
+//! macOS build),
 //! the snapshot falls back to its disk: like booting after a power cut, so
 //! containers restart per their restart policy. Snapshots don't include
 //! files on the Mac (bind mounts).

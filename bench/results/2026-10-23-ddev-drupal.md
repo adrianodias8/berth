@@ -10,7 +10,8 @@ so every request runs PHP. Warm page = median of 20 after 10 warm-up requests.
 | OrbStack 2.2.5 | 10.8–11.8 s | **10.7–11.0 s** | **6.6 s** | **36.7–37.4 s** | **2.0 s** | 14 ms | **20.8–21.1 s** |
 | berth, own virtio-fs (experimental) | 12.4–12.8 s | 21.8–23.0 s | 16.0–16.1 s | 66.5–68.1 s | 4.2–4.4 s | 17–18 ms | 24.1–24.5 s |
 | berth, own virtio-fs + polling guest driver (experimental, 2026-10-24) | 11.4–14.2 s | 14.6–15.5 s | 10.3 s | 44.0–44.2 s | 2.7–2.8 s | 18–21 ms | 23.6–24.1 s |
-| berth, Apple's virtiofs (default) | 13.2 s | fails | – | – | – | – | – |
+| berth, own virtio-fs + polling driver, default (2026-10-24, later) | 11.3–12.9 s | 13.5–14.1 s | **8.9–9.2 s** | 38.9–40.7 s | 2.6–2.7 s | 21–29 ms | 26.9–28.0 s |
+| berth, Apple's virtiofs | 13.2 s | fails | – | – | – | – | – |
 
 - On Apple's share the project folder appears owned by root inside the
   container, so DDEV's `rsync -g` into it fails (`chgrp: Operation not

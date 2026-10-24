@@ -72,6 +72,23 @@ from its code.
 - Linux machines: `berth machine create dev --distro ubuntu:noble` (Debian,
   Fedora, Alpine, Arch, Rocky, Alma, openSUSE…) with your user, sudo, your Mac
   home, systemd, and `dev.berth.local`; `berth machine shell dev`
+  - `ssh dev.berth` (and VS Code's Remote-SSH, which uses it): berth adds
+    `Include ~/.berth/ssh/config` to `~/.ssh/config` and sets up sshd in the
+    machine on first use, starting the machine if it's stopped
+  - `mac <command>` inside a machine runs it on the Mac (`mac open .`,
+    `mac pbcopy < file`), in the same folder when it's under your home
+  - the Mac's SSH agent works in machines (`SSH_AUTH_SOCK`), and in
+    containers that mount `/run/host-services/ssh-auth.sock`, as with Docker
+    Desktop: `-v /run/host-services/ssh-auth.sock:/agent.sock -e SSH_AUTH_SOCK=/agent.sock`
+- Files in Finder: `~/Berth/volumes` (Docker volumes) and `~/Berth/machines`
+  (machines' root folders), mounted from the VM while berth runs. Files open
+  as root in the VM, so anything there can be read and edited
+  (`"finder": false` turns it off)
+- Debug shell: `berth debug <container>` opens a root shell inside any
+  container, distroless and scratch images included, with the VM's tools
+  (bash, ps, ss, curl, `apt install` for more). It shares the container's
+  network, processes and hostname; its files are at `/container`. Nothing is
+  added to the container, and what you install is gone when the shell ends
 
 **Snapshots**
 - `berth snapshot create <name>` saves the whole VM (containers, images, volumes,
@@ -91,12 +108,23 @@ images, volumes, networks, Kubernetes, machines, terminals, logs, files and stat
 - Before macOS 27 (Apple's virtiofs), small-file I/O on bind mounts is ~3.5x
   slower than OrbStack, and DDEV's `composer create-project` fails (the project
   folder shows as root-owned in containers).
-- On berth's own share, Composer-heavy work is still ~1.5x slower than OrbStack
-  (DDEV Drupal CMS `composer install` 10–15 s vs 6.6 s); page loads are on par
+- On berth's own share, Composer-heavy work is still ~1.4x slower than OrbStack
+  (DDEV Drupal CMS `composer install` ~9 s vs 6.6 s, `drush site:install` ~40 s
+  vs 37 s); page loads are on par
   (`bench/results/2026-10-23-ddev-drupal.md`).
 - Memory used by a workload isn't returned to macOS after it ends (OrbStack in the
   same test didn't return it within 2 minutes either).
 - Deleting a file on the Mac doesn't raise an inotify event in containers.
+- Anything in the VM can reach servers listening only on the Mac's loopback,
+  through `host.docker.internal` (as with OrbStack), including the forwarded
+  Kubernetes API on 6443.
+
+## Requirements
+
+An Apple Silicon Mac. berth is developed and tested on macOS 27; berth's own
+file sharing and the fast `host.docker.internal` tunnel need macOS 27's
+custom Virtio devices, and ASIF disks need macOS 26. On older versions berth
+falls back to Apple's virtiofs and vsock. The app needs macOS 14 or later.
 
 ## Build
 
@@ -106,6 +134,8 @@ rustup target add aarch64-unknown-linux-musl   # for the guest agent
 ./scripts/build.sh        # builds the agent, then builds and ad-hoc signs target/release/berth
 ```
 
+If `cargo` isn't found, put the toolchain on your `PATH`
+(`export PATH=~/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH`).
 The binary needs the `com.apple.security.virtualization` entitlement, which the
 script adds. `cargo run -- <args>` also signs before running.
 
@@ -133,9 +163,11 @@ its own. Closing the window keeps it in the menu bar.
 - **Images** (with pull and progress), **Volumes**, **Networks** (subnets, container
   counts, IP routing status)
 - **Machine**: a shell in the VM
-- **Settings**: CPUs, memory and IPv6 for containers (written to `~/.berth/config.json`,
-  applied on restart), start on app launch, open at login, install the IP route helper, trust the HTTPS
-  certificate
+- **Snapshots**: create, restore and delete
+- **Settings**: CPUs, memory, file sharing, IPv6 for containers and whether stopping
+  keeps containers running (suspend), written to `~/.berth/config.json` and applied
+  on restart (`docs/configuration.md`); start on app launch, open at login, install
+  the IP route helper, trust the HTTPS certificate
 
 Launch arguments pick the starting screen, e.g.
 `open target/Berth.app --args -openSection Images` or
@@ -154,6 +186,7 @@ berth engine enable podman   # or nerdctl; berth engine status
 berth machine create dev  # an Ubuntu machine; then: berth machine shell dev
 berth snapshot create before-migration   # then break things...
 berth snapshot restore before-migration  # ...and go back; also: list, delete
+berth debug web           # a shell with tools inside container `web`, even a distroless one
 berth shell               # SSH into the VM; `berth shell uname -a` runs a command
 berth stop                # --suspend: save the VM so the next start resumes it
 berth delete --yes        # wipe the VM disk (containers, images, volumes)
@@ -199,9 +232,9 @@ socket tables (`/proc/net/tcp*`, `udp*`) every 2 s and keeps the listening
 sockets owned by processes in a container cgroup (`docker-<id>.scope` and the
 like), which leaves out sshd, dockerd, k3s and the agent itself. When that set
 changes it asks the daemon to re-sync (a `sync` header on vsock 2401), and the
-daemon forwards those ports like published ones: all-interface servers on
-`[::]` through the guest's NAT address, loopback servers on the Mac's loopback
-through the agent.
+daemon forwards those ports like published ones, but only on the Mac's
+loopback: all-interface servers through the guest's NAT address, loopback
+servers through the agent.
 
 Domain names work differently, without the host daemon in the data path:
 
@@ -222,13 +255,19 @@ removes the address and sends an mDNS goodbye so the Mac drops the cached name.
 
 ```
 container ── DNS 198.19.248.253 (agent) ── host.docker.internal = 198.19.248.254
-container ── TCP 198.19.248.254:3000 ── iptables REDIRECT ── agent ══ vsock:2401 ══ berth daemon ── 127.0.0.1:3000 (or [::1])
+container ── TCP 198.19.248.254:3000 ── iptables REDIRECT ── agent ══ tunnel device ══ berth daemon ── 127.0.0.1:3000 (or [::1])
 ```
 
 The agent sets Docker's `dns` to its own server (keeping any other `daemon.json`
 settings) and relays names it doesn't own to the guest's resolver, which forwards
 to the Mac. The daemon only ever connects to the Mac's loopback, on the port the
 container asked for.
+
+On macOS 27 the connection crosses a second berth virtio-fs device,
+`berth-tunnel` (`src/fuse/tunnel.rs`, `agent/src/tunnel.rs`): each connection is
+a pair of FUSE stream files in it, one per direction. Apple's vsock device
+moves at most ~6 Gbit/s from the Mac into the VM; the tunnel does ~21 Gbit/s.
+Without it (older macOS, Apple's share), connections go over vsock port 2401.
 
 Web access to domains goes through the agent and, for HTTPS, the host:
 
@@ -252,6 +291,7 @@ refuses any other name, so trusting it cannot be abused for real sites.
 - `src/virtiofs.rs`, `src/fuse.rs` (+ `fuse/nofollow.rs`): berth's file sharing
   device and FUSE server; `guest/kmod/virtiofs_poll`: its polling guest driver,
   built in the VM by `agent/src/kmod.rs`
+- `src/fuse/tunnel.rs` (agent: `tunnel.rs`): the `host.docker.internal` tunnel device
 - `src/watch.rs`: FSEvents → inotify forwarding for bind mounts
 - `src/memory.rs`: balloon controller
 - `src/k8s.rs`, `src/machines.rs`: Kubernetes and Linux machines (agent: `k8s.rs`, `machines.rs`)
@@ -266,7 +306,11 @@ refuses any other name, so trusting it cannot be abused for real sites.
   - `listeners.rs`: host-network containers' listening ports
   - `ipv6.rs`: the IPv6 setting (Docker's IPv6 options, router advertisements)
   - `web.rs`: web port detection, HTTP/HTTPS entry for domains
-- `src/snapshots.rs`: VM snapshots (disk clones, saved machine state, restore)
+- `src/snapshots.rs`: VM snapshots and suspend (disk clones, saved machine state, restore)
+- `src/macexec.rs` (agent: `mac.rs`), `src/sshconfig.rs`: machines and the Mac: the `mac`
+  command, the SSH agent, `ssh <machine>.berth`
+- `src/files.rs` (agent: `files.rs`): `~/Berth` in Finder over NFS
+- `guest/berth-debug.sh`: `berth debug`
 - `src/tls.rs`: the local CA, per-name certificates, keychain trust
 - `src/provision.rs`: image download and checksum, disk clone, SSH key, cloud-init seed
 - `guest/user-data.yaml`: guest provisioning (Docker, mounts, Rosetta binfmt, agent unit)
@@ -280,8 +324,8 @@ Informed by OrbStack users' most-requested features (public issue tracker and
 discussions) and the limits above:
 
 - **File sharing**: close the remaining Composer gap (fewer round trips per
-  file, e.g. guest-side handling of no-op chmods); push invalidations to the
-  guest instead of relying on FSEvents touches
+  file); push invalidations to the guest instead of relying on FSEvents
+  touches; prebuilt guest modules, so the polling driver needs no download
 - **Machines**: cloud-init / custom images; per-machine and per-volume snapshots
   next to the whole-VM ones
 - **Linux GUI apps**: first a console window (virtio-gpu 2D, clipboard via
@@ -301,10 +345,13 @@ discussions) and the limits above:
 
 ## Documentation
 
-- `CONTRIBUTING.md`: setting up, the clean-room rule, layout, testing
-- `docs/LEARNINGS.md`: platform quirks, measurements and dead ends found so far
+- `docs/configuration.md`: `~/.berth/config.json`, suspend, environment variables, files
+- `docs/troubleshooting.md`: common problems, starting over, uninstalling
 - `docs/file-sharing.md`: berth's own file sharing and its polling guest driver
+- `docs/LEARNINGS.md`: platform quirks, measurements and dead ends found so far
 - `docs/KNOWN_ISSUES.md`: open review findings
+- `CONTRIBUTING.md`: setting up, the clean-room rule, layout, testing
+- `CHANGELOG.md`: what changed
 - `bench/results/`: benchmark runs against OrbStack
 
 ## License

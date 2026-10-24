@@ -1,6 +1,6 @@
 //! A passthrough FUSE server for virtio-fs: Linux FUSE requests in, replies
-//! out, backed by a directory on the Mac. Used by the experimental berth
-//! virtio-fs device (virtiofs.rs) on macOS 27's custom Virtio API, which lets
+//! out, backed by a directory on the Mac. Used by berth's virtio-fs device
+//! (virtiofs.rs) on macOS 27's custom Virtio API, which lets
 //! us choose the caching policy that Apple's built-in virtiofs doesn't expose.
 //!
 //! Protocol structures follow Linux include/uapi/linux/fuse.h. macOS and
