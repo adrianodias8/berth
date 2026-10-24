@@ -127,6 +127,21 @@ that version's `fs/fuse/virtio_fs.c` and `fuse_i.h`, and reapply the
 and reloading the module, and keep the built-in driver's devices (Apple's
 shares) untouched.
 
+## Releasing
+
+`scripts/release.sh` builds `target/dist/Berth-<version>.zip` (version from
+`Cargo.toml`, build number from the commit count). With
+`BERTH_SIGN_IDENTITY` (a "Developer ID Application" certificate in the
+keychain) it signs with the hardened runtime, and with
+`BERTH_NOTARY_PROFILE` (`xcrun notarytool store-credentials`) it notarizes
+and staples. Without them the app is ad-hoc signed and opens only on the Mac
+that built it.
+
+Pushing a tag such as `v0.2.0` runs the same script in GitHub Actions
+(`.github/workflows/release.yml`) and attaches the zip to a release. The
+workflow's header lists the secrets it needs for signing and notarization;
+without them it publishes an ad-hoc prerelease.
+
 ## Commits and pull requests
 
 - Write commit messages that explain what changed and why: a short subject,

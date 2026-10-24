@@ -354,8 +354,8 @@ discussions) and the limits above:
   `.berth.local` names reachable from other devices, client source IP preservation
 - **Memory**: returning freed memory to macOS needs a VMM with free-page reporting
   (Hypervisor.framework / libkrun); worth it only if it keeps Rosetta working
-- **Distribution**: signed and notarized releases with auto-update; data location
-  setting
+- **Distribution**: auto-update (releases are signed and notarized once a
+  Developer ID is configured, see CONTRIBUTING); data location setting
 
 ## Documentation
 

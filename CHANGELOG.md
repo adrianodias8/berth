@@ -10,6 +10,9 @@ are in the commit messages.
 - **Machines and the Mac:** `ssh <machine>.berth` (VS Code Remote-SSH), the
   `mac` command inside machines, and the Mac's SSH agent in machines and at
   `/run/host-services/ssh-auth.sock`.
+- **Releases:** `scripts/release.sh` and a tag-triggered GitHub workflow
+  build a Developer ID-signed, notarized Berth.app zip (ad-hoc without a
+  certificate).
 - **Machines:** `--arch amd64` (Intel distros on Rosetta) and
   `--cloud-init <user-data>`; machines resolve their own hostname.
 - **Kubernetes:** services resolve on the Mac as

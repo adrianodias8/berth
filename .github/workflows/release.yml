@@ -1,0 +1,72 @@
+# A tag like v0.2.0 builds Berth.app with scripts/release.sh and attaches
+# the zip to a GitHub release. Signed and notarized when the repository has
+# these secrets (Settings › Secrets and variables › Actions):
+#
+#   DEVELOPER_ID_P12           the "Developer ID Application" certificate and key,
+#                              exported from Keychain Access as .p12, base64-encoded
+#   DEVELOPER_ID_P12_PASSWORD  its export password
+#   DEVELOPER_ID_IDENTITY      e.g. "Developer ID Application: Your Name (TEAMID)"
+#   APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD
+#                              for notarytool (an app-specific password)
+#
+# Without them the build is ad-hoc signed and the release marked a prerelease.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the build number is the commit count
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-unknown-linux-musl
+
+      - name: Signing keychain
+        env:
+          P12: ${{ secrets.DEVELOPER_ID_P12 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          IDENTITY: ${{ secrets.DEVELOPER_ID_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          if [ -z "$P12" ]; then echo "No signing secrets: ad-hoc build"; exit 0; fi
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          password=$(uuidgen)
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/id.p12"
+          security import "$RUNNER_TEMP/id.p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/id.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          echo "BERTH_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          if [ -n "$APPLE_ID" ]; then
+            xcrun notarytool store-credentials berth --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_PASSWORD" --keychain "$keychain"
+            echo "BERTH_NOTARY_PROFILE=berth" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build
+        run: DEVELOPER_DIR="$(xcode-select -p)" ./scripts/release.sh
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=""
+          [ -n "${BERTH_NOTARY_PROFILE:-}" ] || flags="--prerelease"
+          gh release create "$GITHUB_REF_NAME" target/dist/Berth-*.zip target/dist/Berth-*.zip.sha256 \
+            --title "berth ${GITHUB_REF_NAME#v}" --generate-notes $flags
