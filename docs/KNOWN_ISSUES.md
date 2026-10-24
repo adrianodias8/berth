@@ -57,11 +57,11 @@ fix one, remove it here in the same change.
 
 ## Networking
 
-- **Host networking forwards TCP on the wildcard addresses, 127.0.0.1 and ::1,
-  and UDP on the wildcard addresses only.** A host-network server bound to one
-  specific guest address isn't forwarded; UDP on loopback or on an
-  ephemeral-range port isn't either. New servers appear on the Mac within the
-  2 s poll.
+- **Host networking forwards TCP servers bound to the wildcard addresses,
+  127.0.0.1 or ::1, and UDP ones bound to the wildcard addresses only**, always
+  on the Mac's loopback. A host-network server bound to one specific guest
+  address isn't forwarded; UDP on loopback or on an ephemeral-range port
+  isn't either. New servers appear on the Mac within the 2 s poll.
 - **Host-network containers can't reach Mac servers on `localhost`** (they
   can through `host.docker.internal`); see LEARNINGS.
 - **IPv6 isn't routed from the Mac to containers.** Container IPv6 addresses
@@ -75,14 +75,6 @@ fix one, remove it here in the same change.
 
 ## Host daemon (`src/`)
 
-- **A failed port bind is retried only on the next container event**
-  (`ports.rs`): if something on the Mac held the port, the forward stays
-  missing until then. Retry failed ports on a timer.
-- **Concurrent `ports::sync()` calls can apply an older snapshot last**,
-  and each Docker event runs a full sync. Use one coalescing sync task, as
-  the agent's domain sync now does.
-- **`helper::bind_privileged` blocks a tokio worker** while holding the
-  `FORWARDS` lock (up to a 5 s timeout).
 - **Direct boot gets turned off** if berth stops after the "trying" marker
   is written but before the guest clears it.
 - **Small edge cases:**

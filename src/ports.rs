@@ -5,11 +5,16 @@
 //! Host-network containers (`--net host`) publish nothing: their servers
 //! listen in the guest's own network namespace. The agent watches for those
 //! (agent/src/listeners.rs), asks for a sync when they change, and lists them
-//! with `info listeners`; they are forwarded the same way, on the address they
-//! bind (all interfaces or loopback), so they appear on the Mac's localhost.
+//! with `info listeners`; they are forwarded the same way, on the Mac's
+//! loopback only (as OrbStack does): a container server on all interfaces
+//! shouldn't appear on the Mac's LAN unless it's published.
+//!
+//! Syncs run one at a time, coalesced, and failed binds (a port held on the
+//! Mac) are retried every few seconds.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -46,6 +51,12 @@ fn published_route(bind: &str) -> Route {
 }
 
 static FORWARDS: Mutex<BTreeMap<Key, (Route, JoinHandle<()>)>> = Mutex::new(BTreeMap::new());
+/// One sync at a time; PENDING marks a request not yet covered by one.
+static SYNC: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static PENDING: AtomicBool = AtomicBool::new(false);
+/// The last sync couldn't bind everything.
+static FAILED: AtomicBool = AtomicBool::new(false);
+const RETRY: Duration = Duration::from_secs(5);
 
 /// A listening socket of a host-network container, as the agent reports it.
 #[derive(Deserialize, Debug)]
@@ -56,29 +67,32 @@ struct Listener {
     bind: String,
 }
 
-/// Where a host-network listener appears on the Mac. Wildcard binds map to
-/// the dual-stack `[::]`; loopback ones stay loopback (and on the same
-/// family, so a server on `localhost` that binds both gets both). UDP is
+/// Where a host-network listener appears on the Mac: always on loopback.
+/// Wildcard binds get both 127.0.0.1 and ::1; loopback ones stay on their
+/// family (so a server on `localhost` that binds both gets both). UDP is
 /// relayed to the guest's NAT address, so only wildcard binds work.
-fn listener_forward(l: &Listener) -> Option<(Key, Route)> {
-    let (bind, route) = match (l.proto.as_str(), l.bind.as_str()) {
-        ("tcp", "0.0.0.0") => ("::", Route { direct: true, guest: "127.0.0.1" }),
-        ("tcp", "::") => ("::", Route { direct: true, guest: "[::1]" }),
-        ("tcp", "127.0.0.1") => ("127.0.0.1", Route { direct: false, guest: "127.0.0.1" }),
-        ("tcp", "::1") => ("::1", Route { direct: false, guest: "[::1]" }),
-        ("udp", "0.0.0.0" | "::") => ("::", Route { direct: true, guest: "127.0.0.1" }),
-        _ => return None,
-    };
+fn listener_forward(l: &Listener) -> Vec<(Key, Route)> {
     let proto = if l.proto == "udp" { Proto::Udp } else { Proto::Tcp };
-    Some(((bind, l.port, proto), route))
+    let both = |route: Route| vec![(("127.0.0.1", l.port, proto), route), (("::1", l.port, proto), route)];
+    match (l.proto.as_str(), l.bind.as_str()) {
+        ("tcp", "0.0.0.0") => both(Route { direct: true, guest: "127.0.0.1" }),
+        ("tcp", "::") => both(Route { direct: true, guest: "[::1]" }),
+        ("tcp", "127.0.0.1") => vec![(("127.0.0.1", l.port, proto), Route { direct: false, guest: "127.0.0.1" })],
+        ("tcp", "::1") => vec![(("::1", l.port, proto), Route { direct: false, guest: "[::1]" })],
+        ("udp", "0.0.0.0" | "::") => both(Route { direct: true, guest: "127.0.0.1" }),
+        _ => Vec::new(),
+    }
 }
 
 /// Everything to forward: published ports first; a host-network listener
-/// only where no published port already holds that Mac address and port.
+/// only where no published port already holds that Mac address and port
+/// (a published `[::]` holds every address).
 fn plan(published: Vec<Key>, listeners: &[Listener]) -> BTreeMap<Key, Route> {
     let mut wanted: BTreeMap<Key, Route> = published.into_iter().map(|key| (key, published_route(key.0))).collect();
-    for (key, route) in listeners.iter().filter_map(listener_forward) {
-        wanted.entry(key).or_insert(route);
+    for (key, route) in listeners.iter().flat_map(listener_forward) {
+        if !wanted.contains_key(&("::", key.1, key.2)) {
+            wanted.entry(key).or_insert(route);
+        }
     }
     wanted
 }
@@ -146,6 +160,15 @@ pub async fn run() {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
+    // Retry ports that couldn't be bound (something on the Mac held them).
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(RETRY).await;
+            if FAILED.load(Ordering::SeqCst) {
+                let _ = sync().await;
+            }
+        }
+    });
     let mut synced = false;
     loop {
         if let Err(err) = watch(&mut synced).await {
@@ -176,7 +199,18 @@ pub fn trigger() {
     });
 }
 
+/// Bring the forwards up to date. Concurrent calls coalesce: each returns
+/// once a sync that started after it was called has finished.
 async fn sync() -> Result<()> {
+    PENDING.store(true, Ordering::SeqCst);
+    let _one = SYNC.lock().await;
+    if !PENDING.swap(false, Ordering::SeqCst) {
+        return Ok(()); // a sync that started after our request just ran
+    }
+    sync_now().await
+}
+
+async fn sync_now() -> Result<()> {
     crate::routes::sync().await;
     let mut body = String::new();
     docker_get("/containers/json").await?.read_to_string(&mut body).await?;
@@ -234,40 +268,67 @@ async fn sync() -> Result<()> {
     }
     let wanted = plan(published, &listeners);
 
-    let mut forwards = FORWARDS.lock().unwrap();
-    forwards.retain(|key, (route, task)| {
-        let keep = wanted.get(key) == Some(route);
-        if !keep {
-            task.abort();
-            eprintln!("ports: stopped forwarding {}", display(*key));
-        }
-        keep
-    });
-    for (key, route) in wanted {
-        if forwards.contains_key(&key) {
-            continue;
-        }
-        // Bind synchronously so a conflict is reported now and retried on the
-        // next event instead of failing silently in a task.
-        let task = match key.2 {
-            Proto::Tcp => bind_tcp(key.0, key.1).and_then(|std| {
+    // Stop what's no longer wanted, and wait for those tasks to end so their
+    // sockets are closed before anything binds the same port again.
+    let stopped: Vec<JoinHandle<()>> = {
+        let mut forwards = FORWARDS.lock().unwrap();
+        let gone: Vec<Key> = forwards.iter().filter(|(key, (route, _))| wanted.get(key) != Some(route)).map(|(k, _)| *k).collect();
+        gone.into_iter()
+            .filter_map(|key| {
+                eprintln!("ports: stopped forwarding {}", display(key));
+                forwards.remove(&key).map(|(_, task)| task)
+            })
+            .collect()
+    };
+    for task in stopped {
+        task.abort();
+        let _ = task.await;
+    }
+    let missing: Vec<(Key, Route)> = {
+        let forwards = FORWARDS.lock().unwrap();
+        wanted.into_iter().filter(|(key, _)| !forwards.contains_key(key)).collect()
+    };
+    let mut failed = false;
+    for (key, route) in missing {
+        // Bind before spawning so a conflict is reported (and retried) now;
+        // off the async workers, since the root helper may be asked.
+        let bound = tokio::task::spawn_blocking(move || match key.2 {
+            Proto::Tcp => bind_tcp(key.0, key.1).map(Bound::Tcp),
+            Proto::Udp => bind_udp(key.0, key.1).map(Bound::Udp),
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+        let task = bound.and_then(|bound| match bound {
+            Bound::Tcp(std) => {
                 std.set_nonblocking(true)?;
                 Ok(tokio::spawn(forward(TcpListener::from_std(std)?, key.1, route)))
-            }),
-            Proto::Udp => bind_udp(key.0, key.1).and_then(|std| {
+            }
+            Bound::Udp(std) => {
                 std.set_nonblocking(true)?;
                 Ok(tokio::spawn(forward_udp(tokio::net::UdpSocket::from_std(std)?, key.1)))
-            }),
-        };
+            }
+        });
         match task {
             Ok(task) => {
                 eprintln!("ports: forwarding {}", display(key));
-                forwards.insert(key, (route, task));
+                FORWARDS.lock().unwrap().insert(key, (route, task));
             }
-            Err(err) => eprintln!("ports: cannot listen on {}: {err}", display(key)),
+            Err(err) => {
+                // Logged once per failure streak, not every retry.
+                if !FAILED.load(Ordering::SeqCst) {
+                    eprintln!("ports: cannot listen on {}: {err} (retrying)", display(key));
+                }
+                failed = true;
+            }
         }
     }
+    FAILED.store(failed, Ordering::SeqCst);
     Ok(())
+}
+
+enum Bound {
+    Tcp(std::net::TcpListener),
+    Udp(std::net::UdpSocket),
 }
 
 /// macOS lets users bind ports below 1024 only on all interfaces; for
@@ -471,23 +532,28 @@ mod tests {
     #[test]
     fn host_listeners_keep_their_scope() {
         let all = Route { direct: true, guest: "127.0.0.1" };
-        assert_eq!(listener_forward(&listener("tcp", 80, "0.0.0.0")), Some((("::", 80, Proto::Tcp), all)));
+        // Wildcard binds: the Mac's loopback only, both families.
         assert_eq!(
-            listener_forward(&listener("tcp", 80, "::")),
-            Some((("::", 80, Proto::Tcp), Route { direct: true, guest: "[::1]" }))
+            listener_forward(&listener("tcp", 80, "0.0.0.0")),
+            vec![(("127.0.0.1", 80, Proto::Tcp), all), (("::1", 80, Proto::Tcp), all)]
         );
+        let v6 = Route { direct: true, guest: "[::1]" };
+        assert_eq!(listener_forward(&listener("tcp", 80, "::")), vec![(("127.0.0.1", 80, Proto::Tcp), v6), (("::1", 80, Proto::Tcp), v6)]);
         assert_eq!(
             listener_forward(&listener("tcp", 5173, "::1")),
-            Some((("::1", 5173, Proto::Tcp), Route { direct: false, guest: "[::1]" }))
+            vec![(("::1", 5173, Proto::Tcp), Route { direct: false, guest: "[::1]" })]
         );
         assert_eq!(
             listener_forward(&listener("tcp", 3000, "127.0.0.1")),
-            Some((("127.0.0.1", 3000, Proto::Tcp), Route { direct: false, guest: "127.0.0.1" }))
+            vec![(("127.0.0.1", 3000, Proto::Tcp), Route { direct: false, guest: "127.0.0.1" })]
         );
-        assert_eq!(listener_forward(&listener("udp", 5000, "::")), Some((("::", 5000, Proto::Udp), all)));
+        assert_eq!(
+            listener_forward(&listener("udp", 5000, "::")),
+            vec![(("127.0.0.1", 5000, Proto::Udp), all), (("::1", 5000, Proto::Udp), all)]
+        );
         // Loopback UDP can't be relayed to the NAT address.
-        assert_eq!(listener_forward(&listener("udp", 5000, "127.0.0.1")), None);
-        assert_eq!(listener_forward(&listener("sctp", 1, "::")), None);
+        assert_eq!(listener_forward(&listener("udp", 5000, "127.0.0.1")), vec![]);
+        assert_eq!(listener_forward(&listener("sctp", 1, "::")), vec![]);
     }
 
     #[test]
@@ -495,10 +561,10 @@ mod tests {
         let published = vec![("127.0.0.1", 80, Proto::Tcp), ("::", 8080, Proto::Tcp)];
         let listeners = [listener("tcp", 8080, "0.0.0.0"), listener("tcp", 80, "0.0.0.0"), listener("tcp", 8080, "::")];
         let plan = plan(published, &listeners);
-        assert_eq!(plan.len(), 3);
+        assert_eq!(plan.len(), 3, "{plan:?}");
         assert_eq!(plan[&("127.0.0.1", 80, Proto::Tcp)], published_route("127.0.0.1"));
         assert_eq!(plan[&("::", 8080, Proto::Tcp)], published_route("::"));
-        // The host-network server on 80 still gets the wildcard address.
-        assert_eq!(plan[&("::", 80, Proto::Tcp)], Route { direct: true, guest: "127.0.0.1" });
+        // The host-network server on 80 still gets ::1; 8080 is all taken.
+        assert_eq!(plan[&("::1", 80, Proto::Tcp)], Route { direct: true, guest: "127.0.0.1" });
     }
 }
