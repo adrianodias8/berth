@@ -16,6 +16,13 @@ const DISK_SIZE: u64 = 64 << 30;
 const USER_DATA_TEMPLATE: &str = include_str!("../guest/user-data.yaml");
 const AGENT: &[u8] = include_bytes!(env!("BERTH_AGENT"));
 
+/// Identifies the embedded agent build; the agent hashes its own binary the
+/// same way (`info version`).
+pub fn agent_version() -> String {
+    let h = AGENT.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3));
+    format!("{h:016x}")
+}
+
 /// Make sure everything the VM needs exists. Cheap when already provisioned.
 pub fn ensure(paths: &Paths) -> Result<()> {
     paths.create_dirs()?;

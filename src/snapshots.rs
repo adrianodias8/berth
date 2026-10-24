@@ -46,6 +46,9 @@ pub struct Meta {
     /// disk-only restore, where only restart policies would bring them back.
     #[serde(default)]
     pub running: Vec<String>,
+    /// The home share it was saved with (virtiofs::HomeShare::as_str).
+    #[serde(default)]
+    pub share: Option<String>,
 }
 
 fn root(paths: &Paths) -> PathBuf {
@@ -172,6 +175,7 @@ pub async fn create_running(paths: &Paths, name: &str, with_memory: bool, res: &
             disk: disk?,
             macos_build: macos_build(),
             running,
+            share: crate::virtiofs::CURRENT.get().map(|s| s.as_str().to_string()),
         })
     }
     .await;
@@ -202,6 +206,7 @@ pub fn create_stopped(paths: &Paths, name: &str) -> Result<Meta> {
         disk,
         macos_build: macos_build(),
         running: Vec::new(),
+        share: None,
     });
     match meta {
         Ok(meta) => {
@@ -266,6 +271,11 @@ struct Pending {
     memory: u64,
     #[serde(default)]
     start: Vec<String>,
+    #[serde(default)]
+    share: Option<String>,
+    /// The state is the one `berth stop` saved: delete it once used.
+    #[serde(default)]
+    consumed: bool,
 }
 
 /// Put the snapshot's files in place of the VM's (which must be stopped) and,
@@ -287,12 +297,16 @@ pub fn prepare_restore(paths: &Paths, name: &str) -> Result<Meta> {
     // The snapshot's disk may predate the polling driver (agent/src/kmod.rs):
     // start with the built-in one until the agent confirms it again.
     let _ = fs::remove_file(paths.guest().join("kmod-ready"));
+    // A suspended VM's state is for the disk just replaced.
+    let _ = fs::remove_dir_all(suspend_dir(paths));
     let state = dir.join(STATE);
     let pending = Pending {
         state: (meta.with_memory && state.exists()).then_some(state),
         cpus: meta.cpus,
         memory: meta.memory,
         start: meta.running.clone(),
+        share: meta.share.clone(),
+        consumed: false,
     };
     fs::write(restore_marker(paths), serde_json::to_vec(&pending)?)?;
     Ok(meta)
@@ -306,6 +320,10 @@ pub struct Restore {
     pub resources: Resources,
     /// Containers to start if the state can't be resumed (disk only).
     pub start: Vec<String>,
+    /// The share the state was saved with.
+    pub share: Option<crate::virtiofs::HomeShare>,
+    /// Delete `state` once the VM is up (a suspend's).
+    pub consumed: bool,
 }
 
 /// Take the pending restore, if any.
@@ -318,7 +336,49 @@ pub fn take_restore(paths: &Paths) -> Option<Restore> {
     } else {
         Resources::load(paths)
     };
-    Some(Restore { state: pending.state, resources, start: pending.start })
+    let share = pending.state.as_ref().and(pending.share.as_deref()).and_then(crate::virtiofs::HomeShare::parse);
+    Some(Restore { state: pending.state, resources, start: pending.start, share, consumed: pending.consumed })
+}
+
+/// Where `berth stop` keeps the VM's state for the next start.
+fn suspend_dir(paths: &Paths) -> PathBuf {
+    paths.data().join("suspended")
+}
+
+/// Suspend the running VM (in the daemon): pause it, save its state and
+/// leave a pending restore that the next start resumes. The VM must then be
+/// stopped without a guest shutdown, so its disk stays as saved.
+pub async fn suspend(paths: &Paths, res: &Resources) -> Result<()> {
+    let dir = suspend_dir(paths);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let running = crate::ports::running_containers().await.unwrap_or_default();
+    crate::vm::pause().await?;
+    if let Err(err) = crate::vm::save_state(dir.join(STATE)).await {
+        let _ = fs::remove_dir_all(&dir);
+        let _ = crate::vm::resume().await;
+        return Err(err);
+    }
+    let pending = Pending {
+        state: Some(dir.join(STATE)),
+        cpus: res.cpus,
+        memory: res.memory,
+        start: running,
+        share: crate::virtiofs::CURRENT.get().map(|s| s.as_str().to_string()),
+        consumed: true,
+    };
+    fs::write(restore_marker(paths), serde_json::to_vec(&pending)?)?;
+    Ok(())
+}
+
+/// The VM is suspended: the next start resumes it.
+pub fn is_suspended(paths: &Paths) -> bool {
+    suspend_dir(paths).join(STATE).exists() && restore_marker(paths).exists()
+}
+
+/// Forget a suspended state (after resuming it, or when it can't be).
+pub fn discard_suspended(paths: &Paths) {
+    let _ = fs::remove_dir_all(suspend_dir(paths));
 }
 
 /// After a restore that booted the disk: start the containers that were

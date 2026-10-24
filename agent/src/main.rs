@@ -12,6 +12,9 @@
 //!   engine <action> [name]\n enable|disable podman|nerdctl, status (engines.rs)
 //!   touch\n                 followed by newline-separated paths until EOF: raise
 //!                           inotify events for files changed on the Mac
+//!   info version\n          a hash of this binary (the host compares it with its own)
+//!   exit\n                  quit; systemd starts the agent binary again (a newer one,
+//!                           after a resumed VM)
 //!   sync\n                  flush filesystems (before a disk-only snapshot); replies "ok"
 //!   clock <unix seconds>\n  set the clock if it's off by more than 50 ms (the VM's
 //!                           clock stops while the Mac sleeps, and after restoring a
@@ -98,6 +101,15 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
     let header = read_header(&mut host)?;
     if header == "touch" {
         return touch_paths(host);
+    }
+    if header == "exit" {
+        let _ = host.write_all(b"ok");
+        std::process::exit(0);
+    }
+    if header == "info version" {
+        let me = std::fs::read("/proc/self/exe").unwrap_or_default();
+        let h = me.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3));
+        return host.write_all(format!("{h:016x}").as_bytes());
     }
     if header == "sync" {
         unsafe { libc::sync() };

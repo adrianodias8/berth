@@ -73,6 +73,19 @@ something here stops being true, fix it.
   - a disk-only restore boots, and Docker starts only containers with a
     restart policy, so berth starts the ones that were running.
 
+- **Suspend instead of shutdown:** `berth stop` reuses snapshot machinery.
+  It saves the state (about 0.5 GB for an idle VM), stops the VM without a
+  guest shutdown so the disk stays as saved, and leaves a pending restore
+  marked "consumed". Measured: stop 4 s instead of ~12, start 2.7 s with
+  containers still running.
+- **What a resumed VM needs:**
+  - the same devices it was saved with, so snapshots and suspends record
+    the home share (Apple's, berth's, or berth's with the polling driver)
+    and restores reproduce it;
+  - the clock, which is still at save time, set again;
+  - an agent restart if berth was updated meanwhile (`info version` against
+    the embedded agent's hash, then `exit`; systemd restarts it).
+
 ## Networking
 
 - **Container IPs need routes,** and routes need root. OrbStack uses per-network

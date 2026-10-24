@@ -43,8 +43,13 @@ struct Cli {
 enum Cmd {
     /// Start the VM and Docker engine
     Start,
-    /// Shut down the VM
-    Stop,
+    /// Stop the VM; the next start resumes it where it was (running
+    /// containers included) unless --shutdown
+    Stop {
+        /// Shut the guest down instead of saving its state
+        #[arg(long)]
+        shutdown: bool,
+    },
     /// Show VM and Docker status
     Status,
     /// List container domain names and their addresses
@@ -206,7 +211,7 @@ fn main() -> Result<()> {
     let paths = Paths::new();
     match command {
         Cmd::Start => start(&paths),
-        Cmd::Stop => stop(&paths),
+        Cmd::Stop { shutdown } => stop_with(&paths, shutdown),
         Cmd::Status => status(&paths),
         Cmd::Domains => domains(&paths),
         Cmd::Engine { action } => {
@@ -450,12 +455,17 @@ fn use_docker_context(paths: &Paths) {
     }
 }
 
+/// Stop with a guest shutdown (restores and other internal stops).
 fn stop(paths: &Paths) -> Result<()> {
+    stop_with(paths, true)
+}
+
+fn stop_with(paths: &Paths, shutdown: bool) -> Result<()> {
     if current_status(paths).is_none() {
         println!("berth is not running");
         return Ok(());
     }
-    let _: serde_json::Value = request(paths, &Request::Stop)?;
+    let _: serde_json::Value = request(paths, &Request::Stop { shutdown })?;
     print!("Stopping");
     std::io::stdout().flush()?;
     let deadline = Instant::now() + Duration::from_secs(40);
@@ -468,7 +478,11 @@ fn stop(paths: &Paths) -> Result<()> {
         println!();
         bail!("daemon still running; see {}", paths.daemon_log().display());
     }
-    println!(" stopped");
+    if snapshots::is_suspended(paths) {
+        println!(" suspended (the next start resumes it; berth stop --shutdown to shut down)");
+    } else {
+        println!(" stopped");
+    }
     Ok(())
 }
 

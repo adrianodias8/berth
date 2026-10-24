@@ -565,6 +565,24 @@ pub enum HomeShare {
 }
 
 impl HomeShare {
+    /// For snapshots and suspend: a saved state resumes only with the same device.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HomeShare::Apple => "apple",
+            HomeShare::Berth { poll_driver: true } => "berth-poll",
+            HomeShare::Berth { poll_driver: false } => "berth",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "apple" => Some(HomeShare::Apple),
+            "berth-poll" => Some(HomeShare::Berth { poll_driver: true }),
+            "berth" => Some(HomeShare::Berth { poll_driver: false }),
+            _ => None,
+        }
+    }
+
     pub fn describe(self) -> &'static str {
         match self {
             HomeShare::Apple => "Apple's virtiofs",
@@ -576,10 +594,17 @@ impl HomeShare {
 
 /// What this start uses, for `berth status`.
 pub static CURRENT: std::sync::OnceLock<HomeShare> = std::sync::OnceLock::new();
+/// Set before the VM is configured to resume a saved state: use exactly the
+/// share it was saved with.
+pub static FORCED: std::sync::OnceLock<HomeShare> = std::sync::OnceLock::new();
 
 /// Decide how to share home for this start (and leave the marker that makes
 /// a failed polling-driver attempt fall back next time).
 pub fn home_share(paths: &crate::paths::Paths) -> HomeShare {
+    if let Some(&forced) = FORCED.get() {
+        let _ = CURRENT.set(forced);
+        return forced;
+    }
     #[derive(serde::Deserialize, Default)]
     struct Config {
         file_sharing: Option<String>,

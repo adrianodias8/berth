@@ -29,7 +29,12 @@ unsafe extern "C" {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Status,
-    Stop,
+    /// Stop the VM: by default save its state for the next start to resume
+    /// (snapshots::suspend), falling back to a guest shutdown.
+    Stop {
+        #[serde(default)]
+        shutdown: bool,
+    },
     Domains,
     K8s { action: String },
     Machine { action: String, args: Vec<String> },
@@ -94,6 +99,20 @@ pub struct Status {
 static STOPPING: AtomicBool = AtomicBool::new(false);
 /// The VM resumed a snapshot's saved state: its clock is where it was saved.
 static RESTORED: AtomicBool = AtomicBool::new(false);
+
+/// A resumed VM runs the agent it was saved with; if berth has a newer one
+/// since, have it exit so systemd starts the new binary.
+async fn restart_outdated_agent() {
+    let Ok(mut guest) = guest_stream("info version").await else { return };
+    let mut running = String::new();
+    let _ = guest.read_to_string(&mut running).await;
+    if running.trim() != crate::provision::agent_version() {
+        eprintln!("agent: the resumed VM runs an older agent; restarting it");
+        if let Ok(mut guest) = guest_stream("exit").await {
+            let _ = guest.read_to_end(&mut Vec::new()).await;
+        }
+    }
+}
 
 /// Keep the guest's clock on the Mac's: the VM's clock stops while the Mac
 /// sleeps, and NTP in the guest takes a long time to notice.
@@ -166,6 +185,7 @@ async fn after_restore() {
         }
         if RESTORED.load(std::sync::atomic::Ordering::SeqCst) {
             sync_clock().await;
+            restart_outdated_agent().await;
             return;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -215,6 +235,10 @@ pub fn run(paths: Paths) -> Result<()> {
         None => Resources::load(&paths),
     };
     let state = restore.as_ref().and_then(|r| r.state.clone());
+    if let Some(share) = restore.as_ref().and_then(|r| r.share) {
+        let _ = crate::virtiofs::FORCED.set(share);
+    }
+    let consumed = restore.as_ref().is_some_and(|r| r.consumed);
     *RESTART_AFTER_BOOT.lock().unwrap() = restore.map(|r| r.start).unwrap_or_default();
     eprintln!(
         "{} VM: {} CPUs, {} MiB",
@@ -223,13 +247,20 @@ pub fn run(paths: Paths) -> Result<()> {
         res.memory >> 20
     );
     let (cpus, memory) = (res.cpus, res.memory);
-    vm::create_and_start(&paths, &res, state.as_deref(), |result| match result {
+    vm::create_and_start(&paths, &res, state.as_deref(), move |result| match result {
         Ok(true) => {
-            eprintln!("VM restored from snapshot");
+            eprintln!("VM {}", if consumed { "resumed where it was stopped" } else { "restored from snapshot" });
+            if consumed {
+                crate::snapshots::discard_suspended(&Paths::new());
+            }
             RESTORED.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         Ok(false) => {
             eprintln!("VM started");
+            if consumed {
+                // Couldn't resume (another macOS build?): booted its disk.
+                crate::snapshots::discard_suspended(&Paths::new());
+            }
             BOOTED.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         Err(err) => {
@@ -355,8 +386,8 @@ async fn handle_control(stream: UnixStream, cpus: usize, memory: u64) -> Result<
             };
             serde_json::to_string(&reply)?
         }
-        Request::Stop => {
-            tokio::spawn(shutdown());
+        Request::Stop { shutdown: full } => {
+            tokio::spawn(stop(!full, cpus, memory));
             "{\"ok\":true}".to_string()
         }
     };
@@ -518,6 +549,24 @@ async fn docker_ready() -> bool {
 }
 
 /// Graceful guest shutdown with a hard-stop fallback.
+/// `berth stop`: suspend if asked and possible, else shut the guest down.
+async fn stop(suspend: bool, cpus: usize, memory: u64) {
+    if suspend && !STOPPING.load(Ordering::SeqCst) {
+        let res = Resources { cpus, memory };
+        match crate::snapshots::suspend(&Paths::new(), &res).await {
+            Ok(()) => {
+                STOPPING.store(true, Ordering::SeqCst);
+                eprintln!("VM suspended; the next start resumes it");
+                let _ = vm::force_stop().await;
+                exit(&Paths::new());
+            }
+            // E.g. the Mac is locked (no key for the saved state).
+            Err(err) => eprintln!("can't suspend ({err:#}); shutting down"),
+        }
+    }
+    shutdown().await;
+}
+
 async fn shutdown() {
     if STOPPING.swap(true, Ordering::SeqCst) {
         return;

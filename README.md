@@ -16,6 +16,9 @@ from its code.
 **Engine**
 - Debian 13 VM on Virtualization.framework, booted straight into its kernel (no
   EFI/GRUB once set up): Docker ready about 3 s after `berth start`
+- `berth stop` saves the VM's state (while the Mac is unlocked) and the next
+  `berth start` resumes it in ~2.7 s with every container still running;
+  `berth stop --shutdown` for a full shutdown
 - Docker's own engine (docker-ce 29) with the Docker API at `~/.berth/run/docker.sock`,
   `/var/run/docker.sock` (via the helper) and a `berth` docker context made current on start
 - Official `docker`, Compose, Buildx and `kubectl` CLIs in `~/.berth/bin`, linked
@@ -150,7 +153,7 @@ berth machine create dev  # an Ubuntu machine; then: berth machine shell dev
 berth snapshot create before-migration   # then break things...
 berth snapshot restore before-migration  # ...and go back; also: list, delete
 berth shell               # SSH into the VM; `berth shell uname -a` runs a command
-berth stop
+berth stop                # suspends: the next start resumes; --shutdown to shut down
 berth delete --yes        # wipe the VM disk (containers, images, volumes)
 ```
 
