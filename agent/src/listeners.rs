@@ -42,7 +42,16 @@ static CURRENT: Mutex<Vec<Listener>> = Mutex::new(Vec::new());
 
 /// The host-network listeners as of the last poll (`info listeners`).
 pub fn current() -> Vec<Listener> {
-    CURRENT.lock().unwrap().clone()
+    let mut all = CURRENT.lock().unwrap().clone();
+    // Kubernetes LoadBalancer services take the same path to the Mac.
+    for (port, proto) in crate::k8s::load_balancer_ports() {
+        let proto = if proto == "udp" { Proto::Udp } else { Proto::Tcp };
+        let listener = Listener { proto, port, bind: "0.0.0.0".into() };
+        if !all.contains(&listener) {
+            all.push(listener);
+        }
+    }
+    all
 }
 
 pub fn run() {

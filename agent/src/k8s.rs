@@ -36,14 +36,33 @@ WantedBy=multi-user.target
 /// `<name>.<namespace>.svc.cluster.local` domains (domains.rs). The Mac
 /// routes the service network here, where kube-proxy takes over.
 pub fn services() -> Vec<(String, String, std::net::Ipv4Addr)> {
-    SERVICES.lock().unwrap().clone()
+    SERVICES.lock().unwrap().iter().map(|s| (s.name.clone(), s.namespace.clone(), s.ip)).collect()
+}
+
+/// Ports of LoadBalancer services, which k3s's service load balancer
+/// answers on the VM's own address: forwarded from the Mac's localhost
+/// like a host-network server (listeners.rs), as OrbStack does.
+pub fn load_balancer_ports() -> Vec<(u16, &'static str)> {
+    let mut ports: Vec<(u16, &'static str)> = SERVICES.lock().unwrap().iter().flat_map(|s| s.lb_ports.clone()).collect();
+    ports.sort();
+    ports.dedup();
+    ports
+}
+
+#[derive(PartialEq, Clone)]
+struct Service {
+    name: String,
+    namespace: String,
+    ip: std::net::Ipv4Addr,
+    /// (port, "tcp" | "udp") when it's a LoadBalancer.
+    lb_ports: Vec<(u16, &'static str)>,
 }
 
 /// The last list watch_services read: domain syncs use it rather than
 /// running kubectl (slow, and it can hang) under their lock.
-static SERVICES: std::sync::Mutex<Vec<(String, String, std::net::Ipv4Addr)>> = std::sync::Mutex::new(Vec::new());
+static SERVICES: std::sync::Mutex<Vec<Service>> = std::sync::Mutex::new(Vec::new());
 
-fn read_services() -> Vec<(String, String, std::net::Ipv4Addr)> {
+fn read_services() -> Vec<Service> {
     // Only once Kubernetes was ever set up: no systemctl forks otherwise.
     if !std::path::Path::new(UNIT).exists() || !active() {
         return Vec::new();
@@ -58,7 +77,25 @@ fn read_services() -> Vec<(String, String, std::net::Ipv4Addr)> {
         .flatten()
         .filter_map(|s| {
             let ip = s["spec"]["clusterIP"].as_str()?.parse().ok()?; // not headless ("None")
-            Some((s["metadata"]["name"].as_str()?.to_string(), s["metadata"]["namespace"].as_str()?.to_string(), ip))
+            let lb_ports = if s["spec"]["type"] == "LoadBalancer" {
+                s["spec"]["ports"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|p| {
+                        let proto = if p["protocol"] == "UDP" { "udp" } else { "tcp" };
+                        Some((u16::try_from(p["port"].as_u64()?).ok()?, proto))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            Some(Service {
+                name: s["metadata"]["name"].as_str()?.to_string(),
+                namespace: s["metadata"]["namespace"].as_str()?.to_string(),
+                ip,
+                lb_ports,
+            })
         })
         .collect()
 }
@@ -71,8 +108,12 @@ pub fn watch_services() {
         let now = read_services();
         let changed = *SERVICES.lock().unwrap() != now;
         if changed {
+            let ports_before = load_balancer_ports();
             *SERVICES.lock().unwrap() = now;
             crate::domains::request_sync();
+            if load_balancer_ports() != ports_before {
+                crate::engines::notify_host_sync();
+            }
         }
     }
 }

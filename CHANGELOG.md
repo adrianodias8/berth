@@ -6,6 +6,7 @@ are in the commit messages.
 ## Unreleased
 
 ### 2026-10-24
+- **Kubernetes:** LoadBalancer services on the Mac's localhost.
 - **More of the Mac in containers:** `/Volumes`, `/tmp` and `$TMPDIR`
   (`/var/folders`) bind mounts work, at the same paths.
 - **Fixed:** files created with O_EXCL|O_NOFOLLOW on bind mounts (busybox
