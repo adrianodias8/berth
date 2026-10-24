@@ -448,6 +448,36 @@ impl Duplex for TcpStream {
 }
 
 /// Copy both directions until each side is done, propagating half-closes.
+/// Connections a proxy serves at once; past it, new ones are closed rather
+/// than each getting threads until the agent runs out.
+pub(crate) struct Limit {
+    open: std::sync::atomic::AtomicUsize,
+    max: usize,
+}
+
+impl Limit {
+    pub(crate) const fn new(max: usize) -> Self {
+        Limit { open: std::sync::atomic::AtomicUsize::new(0), max }
+    }
+
+    /// Run `f` on a thread of its own, unless `max` are already running.
+    pub(crate) fn spawn(&'static self, name: &str, f: impl FnOnce() + Send + 'static) {
+        use std::sync::atomic::Ordering;
+        if self.open.fetch_add(1, Ordering::SeqCst) >= self.max {
+            self.open.fetch_sub(1, Ordering::SeqCst);
+            eprintln!("berth-agent: {name}: {} connections open, refusing more", self.max);
+            return;
+        }
+        let spawned = thread::Builder::new().spawn(move || {
+            f();
+            self.open.fetch_sub(1, Ordering::SeqCst);
+        });
+        if spawned.is_err() {
+            self.open.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 pub(crate) fn splice(a: impl Duplex, b: impl Duplex) -> io::Result<()> {
     let (mut a_read, mut b_write) = (a.try_clone_box()?, b.try_clone_box()?);
     let upstream = thread::spawn(move || {

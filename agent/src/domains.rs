@@ -383,24 +383,23 @@ fn apply(up: &Uplink, mapping: &BTreeMap<Ipv4Addr, Ipv4Addr>) -> io::Result<()> 
         exec("ip", &["addr", "add", &format!("{ip}/32"), "dev", &up.ifname, "label", &label]);
     }
 
-    // Our NAT chain runs first in PREROUTING; rebuilt on every sync.
-    exec_quiet("iptables", &["-t", "nat", "-N", NAT_CHAIN]);
-    if !exec_quiet("iptables", &["-t", "nat", "-C", "PREROUTING", "-j", NAT_CHAIN]) {
-        exec("iptables", &["-t", "nat", "-I", "PREROUTING", "1", "-j", NAT_CHAIN]);
-    }
-    exec("iptables", &["-t", "nat", "-F", NAT_CHAIN]);
-    let (http, https) = (crate::web::HTTP_PORT.to_string(), crate::web::HTTPS_PORT.to_string());
+    // Our NAT chain runs first in PREROUTING; rebuilt on every sync in one
+    // iptables-restore transaction (declaring the chain empties it), so
+    // there's never a moment with no DNAT.
+    let (http, https) = (crate::web::HTTP_PORT, crate::web::HTTPS_PORT);
+    let mut table = format!("*nat\n:{NAT_CHAIN} - [0:0]\n");
     for (svc, target) in mapping {
-        let svc = format!("{svc}/32");
         // Web ports go through the agent first (port detection, HTTPS); the
         // rest goes straight to the container.
-        for (port, to) in [("80", &http), ("443", &https)] {
-            exec(
-                "iptables",
-                &["-t", "nat", "-A", NAT_CHAIN, "-d", &svc, "-p", "tcp", "--dport", port, "-j", "REDIRECT", "--to-ports", to],
-            );
+        for (port, to) in [(80, http), (443, https)] {
+            table += &format!("-A {NAT_CHAIN} -d {svc}/32 -p tcp --dport {port} -j REDIRECT --to-ports {to}\n");
         }
-        exec("iptables", &["-t", "nat", "-A", NAT_CHAIN, "-d", &svc, "-j", "DNAT", "--to-destination", &target.to_string()]);
+        table += &format!("-A {NAT_CHAIN} -d {svc}/32 -j DNAT --to-destination {target}\n");
+    }
+    table += "COMMIT\n";
+    restore(&table);
+    if !exec_quiet("iptables", &["-t", "nat", "-C", "PREROUTING", "-j", NAT_CHAIN]) {
+        exec("iptables", &["-t", "nat", "-I", "PREROUTING", "1", "-j", NAT_CHAIN]);
     }
     // Docker's FORWARD policy drops new connections to unpublished container
     // ports. Let through anything we (or Docker) DNATed, and traffic from the
@@ -425,6 +424,25 @@ fn apply(up: &Uplink, mapping: &BTreeMap<Ipv4Addr, Ipv4Addr>) -> io::Result<()> 
         }
     }
     Ok(())
+}
+
+/// `iptables-restore --noflush`: changes only the chains `rules` names.
+fn restore(rules: &str) {
+    use std::io::Write;
+    let child = Command::new("iptables-restore")
+        .args(["-w", "--noflush"])
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let result = child.and_then(|mut child| {
+        child.stdin.take().expect("piped").write_all(rules.as_bytes())?;
+        child.wait_with_output()
+    });
+    match result {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => eprintln!("berth-agent: iptables-restore: {}", String::from_utf8_lossy(&out.stderr).trim()),
+        Err(err) => eprintln!("berth-agent: iptables-restore: {err}"),
+    }
 }
 
 /// iptables waits for the xtables lock (dockerd holds it at times) instead

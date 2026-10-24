@@ -150,6 +150,8 @@ struct Query {
     questions: Vec<Question>,
 }
 
+const MAX_QUESTIONS: u16 = 32;
+
 impl Query {
     fn parse(msg: &[u8]) -> Option<Self> {
         if msg.len() < 12 {
@@ -163,7 +165,9 @@ impl Query {
         let qdcount = u16::from_be_bytes([msg[4], msg[5]]);
         let mut pos = 12;
         let mut questions = Vec::new();
-        for _ in 0..qdcount {
+        // Real queries ask a handful; a flood of questions in one packet
+        // would only make the reply (and the work) bigger.
+        for _ in 0..qdcount.min(MAX_QUESTIONS) {
             let (name, next) = read_name(msg, pos)?;
             let fixed = msg.get(next..next + 4)?;
             questions.push(Question {

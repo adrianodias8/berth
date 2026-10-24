@@ -92,6 +92,8 @@ pub fn configure_docker() -> io::Result<()> {
     Ok(())
 }
 
+static CONNECTIONS: crate::Limit = crate::Limit::new(1024);
+
 pub fn run() {
     crate::tunnel::mount();
     // Retried: host.docker.internal is dead without it.
@@ -106,7 +108,7 @@ pub fn run() {
     };
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
-        std::thread::spawn(move || {
+        CONNECTIONS.spawn("hostnet", move || {
             if let Err(err) = forward(conn) {
                 eprintln!("berth-agent: hostnet: {err}");
             }

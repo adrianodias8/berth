@@ -139,6 +139,18 @@ fn create(
     if !valid_name(name) {
         return Err(io::Error::other("name: 1-12 characters, a-z 0-9 and -"));
     }
+    // The user and home go into shell commands and the .nspawn file as they
+    // are: only plain values.
+    let plain_user = !user.is_empty()
+        && user.len() <= 32
+        && !user.starts_with('-')
+        && user.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b));
+    if !plain_user || uid.is_empty() || !uid.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(io::Error::other(format!("user {user} ({uid}): only a-z, 0-9, _ . - names are supported")));
+    }
+    if !home.starts_with('/') || home.bytes().any(|b| b.is_ascii_control() || b"\'\"$`:\\".contains(&b)) {
+        return Err(io::Error::other(format!("home folder {home}: quotes, $, `, : and \\ aren't supported")));
+    }
     // Folders for an isolated machine: ones the VM sees (home, /Volumes,
     // /private/tmp...), as plain absolute paths for the .nspawn file.
     for m in mounts {

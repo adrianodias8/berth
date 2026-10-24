@@ -42,12 +42,6 @@ fix one, remove it here in the same change.
 
 ## Guest agent (`agent/`)
 
-- **No limits on connections.** Each connection to the web (`web.rs`) and
-  `host.docker.internal` (`hostnet.rs`) proxies gets its own thread, with no
-  limit.
-- **DNAT rules are flushed and rebuilt on each sync.** That leaves a short
-  window with no DNAT, during which a service IP reaches the guest itself.
-  Use `iptables-restore --noflush`, or diff against the existing rules.
 - **Label domains can claim any `.local` name**, such as `nas.local` (they
   can't take a name berth generated for another container). Consider an
   opt-in for names outside `berth.local`.
@@ -60,17 +54,16 @@ fix one, remove it here in the same change.
 - **The machines' sshd is installed on first `ssh <name>.berth`** with the
   distro's package manager: it needs the internet, and the first connection
   waits for it.
-- **Machine creation puts the user name and home into `sh -c` and `.nspawn`
-  files unquoted.** These values come only from the Mac user.
 - **Integrated machines are trusted with the Mac**: any user in one can run
   commands on the Mac with `mac` (`/run/berth/mac.sock` is 0666), and berth
   enters them with nsenter, running the machine's own binaries as the VM's
   root. For untrusted code use an isolated machine: no `mac`, home or SSH
   agent, and berth reaches into it only through its own systemd, so its
   limits hold (which is why isolated machines need a systemd distribution).
-- **`mac` doesn't pass window resizes** to the command on the Mac.
-- **mDNS:** no cap on the number of questions per query; the goodbye socket
-  briefly shares port 5353; names cached under a wildcard get no goodbye.
+- **`mac` doesn't pass window resizes** to the command on the Mac (it needs a resize message in
+  the `mac` protocol, which only sends the size at the start).
+- **mDNS:** the goodbye socket briefly shares port 5353; names cached under
+  a wildcard get no goodbye.
 
 ## Networking
 

@@ -26,6 +26,9 @@ const PREFERRED: [u16; 10] = [80, 8080, 3000, 8000, 5000, 5173, 4000, 8888, 9000
 /// lifetime of the container (its init PID).
 static CACHE: Mutex<Option<HashMap<String, (u32, u16)>>> = Mutex::new(None);
 
+/// Both ports' connections together.
+static CONNECTIONS: crate::Limit = crate::Limit::new(1024);
+
 pub fn run(table: Shared) {
     for (port, https) in [(HTTP_PORT, false), (HTTPS_PORT, true)] {
         let table = table.clone();
@@ -44,7 +47,7 @@ fn serve(port: u16, https: bool, table: Shared) {
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let table = table.clone();
-        std::thread::spawn(move || {
+        CONNECTIONS.spawn("web", move || {
             if let Err(err) = handle(conn, https, &table) {
                 eprintln!("berth-agent: web: {err}");
             }
