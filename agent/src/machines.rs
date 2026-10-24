@@ -124,7 +124,8 @@ fn create(name: &str, spec: &str, user: &str, uid: &str, home: &str) -> io::Resu
     std::fs::write(
         format!("/etc/systemd/nspawn/{name}.nspawn"),
         format!(
-            "[Exec]\nBoot=yes\nPrivateUsers=no\n\n[Files]\nBind={home}\nBindReadOnly={}\n\n[Network]\nVirtualEthernetExtra={ve}:eth0\n",
+            "[Exec]\nBoot=yes\nPrivateUsers=no\n{}\n[Files]\nBind={home}\nBindReadOnly={}\n\n[Network]\nVirtualEthernetExtra={ve}:eth0\n",
+            kill_signal(name),
             crate::mac::DIR
         ),
     )?;
@@ -132,6 +133,24 @@ fn create(name: &str, spec: &str, user: &str, uid: &str, home: &str) -> io::Resu
     allow_forwarding();
     sh(&format!("machinectl enable {name} >/dev/null 2>&1; machinectl start {name}"))?;
     Ok(())
+}
+
+/// How nspawn asks the machine's init to shut down, as a .nspawn line. Its
+/// default is systemd's SIGRTMIN+3, which busybox init (Alpine) ignores:
+/// that machine would keep running until killed. Busybox powers off on
+/// SIGUSR2.
+fn kill_signal(name: &str) -> &'static str {
+    let init = std::fs::read_link(format!("{MACHINES}/{name}/sbin/init")).unwrap_or_default();
+    if init.file_name().is_some_and(|f| f == "busybox") { "KillSignal=SIGUSR2\n" } else { "" }
+}
+
+/// Stop a machine through its unit: nspawn sends the init its KillSignal
+/// and waits (`machinectl poweroff` sends systemd's own signal instead).
+pub fn stop(name: &str) -> io::Result<()> {
+    if !valid_name(name) {
+        return Err(io::Error::other("bad name"));
+    }
+    sh(&format!("systemctl stop systemd-nspawn@{name}.service")).map(|_| ())
 }
 
 pub fn start(name: &str) -> io::Result<()> {
@@ -186,10 +205,18 @@ pub fn integrate_all() {
         integrate_files(&name);
         let nspawn = format!("/etc/systemd/nspawn/{name}.nspawn");
         let bind = format!("BindReadOnly={}", crate::mac::DIR);
-        if let Ok(config) = std::fs::read_to_string(&nspawn)
-            && !config.contains(&bind)
-        {
-            let _ = std::fs::write(&nspawn, config.replacen("[Files]\n", &format!("[Files]\n{bind}\n"), 1));
+        if let Ok(config) = std::fs::read_to_string(&nspawn) {
+            let mut updated = config.clone();
+            if !updated.contains(&bind) {
+                updated = updated.replacen("[Files]\n", &format!("[Files]\n{bind}\n"), 1);
+            }
+            let signal = kill_signal(&name);
+            if !signal.is_empty() && !updated.contains("KillSignal=") {
+                updated = updated.replacen("[Exec]\n", &format!("[Exec]\n{signal}"), 1);
+            }
+            if updated != config {
+                let _ = std::fs::write(&nspawn, updated);
+            }
         }
         let dir = crate::mac::DIR;
         let _ = sh(&format!(
@@ -306,7 +333,7 @@ pub fn handle(action: &str, mut host: UnixStream) -> io::Result<()> {
     let result: io::Result<String> = match action {
         "create" => create(arg(0), arg(1), arg(2), arg(3), arg(4)).map(|_| "ok".into()),
         "start" => start(arg(0)).map(|_| "ok".into()),
-        "stop" => sh(&format!("machinectl poweroff {}", arg(0))).map(|_| "ok".into()),
+        "stop" => stop(arg(0)).map(|_| "ok".into()),
         "delete" => {
             let name = arg(0);
             if !valid_name(name) {

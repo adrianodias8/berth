@@ -44,8 +44,6 @@ fix one, remove it here in the same change.
 - **Label domains can claim any `.local` name**, such as `nas.local` (they
   can't take a name berth generated for another container). Consider an
   opt-in for names outside `berth.local`.
-- **Alpine machines don't shut down with the VM** (OpenRC under nspawn), so
-  `berth stop` waits 20 s and then forces the VM off.
 - **The machines' sshd is installed on first `ssh <name>.berth`** with the
   distro's package manager: it needs the internet, and the first connection
   waits for it.
