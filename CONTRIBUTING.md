@@ -47,6 +47,8 @@ next to OrbStack or Docker Desktop. Only one of them should own
 | `src/` | the `berth` CLI, daemon and root helper (macOS) |
 | `agent/` | `berth-agent`, a static Linux binary embedded in `berth` and run in the VM |
 | `guest/user-data.yaml` | first-boot provisioning (cloud-init) |
+| `guest/berth-debug.sh`, `guest/berth-ca-sync.sh` | the debug shell; the Mac's CAs into the VM's trust store |
+| `.github/workflows/` | release builds |
 | `guest/kmod/virtiofs_poll/` | the polling virtio-fs guest driver (GPL-2.0) |
 | `app/` | Berth.app (SwiftUI) |
 | `scripts/` | build and signing |
@@ -104,7 +106,7 @@ Logs are in `~/.berth/log/` (`daemon.log`, `console.log`); the helper's is
 Measure first and keep the numbers.
 
 - `bench/compare.sh` runs the same suite on berth and OrbStack (startup, idle
-  CPU and memory, ports, bind mounts) and writes `bench/results/<date>.md`.
+  CPU and memory, ports, bind mounts) and writes `bench/results/<date>-<HHMM>.md`.
 - `bench/fs/` covers file sharing: small files, large files, per-request
   latency, and the polling driver's counters.
 - `BERTH_FS_STATS=1` and `BERTH_FS_TRACE=1` show where file-sharing time goes.

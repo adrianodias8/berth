@@ -54,6 +54,8 @@ from its code.
   Settings): Docker networks get IPv6 subnets, NAT'd out of the VM. Reaching the
   internet over IPv6 needs IPv6 on the Mac; without it, IPv6 works between
   containers, the VM and the Mac
+- Published ports follow Docker's bind address (`-p 8080:80` is on the LAN, as with
+  Docker); `"ports": "localhost"` keeps them on the Mac
 - Docker pulls and pushes trust the CA certificates the Mac trusts (a company
   root, a TLS-inspecting proxy, a private registry), and use the Mac's proxy settings (`"proxy"`: auto, none or a URL;
   a change applies at the next start)
@@ -134,7 +136,7 @@ images, volumes, networks, Kubernetes, machines, terminals, logs, files and stat
   slower than OrbStack, and DDEV's `composer create-project` fails (the project
   folder shows as root-owned in containers).
 - On berth's own share, Composer-heavy work is still ~1.4x slower than OrbStack
-  (DDEV Drupal CMS `composer install` ~9 s vs 6.6 s, `drush site:install` ~40 s
+  (DDEV Drupal CMS `composer install` ~9 s vs 6.6 s, `drush site:install` 40-46 s
   vs 37 s); page loads are on par
   (`bench/results/2026-10-23-ddev-drupal.md`).
 - Memory used by a workload isn't returned to macOS after it ends (OrbStack in the
@@ -189,9 +191,10 @@ its own. Closing the window keeps it in the menu bar.
   - **Stats**: live CPU and memory charts
 - **Images** (with pull and progress), **Volumes**, **Networks** (subnets, container
   counts, IP routing status)
-- **Kubernetes**: enable/disable, pods and services
-- **Machines**: create, start, stop and delete Linux machines, a terminal in each, and
-  a shell in the VM
+- **Kubernetes**: enable/disable, pods
+- **Machines**: create (distro, Intel, cloud-init, isolation and its folders), start,
+  stop, restart, rename, delete, info, logs and Open in Finder; a terminal in each,
+  and a shell in the VM
 - **Snapshots**: create, restore and delete
 - **Settings**: CPUs, memory, file sharing, IPv6 for containers, Docker's proxy,
   volumes and machines in Finder, Podman and nerdctl, and whether stopping keeps
@@ -209,7 +212,8 @@ Launch arguments pick the starting screen, e.g.
 ```sh
 berth start               # first start downloads Debian and installs Docker (a few minutes)
 docker context use berth  # or: docker --context berth ps
-berth status              # berth info: versions, settings, paths (for bug reports)
+berth status              # exits 1 when stopped; berth info: versions, settings, paths
+berth open web            # a container's (or machine's, volume's) files in Finder; berth open: ~/Berth
 berth restart             # stop (shutting down) and start: applies settings
 berth logs -f             # daemon log; also: berth logs console|helper
 berth completions zsh > ~/.zfunc/_berth   # or bash, fish
@@ -358,6 +362,9 @@ refuses any other name, so trusting it cannot be abused for real sites.
 - `src/dockerapi.rs`: the Docker socket bridge (maps `/tmp`, `/var/folders` bind sources);
   agent `shares.rs` mounts `/Volumes`, `/private/tmp`, `/private/var/folders`
 - `src/config.rs`: `berth config`; `src/proxy.rs` (agent: `proxy.rs`): Docker's proxy
+- `src/paths.rs`: the `~/.berth` layout
+- agent `inroot.rs`: files inside a machine opened as the machine sees them (its
+  symlinks can't point the VM's root elsewhere)
 - `src/context.rs`: the `berth` docker context
 - agent: `boot.rs` (direct boot, kernel export), `docker.rs` (Docker API client),
   `engine.rs` (docker-ce install), `memory.rs` (balloon, memory pressure),
@@ -367,7 +374,8 @@ refuses any other name, so trusting it cannot be abused for real sites.
 - `guest/user-data.yaml`: guest provisioning (Docker, mounts, Rosetta binfmt, agent unit)
 - `app/`: the SwiftUI app (SwiftTerm for terminals, Swift Charts for stats)
 
-Logs are in `~/.berth/log/` (`daemon.log`, `console.log`).
+Logs are in `~/.berth/log/` (`daemon.log`, `console.log`); the helper's is
+`/var/log/dev.berth.helper.log`. `berth logs [-f] [console|helper]` shows them.
 
 ## Roadmap
 

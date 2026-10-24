@@ -280,18 +280,36 @@ something here stops being true, fix it.
 
 | | berth | OrbStack |
 |---|---|---|
-| startup | ~3.1 s | 2.2–4.6 s |
-| idle memory (system-wide) | +1.0 GB | +1.4 GB |
-| idle CPU | similar | similar |
-| localhost forward | ~20 Gbit/s | ~30 Gbit/s |
-| bind-mount extract (20k files) | 7.9 s (Apple's) / 2.3 s (own share + polling) | 2.3 s |
-| DDEV composer install | 8.9–9.2 s (own share + polling) | 6.6 s |
+| startup | 3.3–3.6 s | 2.6–4.4 s |
+| idle memory (system-wide) | +1.37 GB (+1.9 with Podman and nerdctl on) | +1.28 GB |
+| idle CPU | 3.0 % | 2.2 % |
+| localhost forward | ~20 Gbit/s | ~31 Gbit/s |
+| bind-mount extract (20k files) | 7.9 s (Apple's) / 2.4–2.7 s (own share + polling) | 2.3 s |
+| DDEV composer install | 9.0–9.2 s (own share + polling) | 6.6 s |
+
+(`bench/results/2026-10-24-compare.md`.)
 
 Neither returns workload memory to macOS within 2 minutes. Docker volumes are
 ~15x faster than any bind mount (they live on the VM's own disk).
 
 ## Testing pitfalls we hit
 
+- **The kernel NFS server can't export overlay mounts** (containers' root
+  filesystems), and Debian 13 has no unfs3 (nfs-ganesha needs the same
+  export support). Samba reads them like any folder: `~/Berth` is SMB,
+  mounted through NetFS with a password.
+- **Container root filesystems come and go with the container.** A bind
+  mount of one keeps a stopped container's overlay alive, and its restart
+  then mounts the same upper directory twice. A recursive bind of Docker's
+  mount area made a slave (`mount --make-rslave`) follows its mounts and
+  unmounts instead.
+- **Running a machine's own binaries through nsenter runs them as the VM's
+  unconfined root** (no capability bounding set, seccomp or device rules):
+  for an untrusted machine go through its systemd (`systemd-run -M`).
+  `machinectl shell` drops a command's output without a terminal.
+- **busybox tar creates files with O_CREAT|O_EXCL|O_NOFOLLOW**, and macOS
+  rejects O_NOFOLLOW together with O_NOFOLLOW_ANY (EINVAL). A benchmark that
+  doesn't check a step's status times its failure.
 - **Never `rm` a script while it runs,** or a cleanup path inside your own
   benchmark folder.
 - **Timing:** `bash`'s `time` on a subshell with `exec 2>/dev/null` prints

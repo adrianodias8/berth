@@ -16,8 +16,9 @@ and boot messages). `berth shell` opens a shell in the VM.
   didn't answer within 90 s, so berth started again with home on Apple's
   share, mounted directly from the kernel command line. In safe mode the
   agent puts the guest's mount setup back to plain virtiofs. The next normal
-  start uses berth's share again, but if the mount helper was involved, on
-  the built-in driver until a berth update changes the helper.
+  start uses berth's share again, but if the guest's mount helper
+  (`mount.berth`, for the polling driver) was involved, on the built-in
+  driver until a berth update changes the helper.
   `console.log` shows what the failed boot was doing.
 - **Still failing.** Rule out berth's file sharing:
   `BERTH_FILE_SHARING=apple berth start`. If that works, try
@@ -62,8 +63,7 @@ and boot messages). `berth shell` opens a shell in the VM.
   sshd in the machine on first use (with the distro's package manager, so
   it needs the internet), and starts the machine if it's stopped.
 - **`mac: /run/berth/mac.sock: ...`** in a machine made before berth had
-  the `mac` command: restart the machine (`berth machine stop <name>`, then
-  start) so it gets `/run/berth`.
+  the `mac` command: `berth machine restart <name>` so it gets `/run/berth`.
 - **"isolated machines need a distribution with systemd"**: berth reaches
   into isolated machines only through their own systemd (Alpine has none).
   Isolated machines have no `mac` command, SSH agent or home folder.
@@ -76,7 +76,7 @@ and boot messages). `berth shell` opens a shell in the VM.
 - **`x509: certificate signed by unknown authority` on a pull.** berth gives
   the VM the CA certificates macOS trusts, from the System and login
   keychains, at each start: trust the CA on the Mac (Keychain Access), then
-  `berth stop --shutdown && berth start`. `daemon.log` says how many were
+  `berth restart`. `daemon.log` says how many were
   passed. Containers don't get them; add them to your image.
 
 ## Files
@@ -136,4 +136,5 @@ sudo rm /usr/local/bin/berth  # and each other link that points into ~/.berth or
 ```
 
 Remove the `Include ~/.berth/ssh/config` line from `~/.ssh/config`, then
-delete `~/.berth` (the VM, snapshots and settings) and Berth.app.
+delete `~/.berth` (the VM, snapshots and settings), the empty `~/Berth`
+folder, and Berth.app.

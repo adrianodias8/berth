@@ -164,7 +164,7 @@ DDEV re-measured on 2026-10-24, `bench/results/2026-10-24-compare.md`):
 | read all 20k files (`compare.sh`) | 2.9 | – | 2.0 | 0.8 |
 | 4 parallel extracts | 20.4 | 12.8 | 7.7 | – |
 | DDEV `composer install` | fails* | 16 | 8.9–9.2 | 6.6 |
-| DDEV `drush site:install` | fails* | 67 | 39–41 | 37 |
+| DDEV `drush site:install` | fails* | 67 | 39–46 | 37 |
 
 \* `create-project` aborts on Apple's share (ownership), so the later steps
 can't run.

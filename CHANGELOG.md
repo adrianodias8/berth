@@ -8,8 +8,15 @@ are in the commit messages.
 ### 2026-10-24
 - **Kubernetes:** LoadBalancer services on the Mac's localhost.
 - **Machines:** isolated machines (`--isolated`, `--mount`,
-  `--isolate-network`), and `restart`, `rename`, `info`, `logs`, `push`,
-  `pull`; also in the app's New Machine sheet.
+  `--isolate-network`; systemd distributions), and `restart`, `rename`,
+  `info`, `logs`, `push`, `pull`; in the app too, except push/pull.
+- **Ports:** `"ports": "localhost"` keeps published ports off the LAN.
+- **CLI:** `berth open`, `berth status` exits 1 when stopped, `machine
+  delete` asks first.
+- **Security:** isolated machines are entered only through their own
+  systemd, their network rules apply before they start, and files berth
+  touches inside machines resolve inside them; `~/Berth` no longer follows
+  links out of the share.
 - **Finder:** running containers' root filesystems at `~/Berth/containers`;
   `~/Berth` is now SMB with a password (no helper needed), files show as yours.
 - **App:** import from OrbStack or Docker Desktop (Settings), and Intel /
@@ -24,7 +31,7 @@ are in the commit messages.
   is edited through symlinks (with a backup); `berth import` keeps anonymous
   volumes' data, doesn't copy volumes that are Mac folders, and reports
   failures; `mac` sessions hang up their command when the machine side goes
-  away; ~/Berth is mounted by the root helper and only from reserved ports;
+  away; ~/Berth got a stricter mount (replaced the same day by SMB);
   proxy changes never restart Docker; machines autostart reliably at boot;
   the app merges its settings into config.json; fewer idle forks in the VM.
 
@@ -47,7 +54,7 @@ are in the commit messages.
 - **Alpine machines** stop with `berth machine stop` and with the VM (busybox
   init gets SIGUSR2, not systemd's signal).
 - **Security:** the guest agent only takes orders from the Mac (vsock CID 2).
-- **Finder:** Docker volumes and machines at `~/Berth`, over NFS from the VM.
+- **Finder:** Docker volumes and machines at `~/Berth` (NFS at first, SMB since).
 - **Debug shell:** `berth debug <container>`, a shell with the VM's tools in
   any container's namespaces, on a throwaway overlay.
 - **File sharing:** berth's own virtio-fs device is the default on macOS 27,

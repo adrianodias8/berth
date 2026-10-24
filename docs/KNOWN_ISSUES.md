@@ -11,9 +11,13 @@ fix one, remove it here in the same change.
   which is usual but not guaranteed (eviction past 4096 cached files is
   skipped only for removed nodes). Reopening by name is refused rather than
   getting the wrong file.
-- **Only the Docker API's container create is rewritten** for `/tmp` and
-  `/var/folders` bind sources: Podman's own (libpod) API and machines don't
-  get the mapping (use `/private/tmp/...`), and machines see only home.
+- **`/tmp` and `/var/folders` bind sources are mapped only in container
+  creates** (Docker's API and Podman's libpod one): machines don't get the
+  mapping (use `/private/tmp/...`). Integrated machines see only home;
+  isolated ones only their `--mount` folders.
+- **The extra shares are read-write**: the VM can write to `/Volumes`
+  (external and network disks), `/private/tmp` and `/private/var/folders`
+  (`$TMPDIR`, caches), as it can to home.
 - **Missing operations.** RENAME2 with `RENAME_NOREPLACE` returns EINVAL
   (macOS `renamex_np(RENAME_EXCL)` could do it); MKNOD is ENOSYS, so `bind()`
   of a Unix socket in a shared folder fails. No xattrs, no locks beyond what
@@ -65,13 +69,8 @@ fix one, remove it here in the same change.
   agent, and berth reaches into it only through its own systemd, so its
   limits hold (which is why isolated machines need a systemd distribution).
 - **`mac` doesn't pass window resizes** to the command on the Mac.
-- **Docker/Podman API calls have no read timeout** (`docker.rs`): a hung
-  `podman.service` stalls the domain sync.
 - **mDNS:** no cap on the number of questions per query; the goodbye socket
   briefly shares port 5353; names cached under a wildcard get no goodbye.
-- **`web.rs` doesn't cache a failed port detection:** each request to a
-  container with no web server re-probes every port.
-- **`hostnet.rs` never retries if binding port 2401 fails at boot.**
 
 ## Networking
 
@@ -85,6 +84,8 @@ fix one, remove it here in the same change.
 - **IPv6 isn't routed from the Mac to containers.** Container IPv6 addresses
   are reachable from the VM and other containers, not from the Mac (the root
   helper routes IPv4 subnets only). Published ports work over IPv6 as before.
+- **Published ports are on the LAN by default** (Docker's semantics); set
+  `"ports": "localhost"` to keep them on the Mac.
 - **No IPv6 for names:** berth's DNS and mDNS answer A records only
   (`host.docker.internal`, `*.berth.local`), and there is no IPv6
   `host.docker.internal`.
@@ -104,10 +105,9 @@ fix one, remove it here in the same change.
   - a Docker binding only on `::1` maps to 127.0.0.1.
 
 - **`~/Berth` (SMB) gives root in the VM** to whoever has the share's
-  password (`~/.berth/files-password`, readable only by the Mac user). Absolute
-  symlinks in `~/Berth/containers` resolve in the VM, not the container: the
-  share follows links so the containers' folders (links to their root
-  filesystems) work.
+  password (`~/.berth/files-password`, readable only by the Mac user). Links
+  are followed only within the share, so a container's absolute symlinks
+  show as missing in `~/Berth/containers`.
 
 ## Root helper and downloads
 
@@ -132,10 +132,6 @@ fix one, remove it here in the same change.
   reads happen inside `Task.detached` (start, machine actions, settings,
   stats), and that pool has a thread per core. Run blocking work on threads
   or dispatch queues and resume through continuations, as `stream()` does.
-- **The helper install runs NSAppleScript on the main thread**, so the app
-  freezes during the password prompt.
-- **The log view re-measures the whole text on every chunk**, which can
-  beachball with chatty containers. Batch updates, or use an NSTextView.
 - **Terminal sessions:** the exec session's fields are unsynchronized, and a
   quick tab switch during the exec upgrade can leak a thread and an fd.
   Sessions also end on every tab switch.
@@ -145,7 +141,11 @@ fix one, remove it here in the same change.
   (long names, xattrs).
 - **`TLSTrust.cached` is written off the main actor.**
 - **UI:**
-  - pull "Cancel" only hides the sheet;
-  - container Delete doesn't ask for confirmation;
-  - logs aren't re-attached after a restart;
-  - a failed file preview replaces the table.
+  - logs re-attach when a container's running state changes, which a very
+    quick restart can slip between;
+  - a failed file preview replaces the table;
+  - snapshot actions' busy state lives in the view: leaving and coming back
+    mid-operation allows a second one;
+  - the Kubernetes screen shows pods, not services;
+  - the CLI's `machine push/pull`, `config unset`, `delete` and import's
+    `--images/--volumes/--containers` aren't in the app.
