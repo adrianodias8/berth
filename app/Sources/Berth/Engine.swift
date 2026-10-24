@@ -33,12 +33,15 @@ struct BerthStatus: Decodable, Equatable {
     /// `memory` has been returned to macOS.
     let memoryUsed: UInt64?
     let memoryAllowed: UInt64?
+    /// Why file sharing is slower than it could be, if it is.
+    let fileSharingNote: String?
 
     enum CodingKeys: String, CodingKey {
         case pid, vm, docker, cpus, memory, ports
         case containerIps = "container_ips"
         case memoryUsed = "memory_used"
         case memoryAllowed = "memory_allowed"
+        case fileSharingNote = "file_sharing_note"
     }
 
     /// The root helper predates abilities this berth needs; reinstall it.

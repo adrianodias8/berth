@@ -696,6 +696,25 @@ fn poll_driver_ready(paths: &crate::paths::Paths) -> bool {
     ok
 }
 
+/// Why file sharing is slower than it could be this run, if it is: berth's
+/// share on the built-in driver (`berth status`, the app's banner). The
+/// polling driver is built in the VM (agent/src/kmod.rs), which needs the
+/// internet, and used from the next start.
+pub fn slow_note(paths: &crate::paths::Paths) -> Option<String> {
+    if *CURRENT.get()? != (HomeShare::Berth { poll_driver: false }) || std::env::var("BERTH_FS_POLL_DRIVER").is_ok() {
+        return None;
+    }
+    let guest = paths.guest();
+    let read = |name: &str| std::fs::read_to_string(guest.join(name)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    Some(match (read("kmod-ready"), read("boot/release"), read("kmod-error")) {
+        (Some(ready), Some(release), _) if ready == release => {
+            "the faster polling driver is ready: restart berth to use it".to_string()
+        }
+        (_, _, Some(error)) => format!("on the slower built-in driver; the polling driver: {error}"),
+        _ => "on the slower built-in driver while the polling driver is built (needs the internet, a few minutes); then restart berth".to_string(),
+    })
+}
+
 /// The tunnel's device tag (fuse/tunnel.rs, agent/src/tunnel.rs).
 const TUNNEL_TAG: &str = "berth-tunnel";
 

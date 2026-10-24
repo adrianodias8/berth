@@ -95,6 +95,20 @@ fn marker() -> Option<PathBuf> {
     Some(std::env::current_exe().ok()?.parent()?.join("kmod-ready"))
 }
 
+/// Why the polling driver isn't there (`~/.berth/guest/kmod-error`), for
+/// `berth status` and the app; removed once it is.
+fn report(error: Option<&str>) {
+    let Some(path) = marker().map(|m| m.with_file_name("kmod-error")) else { return };
+    match error {
+        Some(error) => {
+            let _ = std::fs::write(path, format!("{error}\n"));
+        }
+        None => {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 fn sh(cmd: &mut Command) -> io::Result<()> {
     let out = cmd.output()?;
     if !out.status.success() {
@@ -174,10 +188,12 @@ pub fn run() {
         return;
     }
     if std::fs::read_to_string(HELPER_FAILED).ok().as_deref() == Some(helper_hash.as_str()) {
+        report(Some("the VM didn't come up with it last time; off until berth is updated"));
         return;
     }
     if let Err(err) = install_mount_helper() {
         eprintln!("berth-agent: kmod: mount helper: {err}");
+        report(Some(&format!("mount helper: {err}")));
         return;
     }
     let release = release();
@@ -187,10 +203,12 @@ pub fn run() {
                 if let Some(marker) = marker() {
                     let _ = std::fs::write(marker, format!("{release}\n"));
                 }
+                report(None);
                 return;
             }
             Err(err) => {
                 eprintln!("berth-agent: kmod: building the polling driver: {err}");
+                report(Some(&format!("building it failed ({err}); retrying")));
                 // Offline, most likely: try again later.
                 std::thread::sleep(Duration::from_secs(if attempt < 3 { 60 } else { 1800 }));
             }

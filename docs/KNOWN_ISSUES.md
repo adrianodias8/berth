@@ -27,7 +27,8 @@ fix one, remove it here in the same change.
 - **Module build needs network and ~200 MB.** The agent fetches kernel
   headers and gcc with apt. Offline, or on a kernel Debian no longer ships
   headers for, the share runs on the built-in driver (slower). Shipping
-  prebuilt modules per Debian kernel would avoid both.
+  prebuilt modules per Debian kernel would avoid both. `berth status` and the app
+  say when that happens, and why.
 - **Safe mode needs direct boot.** If the guest kernel was never exported
   (EFI boot only), a broken mount setup can't be rescued automatically.
 - **A snapshot restore takes ~16 s**, mostly stopping the current VM. A

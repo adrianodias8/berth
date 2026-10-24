@@ -807,6 +807,9 @@ fn status(paths: &Paths) -> Result<()> {
             if !s.file_sharing.is_empty() {
                 println!("Files:   {}", s.file_sharing);
             }
+            if !s.file_sharing_note.is_empty() {
+                println!("         note: {}", s.file_sharing_note);
+            }
             if !s.ports.is_empty() {
                 println!("Ports:   {}", s.ports.join(", "));
             }

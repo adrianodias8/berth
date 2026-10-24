@@ -95,6 +95,9 @@ pub struct Status {
     /// How the home folder is shared (virtiofs.rs).
     #[serde(default)]
     pub file_sharing: String,
+    /// Why file sharing is slower than it could be, if it is.
+    #[serde(default)]
+    pub file_sharing_note: String,
 }
 
 static STOPPING: AtomicBool = AtomicBool::new(false);
@@ -459,6 +462,7 @@ async fn handle_control(stream: UnixStream, cpus: usize, memory: u64) -> Result<
                 memory_used: crate::memory::GUEST_USED.load(std::sync::atomic::Ordering::Relaxed),
                 memory_allowed: crate::memory::TARGET.load(std::sync::atomic::Ordering::Relaxed),
                 file_sharing: crate::virtiofs::CURRENT.get().map_or("", |s| s.describe()).to_string(),
+                file_sharing_note: crate::virtiofs::slow_note(&Paths::new()).unwrap_or_default(),
             })?
         }
         Request::K8s { action } => {

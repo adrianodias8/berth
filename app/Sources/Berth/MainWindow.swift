@@ -71,6 +71,7 @@ struct MainWindow: View {
             .overlay(alignment: .bottom) {
                 VStack(spacing: 0) {
                     HelperUpdateBanner()
+                    FileSharingBanner()
                     ErrorBanner()
                 }
             }
@@ -158,6 +159,30 @@ struct HelperUpdateBanner: View {
                         if case let .failed(error) = await Setup.installPrivileged(force: true) { message = error }
                     }
                 }
+            }
+            .padding(10)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+            .padding([.horizontal, .top], 12)
+        }
+    }
+}
+
+/// File sharing on the slower built-in driver (src/virtiofs.rs slow_note):
+/// why, and a restart once the faster one is ready.
+struct FileSharingBanner: View {
+    @EnvironmentObject var engine: Engine
+    @State private var dismissed: String?
+
+    var body: some View {
+        if let note = engine.status?.fileSharingNote, !note.isEmpty, note != dismissed {
+            HStack {
+                Image(systemName: "tortoise.fill").foregroundStyle(.orange)
+                Text("File sharing: \(note)").lineLimit(3).textSelection(.enabled)
+                Spacer()
+                if note.contains("restart berth to use it") {
+                    Button("Restart") { engine.restart() }
+                }
+                Button { dismissed = note } label: { Image(systemName: "xmark") }.buttonStyle(.borderless)
             }
             .padding(10)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
