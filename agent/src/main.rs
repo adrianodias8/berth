@@ -10,6 +10,9 @@
 //!   k8s <action>\n          enable|disable|status|kubeconfig (k8s.rs)
 //!   machine <action>\n      then JSON args until EOF: create|start|stop|delete|list (machines.rs)
 //!   engine <action> [name]\n enable|disable podman|nerdctl, status (engines.rs)
+//!   host-token <hex>\n      the token requests to the Mac carry (mac.rs); replies "ok"
+//!   machine-ssh <name>\n    connect to a machine's sshd, starting it if needed (mac.rs)
+//!   files\n                 export volumes and machines over NFS for ~/Berth (files.rs)
 //!   touch\n                 followed by newline-separated paths until EOF: raise
 //!                           inotify events for files changed on the Mac
 //!   info version\n          a hash of this binary (the host compares it with its own)
@@ -35,11 +38,13 @@ mod docker;
 mod domains;
 mod engine;
 mod engines;
+mod files;
 mod hostnet;
 mod ipv6;
 mod k8s;
 mod kmod;
 mod listeners;
+mod mac;
 mod machines;
 mod mdns;
 mod memory;
@@ -60,6 +65,11 @@ const MAX_HEADER: usize = 512;
 static TABLE: OnceLock<domains::Shared> = OnceLock::new();
 
 fn main() {
+    // Machines link /usr/local/bin/mac to this binary (mac.rs).
+    let mut args = std::env::args();
+    if args.next().is_some_and(|a| a.rsplit('/').next() == Some("mac")) {
+        std::process::exit(mac::client(args.collect()));
+    }
     let table = TABLE.get_or_init(|| Arc::new(Default::default()));
     hostnet::setup();
     // docker-ce before anything talks to Docker; the watchers retry anyway.
@@ -71,6 +81,9 @@ fn main() {
     thread::spawn(boot::tune);
     thread::spawn(boot::export_kernel);
     thread::spawn(kmod::run);
+    thread::spawn(install_debug_helper);
+    mac::run();
+    thread::spawn(machines::integrate_all);
     thread::spawn(move || domains::run(t1));
     thread::spawn(move || mdns::run(t2));
     thread::spawn(move || dns::run(t3));
@@ -99,10 +112,42 @@ fn main() {
     }
 }
 
+/// `berth debug` runs this over SSH (guest/berth-debug.sh).
+fn install_debug_helper() {
+    use std::os::unix::fs::PermissionsExt;
+    const PATH: &str = "/usr/local/libexec/berth-debug";
+    const SCRIPT: &str = include_str!("../../guest/berth-debug.sh");
+    if std::fs::read_to_string(PATH).ok().as_deref() == Some(SCRIPT) {
+        return;
+    }
+    let tmp = format!("{PATH}.tmp");
+    let installed = std::fs::create_dir_all("/usr/local/libexec")
+        .and_then(|_| std::fs::write(&tmp, SCRIPT))
+        .and_then(|_| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)))
+        .and_then(|_| std::fs::rename(&tmp, PATH));
+    if let Err(err) = installed {
+        eprintln!("berth-agent: installing {PATH}: {err}");
+    }
+}
+
 fn handle(fd: OwnedFd) -> io::Result<()> {
     // vsock fds support the same read/write/shutdown calls as unix sockets.
     let mut host = UnixStream::from(fd);
     let header = read_header(&mut host)?;
+    if let Some(token) = header.strip_prefix("host-token ") {
+        mac::set_token(token);
+        return host.write_all(b"ok");
+    }
+    if let Some(name) = header.strip_prefix("machine-ssh ") {
+        return mac::machine_ssh(name, host);
+    }
+    if header == "files" {
+        let reply = match files::ensure() {
+            Ok(()) => "ok".to_string(),
+            Err(err) => format!("error: {err}"),
+        };
+        return host.write_all(reply.as_bytes());
+    }
     if header == "touch" {
         return touch_paths(host);
     }
@@ -462,12 +507,21 @@ pub(crate) fn widen_vsock_buffer(fd: RawFd) {
     }
 }
 
+/// Accept a connection from the Mac. Anything in the VM could otherwise
+/// connect over vsock loopback and give the agent orders, containers
+/// included.
 fn vsock_accept(listener: &OwnedFd) -> io::Result<OwnedFd> {
     let raw = std::os::fd::AsRawFd::as_raw_fd(listener);
-    let fd = unsafe { libc::accept4(raw, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC) };
+    let mut peer: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+    let mut len = size_of::<libc::sockaddr_vm>() as libc::socklen_t;
+    let fd = unsafe { libc::accept4(raw, (&raw mut peer).cast(), &mut len, libc::SOCK_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    widen_vsock_buffer(fd);
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    if peer.svm_cid != hostnet::VMADDR_CID_HOST {
+        return Err(io::Error::other(format!("refused a connection from vsock CID {}", peer.svm_cid)));
+    }
+    widen_vsock_buffer(std::os::fd::AsRawFd::as_raw_fd(&fd));
+    Ok(fd)
 }

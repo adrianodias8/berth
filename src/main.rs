@@ -2,9 +2,11 @@ mod cli_tools;
 mod context;
 mod daemon;
 mod engines;
+mod files;
 mod fuse;
 mod helper;
 mod k8s;
+mod macexec;
 mod machines;
 mod memory;
 mod paths;
@@ -12,12 +14,13 @@ mod ports;
 mod provision;
 mod routes;
 mod snapshots;
+mod sshconfig;
 mod tls;
 mod virtiofs;
 mod vm;
 mod watch;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Stdio};
@@ -78,6 +81,14 @@ enum Cmd {
     K8s {
         #[command(subcommand)]
         action: K8sCmd,
+    },
+    /// A root shell inside a container with the VM's tools (bash, ps, ss,
+    /// curl, apt...), even in images that have none; its files are at
+    /// /container. Nothing is added to the container
+    Debug {
+        container: String,
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
     },
     /// Open a shell in the VM, or run a command there
     Shell {
@@ -141,6 +152,9 @@ enum MachineCmd {
     Stop { name: String },
     /// Delete a machine and its files
     Delete { name: String },
+    /// SSH's ProxyCommand for `<machine>.berth` (see ~/.berth/ssh/config)
+    #[command(hide = true)]
+    Proxy { host: String },
 }
 
 #[derive(Subcommand)]
@@ -252,6 +266,7 @@ fn main() -> Result<()> {
                 MachineCmd::Start { name } => machines::simple(&paths, "start", &name),
                 MachineCmd::Stop { name } => machines::simple(&paths, "stop", &name),
                 MachineCmd::Delete { name } => machines::simple(&paths, "delete", &name),
+                MachineCmd::Proxy { host } => machine_proxy(&paths, &host),
             }
         }
         Cmd::K8s { action } => {
@@ -269,6 +284,7 @@ fn main() -> Result<()> {
         }
         Cmd::Snapshot { action } => snapshot(&paths, action),
         Cmd::Shell { command } => shell(&paths, &command),
+        Cmd::Debug { container, command } => debug(&paths, &container, &command),
         Cmd::Delete { yes } => delete(&paths, yes),
         Cmd::Tls { action: TlsCmd::Trust } => tls::trust(&paths),
         Cmd::Tls { action: TlsCmd::Untrust } => tls::untrust(&paths),
@@ -463,6 +479,28 @@ fn start(paths: &Paths) -> Result<()> {
     }
     println!(" ready in {:.0?}", started.elapsed());
     use_docker_context(paths);
+    match sshconfig::install(paths) {
+        Ok(true) => println!("Added `Include ~/.berth/ssh/config` to ~/.ssh/config: ssh berth, ssh <machine>.berth"),
+        Ok(false) => {}
+        Err(err) => eprintln!("Could not write the SSH config: {err:#}"),
+    }
+    Ok(())
+}
+
+/// Connect stdin/stdout to a machine's sshd: SSH's ProxyCommand.
+fn machine_proxy(paths: &Paths, host: &str) -> Result<()> {
+    let name = host.strip_suffix(".berth").unwrap_or(host);
+    let mut sock = std::os::unix::net::UnixStream::connect(paths.machine_ssh_socket())?;
+    writeln!(sock, "{name}")?;
+    let mut to_machine = sock.try_clone()?;
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut to_machine);
+        let _ = to_machine.shutdown(std::net::Shutdown::Write);
+    });
+    // Straight to fd 1: std's stdout is line-buffered, and SSH packets
+    // would wait in it for a newline byte.
+    let mut stdout = std::mem::ManuallyDrop::new(unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(1) });
+    std::io::copy(&mut sock, &mut *stdout)?;
     Ok(())
 }
 
@@ -584,11 +622,27 @@ fn shell(paths: &Paths, command: &[String]) -> Result<()> {
     ssh(paths, command, command.is_empty())
 }
 
+/// `berth debug`: guest/berth-debug.sh, installed by the agent.
+fn debug(paths: &Paths, container: &str, command: &[String]) -> Result<()> {
+    if current_status(paths).is_none() {
+        bail!("berth is not running");
+    }
+    // Names and IDs as Docker and Podman allow them.
+    if container.is_empty() || !container.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')) {
+        bail!("bad container name: {container}");
+    }
+    let quote = |w: &str| format!("'{}'", w.replace('\'', "'\\''"));
+    let mut remote = vec!["sudo".to_string(), "/usr/local/libexec/berth-debug".into(), container.into()];
+    // ssh hands the joined arguments to the VM's shell.
+    remote.extend(command.iter().map(|w| quote(w)));
+    ssh(paths, &remote, command.is_empty() || std::io::stdin().is_terminal())
+}
+
 /// SSH into the VM, optionally running `command`; `tty` for interactive use.
 fn ssh(paths: &Paths, command: &[String], tty: bool) -> Result<()> {
     // SSH rides the daemon's vsock bridge, so it needs no guest IP address.
     let user = std::env::var("USER")?;
-    let proxy = format!("ProxyCommand=nc -U {}", paths.ssh_socket().display());
+    let proxy = format!("ProxyCommand=nc -U \"{}\"", paths.ssh_socket().display());
     let mut ssh = Command::new("ssh");
     ssh.arg("-i")
         .arg(paths.ssh_key())

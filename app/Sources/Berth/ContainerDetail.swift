@@ -5,6 +5,8 @@ struct ContainerDetail: View {
     @EnvironmentObject var engine: Engine
     let container: Container
     @State private var tab = Tab(rawValue: UserDefaults.standard.string(forKey: "openTab") ?? "") ?? .info
+    /// `berth debug`: the VM's tools in the container, for images without a shell.
+    @State private var debugShell = false
 
     enum Tab: String, CaseIterable {
         case info = "Info", logs = "Logs", terminal = "Terminal", files = "Files", stats = "Stats"
@@ -38,7 +40,22 @@ struct ContainerDetail: View {
                 case .logs: LogsView(containerID: container.id)
                 case .terminal:
                     if container.isRunning {
-                        ContainerTerminal(containerID: container.id)
+                        VStack(alignment: .leading, spacing: 8) {
+                            Picker("", selection: $debugShell) {
+                                Text("Shell").tag(false)
+                                Text("Debug shell").tag(true)
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .fixedSize()
+                            .padding(.horizontal, 16)
+                            .help("Debug shell: a root shell with the VM's tools (bash, ps, curl, apt) in the container's namespaces, even for images without a shell. Its files are at /container.")
+                            if debugShell {
+                                MachineTerminal(args: ["debug", container.id]).id("debug-\(container.id)")
+                            } else {
+                                ContainerTerminal(containerID: container.id)
+                            }
+                        }
                     } else {
                         EmptyHint(icon: "terminal", text: "Start the container to open a terminal.")
                     }

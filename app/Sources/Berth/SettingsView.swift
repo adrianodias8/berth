@@ -40,6 +40,11 @@ struct SettingsView: View {
                     Text("Docker networks get IPv6 subnets. Internet access over IPv6 needs IPv6 on this Mac.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                VStack(alignment: .leading) {
+                    Toggle("Volumes and machines in Finder", isOn: Binding(get: { config.finder ?? true }, set: { config.finder = $0 ? nil : false }))
+                    Text("Mounted at ~/Berth while Berth runs.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 if config != saved {
                     HStack {
                         Text("Restart Berth to apply.").foregroundStyle(.secondary)

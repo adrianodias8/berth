@@ -5,6 +5,10 @@
 //! Each machine gets a veth NIC named eth0 inside (so the distro's own network
 //! config applies) and ve-<name> outside, which systemd-networkd's stock
 //! 80-container-ve.network serves with DHCP and NAT.
+//!
+//! Integration with the Mac (mac.rs): /run/berth is bind-mounted in, with the
+//! `mac` command's and the SSH agent's sockets; `/usr/local/bin/mac` links to
+//! the agent; and sshd is installed on first `ssh <name>.berth`.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -119,11 +123,134 @@ fn create(name: &str, spec: &str, user: &str, uid: &str, home: &str) -> io::Resu
     std::fs::create_dir_all("/etc/systemd/nspawn")?;
     std::fs::write(
         format!("/etc/systemd/nspawn/{name}.nspawn"),
-        format!("[Exec]\nBoot=yes\nPrivateUsers=no\n\n[Files]\nBind={home}\n\n[Network]\nVirtualEthernetExtra={ve}:eth0\n"),
+        format!(
+            "[Exec]\nBoot=yes\nPrivateUsers=no\n\n[Files]\nBind={home}\nBindReadOnly={}\n\n[Network]\nVirtualEthernetExtra={ve}:eth0\n",
+            crate::mac::DIR
+        ),
     )?;
+    integrate_files(name);
     allow_forwarding();
     sh(&format!("machinectl enable {name} >/dev/null 2>&1; machinectl start {name}"))?;
     Ok(())
+}
+
+pub fn start(name: &str) -> io::Result<()> {
+    if !valid_name(name) {
+        return Err(io::Error::other("bad name"));
+    }
+    allow_forwarding();
+    sh(&format!("machinectl start {name}")).map(|_| ())
+}
+
+/// The `mac` link and SSH_AUTH_SOCK, in the machine's files (it needn't run).
+fn integrate_files(name: &str) {
+    let root = format!("{MACHINES}/{name}");
+    if let Ok(agent) = std::env::current_exe() {
+        // The agent runs from the shared home, which machines see at the same path.
+        let link = format!("{root}/usr/local/bin/mac");
+        if std::fs::read_link(&link).ok().as_deref() != Some(agent.as_path()) {
+            let _ = std::fs::create_dir_all(format!("{root}/usr/local/bin"));
+            let _ = std::fs::remove_file(&link);
+            let _ = std::os::unix::fs::symlink(&agent, &link);
+        }
+    }
+    let profile = format!(
+        "# berth: the Mac's SSH agent, unless the session brought its own.\n\
+         [ -n \"$SSH_AUTH_SOCK\" ] || [ ! -S {0}/ssh-agent.sock ] || export SSH_AUTH_SOCK={0}/ssh-agent.sock\n",
+        crate::mac::DIR
+    );
+    let _ = std::fs::create_dir_all(format!("{root}/etc/profile.d"));
+    let _ = std::fs::write(format!("{root}/etc/profile.d/berth.sh"), profile);
+}
+
+/// Bring machines made before an integration feature up to date: files,
+/// the /run/berth bind in their .nspawn file and, if running, live.
+pub fn integrate_all() {
+    let Ok(entries) = std::fs::read_dir(MACHINES) else { return };
+    // iptables rules don't survive a reboot; Docker makes DOCKER-USER once
+    // it's up, which may be a while on boot.
+    std::thread::spawn(|| {
+        for _ in 0..120 {
+            if Command::new("iptables").args(["-w", "-L", "DOCKER-USER", "-n"]).output().is_ok_and(|o| o.status.success()) {
+                allow_forwarding();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    });
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || !valid_name(&name) || !entry.path().is_dir() {
+            continue;
+        }
+        integrate_files(&name);
+        let nspawn = format!("/etc/systemd/nspawn/{name}.nspawn");
+        let bind = format!("BindReadOnly={}", crate::mac::DIR);
+        if let Ok(config) = std::fs::read_to_string(&nspawn)
+            && !config.contains(&bind)
+        {
+            let _ = std::fs::write(&nspawn, config.replacen("[Files]\n", &format!("[Files]\n{bind}\n"), 1));
+        }
+        let dir = crate::mac::DIR;
+        let _ = sh(&format!(
+            "leader=$(machinectl show {name} -p Leader --value 2>/dev/null) && [ -n \"$leader\" ] && \
+             ! nsenter -t \"$leader\" -m -- test -S {dir}/mac.sock && machinectl bind --read-only --mkdir {name} {dir}; true"
+        ));
+    }
+}
+
+/// Install and start sshd in a running machine, with the berth key for the
+/// user, for `ssh <name>.berth` (VS Code's Remote-SSH included).
+pub fn ensure_sshd(name: &str) -> io::Result<()> {
+    if !valid_name(name) {
+        return Err(io::Error::other("bad name"));
+    }
+    let root = format!("{MACHINES}/{name}");
+    // The machine's user (create() wrote it there) and the key the Mac uses
+    // for the VM, from that user's VM account.
+    let user = std::fs::read_to_string(format!("{root}/etc/sudoers.d/berth"))
+        .ok()
+        .and_then(|s| s.split_whitespace().next().map(str::to_string))
+        .filter(|u| u.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')))
+        .ok_or_else(|| io::Error::other("no berth user in the machine"))?;
+    let key = std::fs::read_to_string(format!("/home/{user}/.ssh/authorized_keys"))
+        .ok()
+        .and_then(|k| k.lines().find(|l| l.starts_with("ssh-")).map(str::to_string))
+        .filter(|k| k.bytes().all(|b| b.is_ascii_alphanumeric() || b" +/=@._-:".contains(&b)))
+        .ok_or_else(|| io::Error::other("no SSH key for the VM user"))?;
+    eprintln!("berth-agent: machines: setting up sshd in {name}");
+    // The agent's PATH (Debian's, merged /usr) lacks /bin, where Alpine's
+    // tools are. Accounts made without a password are locked ("!"), which
+    // sshd refuses even for keys: "*" is no password, not locked. sshd's
+    // start goes to /dev/null: a daemon holding our pipe would keep us
+    // waiting for its end.
+    let script = format!(
+        "set -e; export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
+         if [ ! -x /usr/sbin/sshd ]; then \
+           if command -v apt-get >/dev/null; then export DEBIAN_FRONTEND=noninteractive; apt-get update -qq; apt-get install -y -qq openssh-server >/dev/null; \
+           elif command -v dnf >/dev/null; then dnf install -y -q openssh-server; \
+           elif command -v apk >/dev/null; then apk add -q openssh-server; \
+           elif command -v pacman >/dev/null; then pacman -Sy --noconfirm --needed openssh >/dev/null; \
+           elif command -v zypper >/dev/null; then zypper -q in -y openssh-server; fi; \
+         fi; \
+         h=$(getent passwd {user} | cut -d: -f6); mkdir -p \"$h/.ssh\"; \
+         grep -qxF '{key}' \"$h/.ssh/authorized_keys\" 2>/dev/null || echo '{key}' >> \"$h/.ssh/authorized_keys\"; \
+         chown -R \"$(id -u {user}):$(id -g {user})\" \"$h/.ssh\"; chmod 700 \"$h/.ssh\"; chmod 600 \"$h/.ssh/authorized_keys\"; \
+         sed -i 's/^{user}:!\\{{1,2\\}}:/{user}:*:/' /etc/shadow; \
+         {{ if [ -d /run/systemd/system ]; then systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd; \
+         elif command -v rc-update >/dev/null; then rc-update add sshd default; rc-service sshd start || true; fi; }} </dev/null >/dev/null 2>&1"
+    );
+    let run = format!("nsenter -t \"$(machinectl show {name} -p Leader --value)\" -a -- /bin/sh -c '{}'", script.replace('\'', "'\\''"));
+    // A machine that just booted may not have its network yet.
+    let mut result = sh(&run);
+    for _ in 0..3 {
+        if result.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        result = sh(&run);
+    }
+    result.map(|_| ())
 }
 
 #[derive(Serialize)]
@@ -178,7 +305,7 @@ pub fn handle(action: &str, mut host: UnixStream) -> io::Result<()> {
     let arg = |i: usize| args.get(i).map(String::as_str).unwrap_or("");
     let result: io::Result<String> = match action {
         "create" => create(arg(0), arg(1), arg(2), arg(3), arg(4)).map(|_| "ok".into()),
-        "start" => sh(&format!("machinectl start {}", arg(0))).map(|_| "ok".into()),
+        "start" => start(arg(0)).map(|_| "ok".into()),
         "stop" => sh(&format!("machinectl poweroff {}", arg(0))).map(|_| "ok".into()),
         "delete" => {
             let name = arg(0);

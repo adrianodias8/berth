@@ -89,6 +89,8 @@ struct BerthConfig: Codable, Equatable {
     var ipv6: Bool?
     /// "shutdown" (default, like OrbStack) or "suspend": what `berth stop` does.
     var stop: String?
+    /// Docker volumes and machines in Finder at ~/Berth (src/files.rs); default on.
+    var finder: Bool?
 
     enum CodingKeys: String, CodingKey {
         case cpus
@@ -96,6 +98,7 @@ struct BerthConfig: Codable, Equatable {
         case fileSharing = "file_sharing"
         case ipv6
         case stop
+        case finder
     }
 
     static func load() -> BerthConfig {

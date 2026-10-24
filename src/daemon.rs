@@ -99,9 +99,12 @@ pub struct Status {
 
 static STOPPING: AtomicBool = AtomicBool::new(false);
 
+/// A suspend is saving the VM (it then stops, or shuts down if it fails).
+static SUSPENDING: AtomicBool = AtomicBool::new(false);
+
 /// The VM is on its way down: no more snapshots.
 pub fn stopping() -> bool {
-    STOPPING.load(Ordering::SeqCst)
+    STOPPING.load(Ordering::SeqCst) || SUSPENDING.load(Ordering::SeqCst)
 }
 
 fn yes() -> bool {
@@ -126,10 +129,29 @@ async fn restart_outdated_agent() {
 
 /// Keep the guest's clock on the Mac's: the VM's clock stops while the Mac
 /// sleeps, and NTP in the guest takes a long time to notice.
+/// Also hands the agent the token for requests to the Mac (macexec.rs),
+/// again after it restarts.
 async fn keep_clock() {
+    // On a first boot the agent starts only once Docker is installed.
+    while guest_stream("info memory").await.is_err() {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    crate::macexec::push_token().await;
+    tokio::spawn(async {
+        // Retried: on a first boot apt may still be busy in the VM.
+        for attempt in 0..20 {
+            match crate::files::mount(&Paths::new()).await {
+                Ok(()) => return,
+                Err(err) if attempt == 0 => eprintln!("files: ~/Berth not mounted yet: {err:#}"),
+                Err(_) => {}
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
     loop {
         tokio::time::sleep(Duration::from_secs(15)).await;
         sync_clock().await;
+        crate::macexec::push_token().await;
     }
 }
 
@@ -267,7 +289,7 @@ pub fn run(paths: Paths) -> Result<()> {
     pid_file.set_len(0)?;
     std::io::Write::write_all(&mut &pid_file, std::process::id().to_string().as_bytes())?;
     std::mem::forget(pid_file);
-    for sock in [paths.control_socket(), paths.docker_socket(), paths.ssh_socket(), paths.podman_socket()] {
+    for sock in [paths.control_socket(), paths.docker_socket(), paths.ssh_socket(), paths.podman_socket(), paths.machine_ssh_socket()] {
         let _ = std::fs::remove_file(sock);
     }
 
@@ -347,6 +369,7 @@ async fn serve(paths: Paths, cpus: usize, memory: u64) -> Result<()> {
     bridge(UnixListener::bind(paths.docker_socket())?, DOCKER_TARGET, "docker");
     bridge(UnixListener::bind(paths.ssh_socket())?, SSH_TARGET, "ssh");
     bridge(UnixListener::bind(paths.podman_socket())?, PODMAN_TARGET, "podman");
+    crate::macexec::serve_machine_ssh(UnixListener::bind(paths.machine_ssh_socket())?);
     crate::watch::start();
     tokio::spawn(ports::run());
     tokio::spawn(crate::memory::run(memory));
@@ -573,6 +596,9 @@ async fn host_connection(fd: std::os::fd::OwnedFd, tls: Option<tokio_rustls::Tls
                 }
             }
         }
+        ["mac-exec", token] if crate::macexec::token_ok(token) => crate::macexec::exec(guest).await?,
+        ["ssh-agent", token] if crate::macexec::token_ok(token) => crate::macexec::ssh_agent(guest).await?,
+        ["mac-exec" | "ssh-agent", _] => anyhow::bail!("refused a request to the Mac without the agent's token"),
         ["memory-pressure"] => crate::memory::on_pressure(max_memory).await,
         ["sync"] => ports::trigger(),
         _ => anyhow::bail!("bad header {header:?}"),
@@ -611,7 +637,14 @@ async fn docker_ready() -> bool {
 /// Graceful guest shutdown with a hard-stop fallback.
 /// `berth stop`: suspend if asked and possible, else shut the guest down.
 async fn stop(suspend: bool, cpus: usize, memory: u64) {
+    // Before the VM (its NFS server) goes away.
+    let _ = tokio::task::spawn_blocking(|| crate::files::unmount(&Paths::new())).await;
+    // Set before suspend waits for a running snapshot, so a snapshot queued
+    // behind it is refused rather than run on a VM being stopped.
     if suspend && !STOPPING.load(Ordering::SeqCst) {
+        if SUSPENDING.swap(true, Ordering::SeqCst) {
+            return; // already suspending
+        }
         let res = Resources { cpus, memory };
         match crate::snapshots::suspend(&Paths::new(), &res).await {
             Ok(()) => {
@@ -621,17 +654,22 @@ async fn stop(suspend: bool, cpus: usize, memory: u64) {
                 exit(&Paths::new());
             }
             // E.g. the Mac is locked (no key for the saved state).
-            Err(err) => eprintln!("can't suspend ({err:#}); shutting down"),
+            Err(err) => {
+                eprintln!("can't suspend ({err:#}); shutting down");
+                SUSPENDING.store(false, Ordering::SeqCst);
+            }
         }
     }
     shutdown().await;
 }
 
 async fn shutdown() {
-    if STOPPING.swap(true, Ordering::SeqCst) {
+    // A suspend in progress stops the VM itself (or calls this if it fails).
+    if SUSPENDING.load(Ordering::SeqCst) || STOPPING.swap(true, Ordering::SeqCst) {
         return;
     }
     eprintln!("stopping VM");
+    let _ = tokio::task::spawn_blocking(|| crate::files::unmount(&Paths::new())).await;
     if let Err(err) = vm::request_stop().await {
         eprintln!("stop request failed: {err:#}");
     }
@@ -647,8 +685,9 @@ async fn shutdown() {
 }
 
 fn exit(paths: &Paths) -> ! {
+    crate::files::unmount(paths);
     crate::routes::clear();
-    for path in [paths.control_socket(), paths.docker_socket(), paths.ssh_socket(), paths.podman_socket(), paths.pid_file()] {
+    for path in [paths.control_socket(), paths.docker_socket(), paths.ssh_socket(), paths.podman_socket(), paths.machine_ssh_socket(), paths.pid_file()] {
         let _ = std::fs::remove_file(path);
     }
     std::process::exit(0);

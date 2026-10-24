@@ -72,6 +72,10 @@ impl Paths {
     pub fn ssh_socket(&self) -> PathBuf {
         self.run().join("ssh.sock")
     }
+    /// `berth machine proxy` → a machine's sshd (macexec.rs).
+    pub fn machine_ssh_socket(&self) -> PathBuf {
+        self.run().join("machine-ssh.sock")
+    }
     pub fn pid_file(&self) -> PathBuf {
         self.run().join("berthd.pid")
     }
