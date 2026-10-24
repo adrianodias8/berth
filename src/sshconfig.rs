@@ -75,3 +75,43 @@ fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn home(name: &str) -> Paths {
+        let home = std::env::temp_dir().join(format!("berth-ssh-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".berth/ssh")).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        Paths { root: home.join(".berth"), home }
+    }
+
+    #[test]
+    fn symlinked_config_is_edited_where_it_points() {
+        let paths = home("link");
+        let dotfiles = paths.home.join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::write(dotfiles.join("ssh_config"), "Host work\n  User me\n").unwrap();
+        std::os::unix::fs::symlink(dotfiles.join("ssh_config"), paths.home.join(".ssh/config")).unwrap();
+        assert!(install(&paths).unwrap());
+        assert!(std::fs::symlink_metadata(paths.home.join(".ssh/config")).unwrap().file_type().is_symlink(), "still a link");
+        let text = std::fs::read_to_string(dotfiles.join("ssh_config")).unwrap();
+        assert!(text.starts_with(INCLUDE) && text.ends_with("Host work\n  User me\n"), "{text}");
+        assert_eq!(std::fs::read_to_string(dotfiles.join("config.berth-backup")).unwrap(), "Host work\n  User me\n");
+        assert!(!install(&paths).unwrap(), "only once");
+        std::fs::remove_dir_all(&paths.home).ok();
+    }
+
+    #[test]
+    fn non_utf8_config_is_kept() {
+        let paths = home("latin1");
+        let original = b"# caf\xe9\nHost x\n".to_vec();
+        std::fs::write(paths.home.join(".ssh/config"), &original).unwrap();
+        assert!(install(&paths).unwrap());
+        let text = std::fs::read(paths.home.join(".ssh/config")).unwrap();
+        assert!(text.ends_with(&original), "the original bytes stay after the Include");
+        std::fs::remove_dir_all(&paths.home).ok();
+    }
+}
