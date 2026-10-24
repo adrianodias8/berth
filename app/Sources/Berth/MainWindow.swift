@@ -190,7 +190,8 @@ struct ContainersView: View {
     @EnvironmentObject var engine: Engine
     @State private var selection: Container.ID?
     @State private var appliedOpenContainer = false
-    @State private var filter = ""
+    // `-filter shop` starts filtered (scripted screenshots).
+    @State private var filter = UserDefaults.standard.string(forKey: "filter") ?? ""
 
     private var groups: [(project: String?, containers: [Container])] {
         let visible = engine.containers.filter {

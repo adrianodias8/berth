@@ -11,6 +11,63 @@ how far an open-source take on the same idea could go: built with AI assistance,
 written in Rust, and matching OrbStack's behavior from the outside rather than
 from its code.
 
+## Quick start
+
+You need an Apple Silicon Mac, Xcode and rustup (see [Requirements](#requirements)).
+
+**1. Build and open the app**
+
+```sh
+brew install rustup && rustup default stable
+rustup target add aarch64-unknown-linux-musl
+./scripts/build-app.sh
+open target/Berth.app            # or copy it to /Applications first
+```
+
+On first launch, Berth walks you through setup. One administrator prompt
+installs the route helper and links the `berth` CLI into `/usr/local/bin`. You
+can also trust the local HTTPS certificate there. Then click **Start**, or run
+`berth start`. The first start downloads Debian and installs Docker, which
+takes a few minutes. Later starts take seconds.
+
+**2. Run containers**
+
+```sh
+docker context use berth                 # berth's own context; OrbStack/Docker Desktop are untouched
+docker run -d --name web -p 8080:80 nginx
+curl localhost:8080                      # published ports are on the Mac's localhost
+curl http://web.berth.local              # every container has a domain, no ports needed
+```
+
+Compose projects get `<service>.<project>.berth.local`. For example, `web` in
+project `shop` is at `http://web.shop.berth.local`. With `berth tls trust`, the
+same names work over `https://`.
+
+**3. Look inside**
+
+```sh
+berth debug web     # a shell with tools inside the container, even a distroless one
+berth open web      # the container's files in Finder (everything is under ~/Berth)
+```
+
+**4. A Linux machine**
+
+```sh
+berth machine create dev    # Ubuntu; --distro debian:trixie, fedora:44, ...; --arch amd64 for Intel
+ssh dev.berth               # or: berth machine shell dev
+```
+
+Inside, your Mac home folder is mounted and `mac <command>` runs a command on
+the Mac. Use `--isolated` for a machine that can't see the Mac at all.
+
+**5. Moving over and safety nets**
+
+```sh
+berth import orbstack                   # or docker-desktop: images, volumes, networks, containers
+berth snapshot create before-upgrade    # the whole VM, instantly; berth snapshot restore before-upgrade
+berth config set memory_mib 8192        # settings (also in the app); berth restart applies them
+```
+
 ## Features
 
 **Engine**
@@ -203,12 +260,44 @@ its own. Closing the window keeps it in the menu bar.
   IP route helper, trust the HTTPS certificate, and import from OrbStack or Docker
   Desktop. New machines can be Intel (Rosetta) and take a cloud-init file
 
+### In pictures
+
+Containers are grouped by Compose project. Each one shows its domains, IP and
+ports. The ports and domains are links.
+
+![Container info](docs/images/container-info.png)
+
+Logs follow live. Terminal opens a shell in the container. Debug shell works
+even in images that have no shell of their own, because it brings the VM's
+tools with it.
+
+![Container logs](docs/images/container-logs.png)
+![Debug shell](docs/images/debug-shell.png)
+
+Machines are full Linux systems that share the VM. Each has a terminal,
+`<name>.berth.local` and `ssh <name>.berth`. New machines can be Intel
+(Rosetta), take a cloud-init file, or be isolated from the Mac.
+
+![Machines](docs/images/machines.png)
+![New machine](docs/images/new-machine.png)
+
+A snapshot saves the whole VM, optionally with its running processes. Restoring
+one takes everything back to that moment.
+
+![Snapshots](docs/images/snapshots.png)
+
+Settings cover resources, file sharing, the proxy, ports, Finder, importing
+from OrbStack or Docker Desktop, and startup. They are saved to
+`~/.berth/config.json`.
+
+<img src="docs/images/settings.png" alt="Settings" width="400">
+
 Launch arguments pick the starting screen, e.g.
 `open target/Berth.app --args -openSection Images`,
 `--args -openContainer web -openTab Logs` (or `-openTab Debug` for the debug shell),
 `--args -openSettings YES` (with `-openSheet Import`), or
 `--args -openSection Machines -openMachine dev -openSheet MachineInfo` (also
-`MachineLogs`, `NewMachine`).
+`MachineLogs`, `NewMachine`). `-filter shop` starts with the list filtered.
 
 ## Use
 
