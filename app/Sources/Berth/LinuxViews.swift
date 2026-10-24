@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // MARK: - Machines
@@ -113,7 +114,7 @@ struct MachinesView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .sheet(isPresented: $showCreate) { CreateMachineSheet { name, distro in create(name, distro) } }
+        .sheet(isPresented: $showCreate) { CreateMachineSheet { name, distro, arch, userData in create(name, distro, arch, userData) } }
         .task {
             while !Task.isCancelled {
                 await refresh()
@@ -138,12 +139,13 @@ struct MachinesView: View {
         }
     }
 
-    private func create(_ name: String, _ distro: String) {
+    private func create(_ name: String, _ distro: String, _ arch: String, _ userData: String) {
         busy = name
         Task {
             let user = NSUserName()
             do {
-                _ = try await Machines.call("create", [name, distro, user, String(getuid()), NSHomeDirectory()])
+                // Same arguments as `berth machine create` (src/machines.rs).
+                _ = try await Machines.call("create", [name, distro, user, String(getuid()), NSHomeDirectory(), arch, userData])
                 try? await Task.sleep(for: .seconds(3))
                 await refresh()
                 selection = name
@@ -157,15 +159,31 @@ struct MachinesView: View {
 
 struct CreateMachineSheet: View {
     @Environment(\.dismiss) private var dismiss
-    let create: (String, String) -> Void
+    let create: (String, String, String, String) -> Void
     @State private var name = ""
     @State private var distro = "ubuntu:noble"
+    @State private var arch = "arm64"
+    @State private var cloudInit: URL?
+    @State private var cloudInitError: String?
 
     private let distros = [
         ("Ubuntu 24.04", "ubuntu:noble"), ("Debian 13", "debian:trixie"), ("Fedora 44", "fedora:44"),
         ("Alpine", "alpine"), ("Arch Linux", "archlinux"), ("Rocky Linux 10", "rockylinux:10"),
         ("AlmaLinux 10", "almalinux:10"), ("openSUSE Tumbleweed", "opensuse:tumbleweed"),
     ]
+
+    /// The chosen user data, read when creating.
+    private var userData: String? { cloudInit.flatMap { try? String(contentsOf: $0, encoding: .utf8) } }
+
+    private func chooseCloudInit() {
+        let panel = NSOpenPanel()
+        panel.message = "cloud-init user data (#cloud-config)"
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        cloudInit = url
+        let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        cloudInitError = text.hasPrefix("#cloud-config") || text.hasPrefix("#!") ? nil : "Starts with #cloud-config (or #! for a script)."
+    }
 
     private var validName: Bool {
         (1...12).contains(name.count) && name.allSatisfy { $0.isLowercase || $0.isNumber || $0 == "-" } && !name.hasPrefix("-")
@@ -177,7 +195,19 @@ struct CreateMachineSheet: View {
             Picker("Distribution", selection: $distro) {
                 ForEach(distros, id: \.1) { Text($0.0).tag($0.1) }
             }
-            Text("Your user, sudo, and your Mac home folder are set up inside. Reachable at \(name.isEmpty ? "<name>" : name).berth.local.")
+            Picker("Architecture", selection: $arch) {
+                Text("Apple silicon (arm64)").tag("arm64")
+                Text("Intel (amd64, with Rosetta)").tag("amd64")
+            }
+            LabeledContent("cloud-init") {
+                HStack {
+                    Text(cloudInit?.lastPathComponent ?? "None").foregroundStyle(.secondary)
+                    if cloudInit != nil { Button("Clear") { cloudInit = nil; cloudInitError = nil } }
+                    Button("Choose…") { chooseCloudInit() }
+                }
+            }
+            if let cloudInitError { Text(cloudInitError).font(.caption).foregroundStyle(.red) }
+            Text("Your user, sudo, and your Mac home folder are set up inside. Reachable at \(name.isEmpty ? "<name>" : name).berth.local; `ssh \(name.isEmpty ? "<name>" : name).berth` too.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
@@ -186,8 +216,8 @@ struct CreateMachineSheet: View {
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("Create") { create(name, distro); dismiss() }
-                    .keyboardShortcut(.defaultAction).disabled(!validName)
+                Button("Create") { create(name, distro, arch, userData ?? ""); dismiss() }
+                    .keyboardShortcut(.defaultAction).disabled(!validName || cloudInitError != nil)
             }
             .padding()
         }

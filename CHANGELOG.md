@@ -7,6 +7,8 @@ are in the commit messages.
 
 ### 2026-10-24
 - **Kubernetes:** LoadBalancer services on the Mac's localhost.
+- **App:** import from OrbStack or Docker Desktop (Settings), and Intel /
+  cloud-init options for new machines.
 - **CLI:** `berth restart`, `berth info`, `berth logs`, `berth completions`.
 - **Certificates:** Docker in the VM trusts the CAs the Mac trusts.
 - **More of the Mac in containers:** `/Volumes`, `/tmp` and `$TMPDIR`

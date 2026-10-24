@@ -7,6 +7,7 @@ struct SettingsView: View {
     @State private var config = BerthConfig.load()
     @State private var saved = BerthConfig.load()
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var showImport = false
     @AppStorage("autoStart") private var autoStart = true
     @State private var helperMessage: String?
     @State private var httpsTrusted = TLSTrust.cached
@@ -68,6 +69,12 @@ struct SettingsView: View {
                         Button("Save") { save(restart: false) }
                         Button("Save & Restart") { save(restart: true) }.disabled(!engine.isRunning)
                     }
+                }
+            }
+
+            SwiftUI.Section("Moving over") {
+                LabeledContent("Images, volumes and containers from OrbStack or Docker Desktop") {
+                    Button("Import…") { showImport = true }.disabled(!engine.isRunning)
                 }
             }
 
@@ -148,6 +155,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .sheet(isPresented: $showImport) { ImportSheet() }
         .frame(width: 520, height: 720)
     }
 

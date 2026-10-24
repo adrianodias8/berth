@@ -190,8 +190,8 @@ its own. Closing the window keeps it in the menu bar.
   volumes and machines in Finder, Podman and nerdctl, and whether stopping keeps
   containers running (suspend), merged into `~/.berth/config.json` and applied on
   restart (`docs/configuration.md`); start on app launch, open at login, install the
-  IP route helper, trust the HTTPS certificate. Import and machines' `--arch` /
-  `--cloud-init` are CLI-only for now
+  IP route helper, trust the HTTPS certificate, and import from OrbStack or Docker
+  Desktop. New machines can be Intel (Rosetta) and take a cloud-init file
 
 Launch arguments pick the starting screen, e.g.
 `open target/Berth.app --args -openSection Images` or
