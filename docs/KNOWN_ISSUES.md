@@ -115,9 +115,8 @@ fix one, remove it here in the same change.
   reads happen inside `Task.detached` (start, machine actions, settings,
   stats), and that pool has a thread per core. Run blocking work on threads
   or dispatch queues and resume through continuations, as `stream()` does.
-- **Terminal sessions:** the exec session's fields are unsynchronized, and a
-  quick tab switch during the exec upgrade can leak a thread and an fd.
-  Sessions also end on every tab switch.
+- **Terminal sessions** are kept for the 8 terminals shown most recently;
+  older ones are closed.
 - **UI:**
   - logs re-attach when a container's running state changes, which a very
     quick restart can slip between;
