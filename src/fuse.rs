@@ -92,6 +92,7 @@ mod lerr {
     pub const ENOENT: i32 = 2;
     pub const EIO: i32 = 5;
     pub const EBADF: i32 = 9;
+    pub const EEXIST: i32 = 17;
     pub const EINVAL: i32 = 22;
     pub const ENOSYS: i32 = 38;
     pub const ESTALE: i32 = 116;
@@ -190,6 +191,9 @@ impl Default for CachePolicy {
 struct Node {
     path: PathBuf,
     lookups: u64,
+    /// Its file type (S_IFMT bits), for replaying a removal on the Mac to the
+    /// guest (`gone_from_mac`); 0 when unknown (restored from a suspend).
+    kind: u32,
     /// With "no open" mode the kernel skips OPEN/RELEASE and sends fh 0;
     /// reads and writes then use this per-node file, opened on first use.
     file: Option<Arc<fs::File>>,
@@ -327,7 +331,7 @@ impl Server {
         // root itself must have none either.
         let root = fs::canonicalize(&root).unwrap_or(root);
         let mut nodes = HashMap::new();
-        nodes.insert(FUSE_ROOT_ID, Node { path: root.clone(), lookups: 1, file: None });
+        nodes.insert(FUSE_ROOT_ID, Node { path: root.clone(), lookups: 1, kind: 0, file: None });
         Self {
             root,
             policy,
@@ -382,9 +386,9 @@ impl Server {
         let Ok(state) = serde_json::from_slice::<SavedState>(bytes) else { return false };
         let mut nodes = HashMap::new();
         for n in state.nodes {
-            nodes.insert(n.id, Node { path: n.path, lookups: n.lookups, file: None });
+            nodes.insert(n.id, Node { path: n.path, lookups: n.lookups, kind: 0, file: None });
         }
-        nodes.entry(FUSE_ROOT_ID).or_insert(Node { path: self.root.clone(), lookups: 1, file: None });
+        nodes.entry(FUSE_ROOT_ID).or_insert(Node { path: self.root.clone(), lookups: 1, kind: 0, file: None });
         let mut handles = HashMap::new();
         for (fh, h) in state.handles {
             // A handle whose file is gone now just fails like a stale one.
@@ -447,7 +451,7 @@ impl Server {
         if let Some(n) = self.opcodes.get(opcode as usize) {
             n.fetch_add(1, Ordering::Relaxed);
         }
-        let (_uid, _gid, _pid, _extlen, _pad) = (r.u32()?, r.u32()?, r.u32()?, r.u16()?, r.u16()?);
+        let (_uid, _gid, pid, _extlen, _pad) = (r.u32()?, r.u32()?, r.u32()?, r.u16()?, r.u16()?);
         let result = match opcode {
             op::FORGET => {
                 let n = r.u64().unwrap_or(0);
@@ -467,7 +471,7 @@ impl Server {
             op::INTERRUPT => return None,
             op::INIT => self.init(&mut r),
             op::DESTROY => Ok(Vec::new()),
-            op::LOOKUP => self.lookup(nodeid, r.cstr().unwrap_or_default()),
+            op::LOOKUP => self.lookup(nodeid, r.cstr().unwrap_or_default(), pid),
             op::GETATTR => self.getattr(nodeid),
             op::SETATTR => self.setattr(nodeid, &mut r),
             op::READLINK => self.readlink(nodeid),
@@ -480,8 +484,8 @@ impl Server {
                 let _umask = r.u32();
                 self.mkdir(nodeid, r.cstr().unwrap_or_default(), mode)
             }
-            op::UNLINK => self.remove(nodeid, r.cstr().unwrap_or_default(), false),
-            op::RMDIR => self.remove(nodeid, r.cstr().unwrap_or_default(), true),
+            op::UNLINK => self.remove(nodeid, r.cstr().unwrap_or_default(), false, pid),
+            op::RMDIR => self.remove(nodeid, r.cstr().unwrap_or_default(), true, pid),
             op::RENAME => {
                 let newdir = r.u64().unwrap_or(0);
                 let (old, new) = (r.cstr().unwrap_or_default(), r.cstr().unwrap_or_default());
@@ -701,9 +705,10 @@ impl Server {
         let nodeid = if path == self.root { FUSE_ROOT_ID } else { m.ino() };
         let stale = {
             let mut nodes = self.nodes.lock().unwrap();
-            let node = nodes.entry(nodeid).or_insert(Node { path: path.clone(), lookups: 0, file: None });
+            let node = nodes.entry(nodeid).or_insert(Node { path: path.clone(), lookups: 0, kind: 0, file: None });
             let stale = if node.path != path { node.file.take() } else { None };
             node.path = path;
+            node.kind = m.mode() & 0o170000;
             node.lookups += 1;
             stale
         };
@@ -720,9 +725,10 @@ impl Server {
         Ok(out.0)
     }
 
-    fn lookup(&self, parent: u64, name: &[u8]) -> Reply {
+    fn lookup(&self, parent: u64, name: &[u8], pid: u32) -> Reply {
         let path = self.child(parent, name)?;
-        match self.entry(path) {
+        match self.entry(path.clone()) {
+            Err(lerr::ENOENT) if crate::watch::replaying_removal(pid, &path) => self.gone_from_mac(&path),
             // A negative entry (node ID 0) the guest may cache.
             Err(lerr::ENOENT) if !self.policy.negative.is_zero() && !self.vanished(parent) => {
                 let n = self.policy.negative;
@@ -732,6 +738,36 @@ impl Server {
             }
             result => result,
         }
+    }
+
+    /// The node the guest knows at `path`, if any.
+    fn node_at(&self, path: &Path) -> Option<u64> {
+        self.nodes.lock().unwrap().iter().find(|(_, n)| n.path == path).map(|(id, _)| *id)
+    }
+
+    /// The entry for a name just removed on the Mac, as the guest knew it
+    /// (same node, same type), so the agent can remove it in the guest too
+    /// and watchers there see IN_DELETE. Never cached; ENOENT if the guest
+    /// never looked the name up.
+    fn gone_from_mac(&self, path: &Path) -> Reply {
+        let (nodeid, kind, file) = {
+            let mut nodes = self.nodes.lock().unwrap();
+            let (id, node) = nodes.iter_mut().find(|(_, n)| n.path == path && n.kind != 0).ok_or(lerr::ENOENT)?;
+            node.lookups += 1;
+            (*id, node.kind, node.file.clone())
+        };
+        let mut out = Out::default();
+        out.u64(nodeid).u64(0).u64(0).u64(0).u32(0).u32(0);
+        // Still open in the guest: its real attributes, so it reads on.
+        if let Some(m) = file.and_then(|f| nofollow::fstat(&f).ok()) {
+            Self::attr(&mut out, nodeid, &m);
+            return Ok(out.0);
+        }
+        // fuse_attr: ino, size, blocks, times, then mode, nlink, uid, gid,
+        // rdev, blksize, flags.
+        out.u64(nodeid).u64(0).u64(0).u64(0).u64(0).u64(0).u32(0).u32(0).u32(0);
+        out.u32(kind | if kind == 0o040000 { 0o755 } else { 0o644 }).u32(1).u32(0).u32(0).u32(0).u32(4096).u32(0);
+        Ok(out.0)
     }
 
     fn attr_reply(&self, nodeid: u64, m: &Stat) -> Vec<u8> {
@@ -860,9 +896,22 @@ impl Server {
         self.entry_noted(path)
     }
 
-    fn remove(&self, parent: u64, name: &[u8], dir: bool) -> Reply {
+    fn remove(&self, parent: u64, name: &[u8], dir: bool, pid: u32) -> Reply {
         let path = self.child(parent, name)?;
         let ino = nofollow::lstat(&path).map(|m| m.ino()).ok();
+        // The agent replaying a removal on the Mac so the guest's watchers
+        // get IN_DELETE (watch.rs): agree if it's still gone, and never
+        // remove anything, as the name may be back already (an editor's
+        // delete-and-write save).
+        if crate::watch::replaying_removal(pid, &path) {
+            if ino.is_some() {
+                return Err(lerr::EEXIST);
+            }
+            if let Some(ino) = self.node_at(&path) {
+                self.forget_name(ino, &path);
+            }
+            return Ok(Vec::new());
+        }
         nofollow::remove(&path, dir).map_err(|e| io_errno(&e))?;
         crate::watch::guest_removed(&path);
         // A removed file may still be open in the guest: keep its node (and
@@ -1147,6 +1196,37 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn replays_a_removal_on_the_mac_only_for_the_agent() {
+        let dir = tempdir("replay");
+        let s = Server::new(dir.clone(), CachePolicy::default());
+        fs::write(dir.join("gone.js"), "x").unwrap();
+        let (err, entry) = reply(&s, op::LOOKUP, FUSE_ROOT_ID, &name("gone.js"));
+        assert_eq!(err, 0);
+        let nodeid = u64::from_le_bytes(entry[0..8].try_into().unwrap());
+        fs::remove_file(dir.join("gone.js")).unwrap();
+
+        // Not replaying: gone.
+        assert_eq!(reply(&s, op::LOOKUP, FUSE_ROOT_ID, &name("gone.js")).0, 0, "negative entry");
+        assert_eq!(reply(&s, op::UNLINK, FUSE_ROOT_ID, &name("gone.js")).0, -lerr::ENOENT);
+
+        // The agent (pid 1 in these requests) replaying it: the same node,
+        // and the removal is agreed to.
+        let real = dir.canonicalize().unwrap();
+        crate::watch::set_replay(Some((1, [real.join("gone.js"), real.join("back.js")].into())));
+        let (err, entry) = reply(&s, op::LOOKUP, FUSE_ROOT_ID, &name("gone.js"));
+        assert_eq!(err, 0);
+        assert_eq!(u64::from_le_bytes(entry[0..8].try_into().unwrap()), nodeid, "same node as before");
+        assert_eq!(reply(&s, op::UNLINK, FUSE_ROOT_ID, &name("gone.js")).0, 0);
+
+        // Back on the Mac before the replay: never removed.
+        fs::write(dir.join("back.js"), "new").unwrap();
+        assert_eq!(reply(&s, op::UNLINK, FUSE_ROOT_ID, &name("back.js")).0, -lerr::EEXIST);
+        assert!(dir.join("back.js").exists());
+        crate::watch::set_replay(None);
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

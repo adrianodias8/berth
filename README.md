@@ -198,8 +198,9 @@ images, volumes, networks, Kubernetes, machines, terminals, logs, files and stat
   (`bench/results/2026-10-23-ddev-drupal.md`).
 - Memory used by a workload isn't returned to macOS after it ends (OrbStack in the
   same test didn't return it within 2 minutes either).
-- Deleting a file on the Mac raises no IN_DELETE in containers, only an attribute
-  event on its folder (watchers that rescan the folder notice).
+- Deleting a folder on the Mac raises IN_DELETE in containers for the folder
+  only, not for each file in it (on Linux every file gets one). Files deleted
+  or renamed on the Mac do raise IN_DELETE (berth's own share).
 - Anything in the VM can reach servers listening only on the Mac's loopback,
   through `host.docker.internal` (as with OrbStack), including the forwarded
   Kubernetes API on 6443.

@@ -255,6 +255,13 @@ something here stops being true, fix it.
 - **virtiofs carries no macOS file events.** berth watches bind-mount sources
   with FSEvents, and the agent `chmod`s each changed path to its current
   mode. That raises IN_ATTRIB and refreshes cached attributes.
+- **Touches raise only IN_ATTRIB**, which chokidar (Vite, nodemon) turns
+  into add/unlink by rescanning, but watchpack (webpack, Laravel Mix) and
+  @parcel/watcher (Tailwind 4) ignore for deletes. So removals are replayed:
+  the agent unlinks the name in the guest and the file server agrees for
+  that agent thread only (FUSE requests carry the caller's TID), returning
+  the node the guest already had. It never removes anything on a replay: an
+  editor may have written the name again meanwhile.
 - **Feedback loops:** a touch is a change too. Drop events whose
   (exists, mtime, size) didn't change, and skip the file server's own writes.
 

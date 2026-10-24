@@ -10,6 +10,12 @@
 //! forward a path only when its state changed: existence, mtime or size. A
 //! chmod changes none of them; real edits, creations and deletions do.
 //!
+//! Removals are replayed rather than touched, so watchers that only act on
+//! IN_DELETE (webpack's watchpack, @parcel/watcher) see them: the agent
+//! removes the name in the guest, and berth's file server, which already
+//! saw it go on the Mac, agrees for that one thread of the agent
+//! (`replaying_removal`). Others still get ENOENT.
+//!
 //! Changes the guest itself makes through berth's own file server (fuse.rs)
 //! come back as FSEvents too. Touching those would only send the guest's own
 //! change back to it, at a round trip per file (it made `composer install`
@@ -35,6 +41,20 @@ const MAX_PATHS: usize = 2000;
 
 /// How long a guest change is remembered: FSEvents arrive well within this.
 const ECHO_WINDOW: Duration = Duration::from_secs(10);
+
+/// The agent thread replaying removals, and the paths it may remove.
+static REPLAY: Mutex<Option<(u32, BTreeSet<PathBuf>)>> = Mutex::new(None);
+
+/// The file server may answer as if `path` (gone on the Mac) were still
+/// there: `pid` is the agent replaying its removal.
+pub fn replaying_removal(pid: u32, path: &Path) -> bool {
+    REPLAY.lock().unwrap().as_ref().is_some_and(|(tid, paths)| *tid == pid && paths.contains(path))
+}
+
+#[cfg(test)]
+pub fn set_replay(replay: Option<(u32, BTreeSet<PathBuf>)>) {
+    *REPLAY.lock().unwrap() = replay;
+}
 
 static GUEST_CHANGES: LazyLock<Mutex<HashMap<PathBuf, (Signature, Instant)>>> = LazyLock::new(Default::default);
 
@@ -158,20 +178,44 @@ async fn forward(mut rx: mpsc::UnboundedReceiver<Vec<PathBuf>>) {
                 seen.remove(&p);
             }
         }
-        let paths: Vec<String> = changed.into_iter().filter_map(|p| p.to_str().map(str::to_string)).collect();
-        if paths.is_empty() {
+        // Removed ones are marked "-" (paths are absolute, so it can't be
+        // part of one): the agent replays those.
+        let (removed, present): (Vec<PathBuf>, Vec<PathBuf>) = changed.into_iter().partition(|p| signature(p).is_none());
+        let lines: Vec<String> = removed
+            .iter()
+            .filter_map(|p| p.to_str().map(|s| format!("-{s}")))
+            .chain(present.iter().filter_map(|p| p.to_str().map(str::to_string)))
+            .collect();
+        if lines.is_empty() {
             continue;
         }
-        if let Err(err) = touch(&paths).await {
+        if let Err(err) = touch(&lines, removed.into_iter().collect()).await {
             eprintln!("watch: {err:#}");
         }
+        *REPLAY.lock().unwrap() = None;
     }
 }
 
-async fn touch(paths: &[String]) -> anyhow::Result<()> {
-    let mut guest = guest_stream("touch").await?;
-    guest.write_all(paths.join("\n").as_bytes()).await?;
-    guest.shutdown().await?;
+/// Send the batch, ended by an empty line. With removals, the agent answers
+/// with the thread that replays them ("tid N"), which the file server then
+/// lets remove these paths until the agent is done (it closes the stream).
+async fn touch(lines: &[String], removed: BTreeSet<PathBuf>) -> anyhow::Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let guest = guest_stream("touch").await?;
+    let (read, mut write) = tokio::io::split(guest);
+    write.write_all(format!("{}\n\n", lines.join("\n")).as_bytes()).await?;
+    let mut read = tokio::io::BufReader::new(read);
+    if !removed.is_empty() {
+        let mut reply = String::new();
+        tokio::time::timeout(Duration::from_secs(5), read.read_line(&mut reply)).await??;
+        if let Some(tid) = reply.trim().strip_prefix("tid ").and_then(|t| t.parse().ok()) {
+            *REPLAY.lock().unwrap() = Some((tid, removed));
+        }
+        write.write_all(b"ok\n").await?;
+    }
+    // Until the agent is done: the replay stays allowed that long.
+    let mut rest = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(30), read.read_to_end(&mut rest)).await;
     Ok(())
 }
 

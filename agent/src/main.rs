@@ -14,7 +14,7 @@
 //!   machine-ssh <name>\n    connect to a machine's sshd, starting it if needed (mac.rs)
 //!   proxy\n                 then JSON until EOF: Docker's and apt's proxy (proxy.rs)
 //!   files <password>\n      share volumes, machines and containers over SMB for ~/Berth (files.rs)
-//!   touch\n                 followed by newline-separated paths until EOF: raise
+//!   touch\n                 followed by newline-separated paths and an empty line: raise
 //!                           inotify events for files changed on the Mac
 //!   info version\n          a hash of this binary (the host compares it with its own)
 //!   exit\n                  quit; systemd starts the agent binary again (a newer one,
@@ -341,15 +341,66 @@ fn set_clock(secs: &str, mut host: UnixStream) -> io::Result<()> {
 
 /// chmod each path to its current mode: a no-op that still raises IN_ATTRIB
 /// for inotify watchers in the guest and refreshes virtiofs's cached
-/// attributes. Missing paths (deleted on the Mac) are skipped; the host also
-/// sends their parent directory.
+/// attributes. Paths marked "-" were removed on the Mac: those are removed
+/// here too (berth's file server agrees for this thread, src/watch.rs), which
+/// raises IN_DELETE. The host ends the list with an empty line.
 fn touch_paths(mut host: UnixStream) -> io::Result<()> {
-    let mut list = String::new();
-    host.read_to_string(&mut list)?;
-    for path in list.lines().filter(|l| !l.is_empty()) {
+    let mut lines = Vec::new();
+    loop {
+        let line = read_line(&mut host, 4096)?;
+        if line.is_empty() {
+            break;
+        }
+        lines.push(line);
+    }
+    let (removed, present): (Vec<&String>, Vec<&String>) = lines.iter().partition(|l| l.starts_with('-'));
+    if !removed.is_empty() {
+        writeln!(host, "tid {}", unsafe { libc::gettid() })?;
+        let _ok = read_header(&mut host)?;
+        for path in removed {
+            let _ = replay_removal(&path[1..]);
+        }
+    }
+    for path in present {
         let _ = touch(path);
     }
     Ok(())
+}
+
+/// Remove `path` in the guest after it was removed on the Mac. Only on the
+/// shared folder: its directory is opened refusing symlinks and must be on
+/// virtio-fs, so a container's swapped-in link can't point this elsewhere.
+fn replay_removal(path: &str) -> io::Result<()> {
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const FUSE_SUPER_MAGIC: i64 = 0x65735546;
+    let path = std::path::Path::new(path);
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return Ok(()) };
+    let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).map_err(io::Error::other)?;
+    let how = OpenHow { flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64, mode: 0, resolve: RESOLVE_NO_SYMLINKS };
+    let fd = unsafe { libc::syscall(libc::SYS_openat2, libc::AT_FDCWD, c.as_ptr(), &how, std::mem::size_of::<OpenHow>()) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let dir = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(dir.as_raw_fd(), &mut fs) } != 0 || fs.f_type as i64 != FUSE_SUPER_MAGIC {
+        return Ok(());
+    }
+    let name = std::ffi::CString::new(name.as_encoded_bytes()).map_err(io::Error::other)?;
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EISDIR) && unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
+        return Ok(());
+    }
+    Err(err)
 }
 
 /// chmod `path` to its current mode. We run as root and containers can
@@ -410,9 +461,14 @@ fn touch(path: &str) -> io::Result<()> {
 /// Read up to and including '\n', one byte at a time so nothing past the
 /// header is consumed.
 fn read_header(stream: &mut UnixStream) -> io::Result<String> {
+    read_line(stream, MAX_HEADER)
+}
+
+/// `read_header` for lines up to `max` bytes (paths: up to PATH_MAX).
+fn read_line(stream: &mut UnixStream, max: usize) -> io::Result<String> {
     let mut header = Vec::new();
     let mut byte = [0u8];
-    while header.len() < MAX_HEADER {
+    while header.len() < max {
         if stream.read(&mut byte)? == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
