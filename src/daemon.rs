@@ -92,6 +92,27 @@ static STOPPING: AtomicBool = AtomicBool::new(false);
 /// The VM resumed a snapshot's saved state: its clock is where it was saved.
 static RESTORED: AtomicBool = AtomicBool::new(false);
 
+/// Keep the guest's clock on the Mac's: the VM's clock stops while the Mac
+/// sleeps, and NTP in the guest takes a long time to notice.
+async fn keep_clock() {
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        sync_clock().await;
+    }
+}
+
+async fn sync_clock() {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let Ok(mut guest) = guest_stream(&format!("clock {:.6}", now.as_secs_f64())).await else { return };
+    let mut reply = String::new();
+    let _ = guest.read_to_string(&mut reply).await;
+    if let Ok(drift) = reply.trim().parse::<f64>()
+        && drift.abs() > 1.0
+    {
+        eprintln!("clock: guest was {drift:.1}s off, corrected");
+    }
+}
+
 /// The VM booted (rather than resuming a saved state).
 static BOOTED: AtomicBool = AtomicBool::new(false);
 /// Containers to start once a restored snapshot's disk has booted.
@@ -110,14 +131,7 @@ async fn after_restore() {
             return;
         }
         if RESTORED.load(std::sync::atomic::Ordering::SeqCst) {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-            match guest_stream(&format!("clock {}", now.as_secs_f64())).await {
-                Ok(mut guest) => {
-                    let _ = guest.read_to_end(&mut Vec::new()).await;
-                    eprintln!("snapshot: guest clock set");
-                }
-                Err(err) => eprintln!("snapshot: setting the guest clock: {err:#}"),
-            }
+            sync_clock().await;
             return;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -214,6 +228,7 @@ async fn serve(paths: Paths, cpus: usize, memory: u64) -> Result<()> {
     tokio::spawn(crate::routes::run_periodic());
     tokio::spawn(serve_host_connections(memory));
     tokio::spawn(after_restore());
+    tokio::spawn(keep_clock());
 
     let cleanup_paths = Paths::new();
     tokio::spawn(async move {

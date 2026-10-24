@@ -12,7 +12,9 @@
 //!   touch\n                 followed by newline-separated paths until EOF: raise
 //!                           inotify events for files changed on the Mac
 //!   sync\n                  flush filesystems (before a disk-only snapshot); replies "ok"
-//!   clock <unix seconds>\n  set the clock (after restoring a snapshot); replies "ok"
+//!   clock <unix seconds>\n  set the clock if it's off by more than 50 ms (the VM's
+//!                           clock stops while the Mac sleeps, and after restoring a
+//!                           snapshot); replies with how far off it was, in seconds
 //!
 //! A failed connect just closes the stream. The agent also runs the container
 //! domain controller (domains.rs), its mDNS responder (mdns.rs), DNS for
@@ -131,14 +133,19 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
     }
 }
 
-/// A restored snapshot wakes up with the clock it was saved at.
+/// The VM's clock doesn't run while the Mac sleeps (and a restored snapshot
+/// wakes up with the time it was saved at); NTP polls too rarely to notice.
 fn set_clock(secs: &str, mut host: UnixStream) -> io::Result<()> {
-    let secs: f64 = secs.trim().parse().map_err(|_| io::Error::other("bad time"))?;
-    let ts = libc::timespec { tv_sec: secs.trunc() as _, tv_nsec: (secs.fract() * 1e9) as _ };
-    if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) } != 0 {
-        return Err(io::Error::last_os_error());
+    let mac: f64 = secs.trim().parse().map_err(|_| io::Error::other("bad time"))?;
+    let ours = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+    let drift = ours - mac;
+    if drift.abs() > 0.05 {
+        let ts = libc::timespec { tv_sec: mac.trunc() as _, tv_nsec: (mac.fract() * 1e9) as _ };
+        if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
-    host.write_all(b"ok")
+    host.write_all(format!("{drift:.3}").as_bytes())
 }
 
 /// chmod each path to its current mode: a no-op that still raises IN_ATTRIB
