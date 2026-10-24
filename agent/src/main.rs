@@ -121,19 +121,33 @@ fn main() {
 /// - `berth debug` runs the debug helper over SSH (guest/berth-debug.sh);
 /// - machines bind-mount /run/berth (mac.rs), so it must exist before they
 ///   autostart at boot, and they start after us, once the home share (also
-///   bound in) is mounted.
+///   bound in) is mounted;
+/// - before Docker starts, the CA certificates the Mac trusts (src/cacerts.rs,
+///   next to this binary on the home share) go into Debian's trust store.
 fn install_guest_files() {
-    let files: [(&str, &str, u32); 3] = [
-        ("/usr/local/libexec/berth-debug", include_str!("../../guest/berth-debug.sh"), 0o755),
-        ("/etc/tmpfiles.d/berth.conf", "d /run/berth 0755 root root -\n", 0o644),
+    let bundle = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join("ca-certificates.pem").to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    let ca_sync = include_str!("../../guest/berth-ca-sync.sh").replace("@BUNDLE@", &bundle);
+    let files: [(&str, String, u32); 5] = [
+        ("/usr/local/libexec/berth-debug", include_str!("../../guest/berth-debug.sh").into(), 0o755),
+        ("/usr/local/libexec/berth-ca-sync", ca_sync, 0o755),
+        ("/etc/tmpfiles.d/berth.conf", "d /run/berth 0755 root root -\n".into(), 0o644),
         (
             "/etc/systemd/system/systemd-nspawn@.service.d/berth.conf",
-            "# berth: machines bind the home share and /run/berth (agent/src/main.rs).\n[Unit]\nAfter=berth-agent.service\n",
+            "# berth: machines bind the home share and /run/berth (agent/src/main.rs).\n[Unit]\nAfter=berth-agent.service\n".into(),
+            0o644,
+        ),
+        (
+            "/etc/systemd/system/docker.service.d/berth-ca.conf",
+            "# berth: the Mac's trusted CA certificates (agent/src/main.rs).\n[Service]\nExecStartPre=-/usr/local/libexec/berth-ca-sync\n".into(),
             0o644,
         ),
     ];
     let mut units_changed = false;
-    for (path, contents, mode) in files {
+    for (path, contents, mode) in &files {
+        let (path, contents, mode) = (*path, contents.as_str(), *mode);
         if std::fs::read_to_string(path).ok().as_deref() == Some(contents) {
             continue;
         }

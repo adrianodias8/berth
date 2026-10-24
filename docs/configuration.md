@@ -83,7 +83,7 @@ These are for testing and debugging; set them for `berth start`.
 | `~/.berth/config.json` | this file |
 | `~/.berth/data/` | the VM: disk image, EFI variables, machine identity, a suspended state |
 | `~/.berth/snapshots/` | snapshots (excluded from Time Machine) |
-| `~/.berth/guest/` | the guest agent, the exported kernel, boot markers |
+| `~/.berth/guest/` | the guest agent, the exported kernel, boot markers, and `ca-certificates.pem`: the CA certificates the Mac trusts beyond Apple's roots, which the VM adds to its trust store before Docker starts (containers don't get them) |
 | `~/.berth/bin/` | the bundled `docker`, Compose, Buildx and `kubectl` |
 | `~/.berth/cache/` | the downloaded Debian image (kept by `berth delete`; excluded from Time Machine) |
 | `~/.berth/run/` | sockets (`docker.sock`, `podman.sock`, `ssh.sock`, `machine-ssh.sock`, the control socket) and the daemon's pid file |

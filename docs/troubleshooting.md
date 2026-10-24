@@ -66,6 +66,14 @@ and boot messages). `berth shell` opens a shell in the VM.
   one launchd sets for your login session); agents configured only with
   `IdentityAgent` in `~/.ssh/config` aren't picked up.
 
+## Certificates
+
+- **`x509: certificate signed by unknown authority` on a pull.** berth gives
+  the VM the CA certificates macOS trusts, from the System and login
+  keychains, at each start: trust the CA on the Mac (Keychain Access), then
+  `berth stop --shutdown && berth start`. `daemon.log` says how many were
+  passed. Containers don't get them; add them to your image.
+
 ## Files
 
 - **`~/Berth` is empty.** It's only mounted while berth runs, with the IP route

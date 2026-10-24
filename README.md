@@ -54,7 +54,8 @@ from its code.
   Settings): Docker networks get IPv6 subnets, NAT'd out of the VM. Reaching the
   internet over IPv6 needs IPv6 on the Mac; without it, IPv6 works between
   containers, the VM and the Mac
-- Docker pulls and pushes use the Mac's proxy settings (`"proxy"`: auto, none or a URL;
+- Docker pulls and pushes trust the CA certificates the Mac trusts (a company
+  root, a TLS-inspecting proxy, a private registry), and use the Mac's proxy settings (`"proxy"`: auto, none or a URL;
   a change applies at the next start)
 - Container domains with no setup: `<container>.berth.local`,
   `<service>.<project>.berth.local` for Compose, any subdomain, plus custom names
@@ -341,6 +342,7 @@ refuses any other name, so trusting it cannot be abused for real sites.
 - `src/files.rs` (agent: `files.rs`): `~/Berth` in Finder over NFS
 - `guest/berth-debug.sh`: `berth debug`
 - `src/import.rs`: `berth import` from OrbStack or Docker Desktop
+- `src/cacerts.rs` (+ `guest/berth-ca-sync.sh`): the Mac's trusted CAs for the VM
 - `src/dockerapi.rs`: the Docker socket bridge (maps `/tmp`, `/var/folders` bind sources);
   agent `shares.rs` mounts `/Volumes`, `/private/tmp`, `/private/var/folders`
 - `src/config.rs`: `berth config`; `src/proxy.rs` (agent: `proxy.rs`): Docker's proxy
