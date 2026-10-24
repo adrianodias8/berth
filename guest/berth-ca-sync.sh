@@ -8,7 +8,9 @@ dir=/usr/local/share/ca-certificates/berth
 # The home share may still be mounting this early in boot.
 i=0
 while [ ! -d "$(dirname "$src")" ] && [ $i -lt 20 ]; do sleep 0.5; i=$((i + 1)); done
-new=$(cat "$src" 2>/dev/null)
+# No bundle (yet): leave the trust store as it is.
+[ -f "$src" ] || exit 0
+new=$(cat "$src")
 [ "$new" = "$(cat "$dir/.bundle" 2>/dev/null)" ] && exit 0
 rm -rf "$dir"
 mkdir -p "$dir"

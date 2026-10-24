@@ -41,6 +41,7 @@ mod engine;
 mod engines;
 mod files;
 mod hostnet;
+mod inroot;
 mod ipv6;
 mod k8s;
 mod kmod;
@@ -73,6 +74,21 @@ fn main() {
     if args.next().is_some_and(|a| a.rsplit('/').next() == Some("mac")) {
         std::process::exit(mac::client(args.collect()));
     }
+    // ExecStartPre steps (install_guest_files): before a machine or Docker
+    // starts, not as the agent.
+    match (args.next().as_deref(), args.next()) {
+        (Some("isolate"), Some(name)) => {
+            shares::mount_all();
+            std::process::exit(if machines::guard(&name) { 0 } else { 1 });
+        }
+        (Some("mount-shares"), _) => {
+            shares::mount_all();
+            std::process::exit(0);
+        }
+        _ => {}
+    }
+    // Before anything else: machines may already be starting.
+    machines::apply_isolation();
     let table = TABLE.get_or_init(|| Arc::new(Default::default()));
     hostnet::setup();
     // docker-ce before anything talks to Docker; the watchers retry anyway.
@@ -125,10 +141,10 @@ fn main() {
 /// - before Docker starts, the CA certificates the Mac trusts (src/cacerts.rs,
 ///   next to this binary on the home share) go into Debian's trust store.
 fn install_guest_files() {
-    let bundle = std::env::current_exe()
-        .ok()
-        .and_then(|exe| Some(exe.parent()?.join("ca-certificates.pem").to_string_lossy().into_owned()))
-        .unwrap_or_default();
+    // Our own path goes into root's scripts and units: only plain characters.
+    let agent = std::env::current_exe().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+    let agent = if agent.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+".contains(&b)) { agent } else { String::new() };
+    let bundle = std::path::Path::new(&agent).with_file_name("ca-certificates.pem").to_string_lossy().into_owned();
     let ca_sync = include_str!("../../guest/berth-ca-sync.sh").replace("@BUNDLE@", &bundle);
     let files: [(&str, String, u32); 5] = [
         ("/usr/local/libexec/berth-debug", include_str!("../../guest/berth-debug.sh").into(), 0o755),
@@ -136,12 +152,20 @@ fn install_guest_files() {
         ("/etc/tmpfiles.d/berth.conf", "d /run/berth 0755 root root -\n".into(), 0o644),
         (
             "/etc/systemd/system/systemd-nspawn@.service.d/berth.conf",
-            "# berth: machines bind the home share and /run/berth (agent/src/main.rs).\n[Unit]\nAfter=berth-agent.service\n".into(),
+            format!(
+                "# berth: machines bind the home share, /run/berth and other shared folders, and some are\n\
+                 # kept off the network (agent/src/main.rs, machines.rs).\n\
+                 [Unit]\nAfter=berth-agent.service\n[Service]\nExecStartPre={agent} isolate %i\n"
+            ),
             0o644,
         ),
         (
             "/etc/systemd/system/docker.service.d/berth-ca.conf",
-            "# berth: the Mac's trusted CA certificates (agent/src/main.rs).\n[Service]\nExecStartPre=-/usr/local/libexec/berth-ca-sync\n".into(),
+            format!(
+                "# berth: the Mac's shared folders and trusted CA certificates, before Docker starts\n\
+                 # (agent/src/main.rs).\n[Unit]\nAfter=berth-agent.service\n[Service]\n\
+                 ExecStartPre=-{agent} mount-shares\nExecStartPre=-/usr/local/libexec/berth-ca-sync\n"
+            ),
             0o644,
         ),
     ];

@@ -19,10 +19,22 @@ use crate::daemon::{guest_stream, is_disconnect};
 
 /// Requests bigger than this are passed on unread.
 const MAX_CREATE_BODY: u64 = 8 << 20;
+/// Request headers, as dockerd (Go's 1 MiB): `docker build` sends every
+/// registry login in X-Registry-Config.
+const HEAD_LIMIT: usize = 1 << 20;
 
 pub fn bridge(listener: UnixListener, target: &'static str, name: &'static str) {
     tokio::spawn(async move {
-        while let Ok((client, _)) = listener.accept().await {
+        loop {
+            let client = match listener.accept().await {
+                Ok((client, _)) => client,
+                Err(err) => {
+                    // Out of descriptors, typically: back off, don't stop serving.
+                    eprintln!("{name} bridge: accept: {err}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             tokio::spawn(async move {
                 if let Err(err) = connection(client, target).await
                     && !is_disconnect(&err)
@@ -88,7 +100,8 @@ where
         } else {
             guest.write_all(&head).await?;
             if let Some(n) = length {
-                tokio::io::copy(&mut (&mut client).take(n), guest).await?;
+                // copy_buf: through our big buffer (copy() uses 8 KiB).
+                tokio::io::copy_buf(&mut (&mut client).take(n), guest).await?;
             } else if chunked {
                 copy_chunked(&mut client, guest).await?;
             }
@@ -107,13 +120,13 @@ async fn read_head<R: tokio::io::AsyncRead + Unpin>(client: &mut BufReader<R>) -
     let mut head = Vec::new();
     loop {
         let start = head.len();
-        if (&mut *client).take(64 * 1024).read_until(b'\n', &mut head).await? == 0 {
+        if (&mut *client).take(HEAD_LIMIT as u64).read_until(b'\n', &mut head).await? == 0 {
             if head.is_empty() {
                 return Ok(None);
             }
             anyhow::bail!("connection ended inside a request");
         }
-        if head.len() > 64 * 1024 {
+        if head.len() > HEAD_LIMIT {
             anyhow::bail!("request headers too long");
         }
         if &head[start..] == b"\r\n" && start > 0 {
@@ -143,11 +156,12 @@ where
                 }
             }
         }
-        tokio::io::copy(&mut (&mut *client).take(size + 2), guest).await?;
+        tokio::io::copy_buf(&mut (&mut *client).take(size + 2), guest).await?;
     }
 }
 
-/// `/containers/create`, with or without an API version, any query.
+/// `/containers/create`, with or without an API version, any query; also
+/// Podman's own `/vN/libpod/containers/create`.
 fn is_create(path: &str) -> bool {
     let path = path.split('?').next().unwrap_or_default();
     let rest = match path.strip_prefix("/v") {
@@ -157,7 +171,7 @@ fn is_create(path: &str) -> bool {
         },
         None => path.strip_prefix('/').unwrap_or(path),
     };
-    rest == "containers/create"
+    rest == "containers/create" || rest == "libpod/containers/create"
 }
 
 /// The head with its Content-Length replaced.
@@ -187,7 +201,18 @@ fn map_source(source: &str) -> Option<String> {
 fn rewrite_create(body: &[u8]) -> Option<Vec<u8>> {
     let mut json: Value = serde_json::from_slice(body).ok()?;
     let mut changed = false;
-    let host = json.get_mut("HostConfig")?;
+    // Podman's libpod spec: "mounts": [{"type": "bind", "source": ...}].
+    if let Some(mounts) = json.get_mut("mounts").and_then(Value::as_array_mut) {
+        for mount in mounts.iter_mut().filter(|m| m["type"] == "bind") {
+            if let Some(mapped) = mount["source"].as_str().and_then(map_source) {
+                mount["source"] = Value::String(mapped);
+                changed = true;
+            }
+        }
+    }
+    let Some(host) = json.get_mut("HostConfig") else {
+        return changed.then(|| serde_json::to_vec(&json).ok()).flatten();
+    };
     if let Some(binds) = host.get_mut("Binds").and_then(Value::as_array_mut) {
         for bind in binds {
             let Some(spec) = bind.as_str() else { continue };
@@ -219,7 +244,11 @@ mod tests {
         assert!(is_create("/v1.47/containers/create?name=web"));
         assert!(!is_create("/v1.47/containers/web/start"));
         assert!(!is_create("/vx/containers/create"));
-        assert!(!is_create("/v4.0.0/libpod/containers/create"));
+        assert!(is_create("/v4.0.0/libpod/containers/create"));
+        assert!(!is_create("/v4.0.0/libpod/containers/json"));
+        let libpod = br#"{"image":"a","mounts":[{"type":"bind","source":"/tmp/p","destination":"/p"}]}"#;
+        let out: Value = serde_json::from_slice(&rewrite_create(libpod).unwrap()).unwrap();
+        assert_eq!(out["mounts"][0]["source"], "/private/tmp/p");
     }
 
     #[test]

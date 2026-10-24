@@ -188,6 +188,12 @@ fn create(
          grep -qw {name} /etc/hosts 2>/dev/null || echo '127.0.1.1 {name}' >> /etc/hosts"
     );
     sh(&format!("systemd-nspawn -q -D {root} --pipe /bin/sh -c '{}'", setup.replace('\'', "'\\''")))?;
+    if (isolated || isolate_network) && !["usr/lib/systemd/systemd", "lib/systemd/systemd"].iter().any(|p| Path::new(&format!("{root}/{p}")).exists()) {
+        let _ = std::fs::remove_dir_all(&root);
+        return Err(io::Error::other(
+            "isolated machines need a distribution with systemd (not Alpine): berth reaches into them only through it",
+        ));
+    }
     if !user_data.is_empty() {
         seed_cloud_init(&root, name, user_data)?;
     }
@@ -221,57 +227,116 @@ fn create(
         integrate_files(name);
     }
     allow_forwarding();
-    isolate_network_of(name);
+    apply_isolation();
     sh(&format!("machinectl enable {name} >/dev/null 2>&1; machinectl start {name}"))?;
     Ok(())
 }
 
-/// For a machine marked isolate-network: DNS (the Mac's resolver) and the
-/// internet only. Its traffic to private ranges is dropped where the VM
-/// forwards it, and to the VM itself (where host.docker.internal is
-/// answered) except DHCP and replies. Rules go first, ahead of the
-/// machines' general ACCEPT; IPv6 isn't forwarded for it at all.
-fn isolate_network_of(name: &str) {
-    let ve = format!("ve-{name}");
-    // Remove ours first (a rename, or a boot that already added them).
-    let ours = |chain: &str, table_cmd: &str| {
-        let out = Command::new(table_cmd).args(["-w", "-S", chain]).output().ok()?;
-        Some(
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter(|l| l.contains(&format!("-i {ve} ")) && l.contains("berth-isolate"))
-                .map(|l| l.replacen("-A ", "-D ", 1))
-                .collect::<Vec<_>>(),
-        )
-    };
-    for (cmd, chain) in [("iptables", "DOCKER-USER"), ("iptables", "INPUT"), ("ip6tables", "FORWARD"), ("ip6tables", "INPUT")] {
-        for rule in ours(chain, cmd).unwrap_or_default() {
-            let _ = Command::new(cmd).arg("-w").args(rule.split_whitespace().map(|w| w.trim_matches('"'))).output();
-        }
-    }
-    if !isolation(name).network {
-        return;
+/// berth's own chains for network-isolated machines, jumped to first from
+/// FORWARD, INPUT and Docker's DOCKER-USER: ahead of the machines' general
+/// ACCEPT and the DNAT ACCEPT domains.rs adds, whichever comes later.
+const CHAIN: &str = "BERTH-ISOLATE";
+const CHAIN_IN: &str = "BERTH-ISOLATE-IN";
+
+fn ipt(cmd: &str, args: &[&str]) -> bool {
+    Command::new(cmd).arg("-w").args(args).output().is_ok_and(|o| o.status.success())
+}
+
+/// Rebuild the chains from the machines marked isolate-network: DNS (the
+/// Mac's resolver) and the internet only. Traffic to private ranges is
+/// dropped where the VM forwards it, and to the VM itself
+/// (host.docker.internal's REDIRECT lands there) except DHCP and replies;
+/// IPv6 isn't forwarded for them at all. Called at agent start, before
+/// such a machine starts (berth-agent isolate, an ExecStartPre), and on
+/// create, rename and delete.
+pub fn apply_isolation() {
+    // The agent and a machine's ExecStartPre can rebuild at once: one at a
+    // time, or the rules end up twice.
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open("/run/berth-isolate.lock");
+    if let Ok(file) = &lock {
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(file), libc::LOCK_EX) };
     }
     let dns = sh("ip -4 route show default | awk '{print $3; exit}'").unwrap_or_default().trim().to_string();
-    let tag = ["-m", "comment", "--comment", "berth-isolate"];
-    let insert = |cmd: &str, chain: &str, rule: &[&str]| {
-        let _ = Command::new(cmd).args(["-w", "-I", chain, "1", "-i", &ve]).args(rule).args(tag).output();
-    };
-    // Inserted at the top in reverse: the last one inserted runs first.
-    for range in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "198.18.0.0/15"] {
-        insert("iptables", "DOCKER-USER", &["-d", range, "-j", "DROP"]);
-    }
-    if dns.parse::<std::net::Ipv4Addr>().is_ok() {
-        for proto in ["udp", "tcp"] {
-            insert("iptables", "DOCKER-USER", &["-d", &dns, "-p", proto, "--dport", "53", "-j", "ACCEPT"]);
+    for cmd in ["iptables", "ip6tables"] {
+        for chain in [CHAIN, CHAIN_IN] {
+            ipt(cmd, &["-N", chain]);
+            ipt(cmd, &["-F", chain]);
+        }
+        // Rules an earlier berth put straight into Docker's chains.
+        for parent in ["DOCKER-USER", "INPUT", "FORWARD"] {
+            let rules = Command::new(cmd).args(["-w", "-S", parent]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+            for rule in rules.lines().filter(|l| l.contains("berth-isolate")) {
+                let _ = Command::new(cmd).arg("-w").args(rule.replacen("-A ", "-D ", 1).split_whitespace()).output();
+            }
         }
     }
-    insert("iptables", "INPUT", &["-j", "DROP"]);
-    insert("iptables", "INPUT", &["-p", "udp", "--dport", "67", "-j", "ACCEPT"]);
-    insert("iptables", "INPUT", &["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]);
-    insert("ip6tables", "FORWARD", &["-j", "DROP"]);
-    insert("ip6tables", "INPUT", &["-j", "DROP"]);
-    insert("ip6tables", "INPUT", &["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]);
+    for entry in std::fs::read_dir(MACHINES).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !valid_name(&name) || !isolation(&name).network {
+            continue;
+        }
+        let ve = format!("ve-{name}");
+        let add = |cmd: &str, chain: &str, rule: &[&str]| {
+            let mut args = vec!["-A", chain, "-i", ve.as_str()];
+            args.extend_from_slice(rule);
+            ipt(cmd, &args);
+        };
+        let replies = ["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"];
+        add("iptables", CHAIN, &replies);
+        if dns.parse::<std::net::Ipv4Addr>().is_ok() {
+            for proto in ["udp", "tcp"] {
+                add("iptables", CHAIN, &["-d", &dns, "-p", proto, "--dport", "53", "-j", "ACCEPT"]);
+            }
+        }
+        for range in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "198.18.0.0/15"] {
+            add("iptables", CHAIN, &["-d", range, "-j", "DROP"]);
+        }
+        add("iptables", CHAIN_IN, &replies);
+        add("iptables", CHAIN_IN, &["-p", "udp", "--dport", "67", "-j", "ACCEPT"]);
+        add("iptables", CHAIN_IN, &["-j", "DROP"]);
+        add("ip6tables", CHAIN, &["-j", "DROP"]);
+        add("ip6tables", CHAIN_IN, &replies);
+        add("ip6tables", CHAIN_IN, &["-j", "DROP"]);
+    }
+    ensure_jumps();
+}
+
+/// Put the jumps to our chains first again (Docker inserts its own at the
+/// top when it starts, and domains.rs adds a DNAT ACCEPT to DOCKER-USER).
+pub fn ensure_jumps() {
+    for (cmd, parent, chain) in [
+        ("iptables", "FORWARD", CHAIN),
+        ("iptables", "INPUT", CHAIN_IN),
+        ("ip6tables", "FORWARD", CHAIN),
+        ("ip6tables", "INPUT", CHAIN_IN),
+        ("iptables", "DOCKER-USER", CHAIN),
+    ] {
+        let Ok(out) = Command::new(cmd).args(["-w", "-S", parent]).output() else { continue };
+        if !out.status.success() {
+            continue; // no DOCKER-USER until Docker is up
+        }
+        let jump = format!("-A {parent} -j {chain}");
+        let rules = String::from_utf8_lossy(&out.stdout).into_owned();
+        // `-S` lists the policy (or -N) first, then the rules in order.
+        if rules.lines().nth(1) == Some(jump.as_str()) {
+            continue;
+        }
+        while ipt(cmd, &["-D", parent, "-j", chain]) {}
+        ipt(cmd, &["-I", parent, "1", "-j", chain]);
+    }
+}
+
+/// `berth-agent isolate <name>`, before a machine starts (an ExecStartPre
+/// of systemd-nspawn@): the rules, and refuse to start a network-isolated
+/// machine whose rules aren't there.
+pub fn guard(name: &str) -> bool {
+    apply_isolation();
+    if !valid_name(name) || !isolation(name).network {
+        return true;
+    }
+    let ours = Command::new("iptables").args(["-w", "-S", CHAIN]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let first = Command::new("iptables").args(["-w", "-S", "FORWARD"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    ours.contains(&format!("-i ve-{name} ")) && first.lines().nth(1) == Some(format!("-A FORWARD -j {CHAIN}").as_str())
 }
 
 /// How nspawn asks the machine's init to shut down, as a .nspawn line. Its
@@ -334,14 +399,12 @@ pub fn start(name: &str) -> io::Result<()> {
 
 /// The `mac` link and SSH_AUTH_SOCK, in the machine's files (it needn't run).
 fn integrate_files(name: &str) {
-    let root = format!("{MACHINES}/{name}");
+    let Ok(root) = crate::inroot::Root::new(format!("{MACHINES}/{name}")) else { return };
     if let Ok(agent) = std::env::current_exe() {
         // The agent runs from the shared home, which machines see at the same path.
-        let link = format!("{root}/usr/local/bin/mac");
-        if std::fs::read_link(&link).ok().as_deref() != Some(agent.as_path()) {
-            let _ = std::fs::create_dir_all(format!("{root}/usr/local/bin"));
-            let _ = std::fs::remove_file(&link);
-            let _ = std::os::unix::fs::symlink(&agent, &link);
+        let agent = agent.to_string_lossy();
+        if root.read_link("/usr/local/bin/mac").ok().as_deref() != Some(&*agent) {
+            let _ = root.symlink(&agent, "/usr/local/bin/mac");
         }
     }
     let profile = format!(
@@ -349,8 +412,32 @@ fn integrate_files(name: &str) {
          [ -n \"$SSH_AUTH_SOCK\" ] || [ ! -S {0}/ssh-agent.sock ] || export SSH_AUTH_SOCK={0}/ssh-agent.sock\n",
         crate::mac::DIR
     );
-    let _ = std::fs::create_dir_all(format!("{root}/etc/profile.d"));
-    let _ = std::fs::write(format!("{root}/etc/profile.d/berth.sh"), profile);
+    let _ = root.write_creating("/etc/profile.d/berth.sh", profile.as_bytes());
+}
+
+/// Whether the machine's PID 1 is systemd (its own `systemd-run -M` and
+/// `machinectl shell` then work, confined like the machine).
+fn runs_systemd(name: &str) -> bool {
+    sh(&format!("machinectl show {name} -p Leader --value"))
+        .ok()
+        .and_then(|leader| std::fs::read_to_string(format!("/proc/{}/comm", leader.trim())).ok())
+        .is_some_and(|comm| comm.trim() == "systemd")
+}
+
+/// Run a script inside a running machine, as its root. Through the
+/// machine's own systemd when it has one: the process then has the
+/// machine's limits (capabilities, seccomp, devices). Otherwise nsenter,
+/// which runs the machine's binaries as the VM's unconfined root: fine for
+/// a machine trusted with the Mac anyway, never for an isolated one.
+fn run_in(name: &str, script: &str) -> io::Result<String> {
+    let quoted = script.replace('\'', "'\\''");
+    if runs_systemd(name) {
+        return sh(&format!("systemd-run -M {name} --wait --pipe --quiet --collect /bin/sh -c '{quoted}'"));
+    }
+    if isolation(name).files {
+        return Err(io::Error::other("an isolated machine without systemd: berth won't run anything in it"));
+    }
+    sh(&format!("nsenter -t \"$(machinectl show {name} -p Leader --value)\" -a -- /bin/sh -c '{quoted}'"))
 }
 
 /// Bring machines made before an integration feature up to date: files,
@@ -365,12 +452,7 @@ pub fn integrate_all() {
             if Command::new("iptables").args(["-w", "-L", "DOCKER-USER", "-n"]).output().is_ok_and(|o| o.status.success()) {
                 allow_forwarding();
                 // After the general ACCEPT, so they come first.
-                for entry in std::fs::read_dir(MACHINES).into_iter().flatten().flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if valid_name(&name) {
-                        isolate_network_of(&name);
-                    }
-                }
+                ensure_jumps();
                 return;
             }
             std::thread::sleep(std::time::Duration::from_secs(2));
@@ -414,9 +496,10 @@ pub fn ensure_sshd(name: &str) -> io::Result<()> {
     let root = format!("{MACHINES}/{name}");
     // The machine's user (create() wrote it there) and the key the Mac uses
     // for the VM, from that user's VM account.
-    let user = std::fs::read_to_string(format!("{root}/etc/sudoers.d/berth"))
+    let user = crate::inroot::Root::new(&root)
+        .and_then(|r| r.read("/etc/sudoers.d/berth", 4096))
         .ok()
-        .and_then(|s| s.split_whitespace().next().map(str::to_string))
+        .and_then(|s| String::from_utf8_lossy(&s).split_whitespace().next().map(str::to_string))
         .filter(|u| u.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')))
         .ok_or_else(|| io::Error::other("no berth user in the machine"))?;
     let key = std::fs::read_to_string(format!("/home/{user}/.ssh/authorized_keys"))
@@ -446,15 +529,14 @@ pub fn ensure_sshd(name: &str) -> io::Result<()> {
          {{ if [ -d /run/systemd/system ]; then systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd; \
          elif command -v rc-update >/dev/null; then rc-update add sshd default; rc-service sshd start || true; fi; }} </dev/null >/dev/null 2>&1"
     );
-    let run = format!("nsenter -t \"$(machinectl show {name} -p Leader --value)\" -a -- /bin/sh -c '{}'", script.replace('\'', "'\\''"));
     // A machine that just booted may not have its network yet.
-    let mut result = sh(&run);
+    let mut result = run_in(name, &script);
     for _ in 0..3 {
         if result.is_ok() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_secs(5));
-        result = sh(&run);
+        result = run_in(name, &script);
     }
     result.map(|_| ())
 }
@@ -535,7 +617,7 @@ pub fn handle(action: &str, mut host: UnixStream) -> io::Result<()> {
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
                 let _ = std::fs::remove_file(nspawn_path(name));
-                isolate_network_of(name); // no marker now: just removes its rules
+                apply_isolation(); // without it now
                 std::fs::remove_dir_all(format!("{MACHINES}/{name}")).map(|_| "ok".into())
             }
         }
@@ -592,17 +674,17 @@ fn rename(old: &str, new: &str) -> io::Result<()> {
     let config = std::fs::read_to_string(nspawn_path(old)).unwrap_or_default();
     std::fs::write(nspawn_path(new), config.replace(&format!("ve-{old}:"), &format!("ve-{new}:")))?;
     let _ = std::fs::remove_file(nspawn_path(old));
-    let root = format!("{MACHINES}/{new}");
-    let _ = std::fs::write(format!("{root}/etc/hostname"), format!("{new}\n"));
-    if let Ok(hosts) = std::fs::read_to_string(format!("{root}/etc/hosts")) {
-        let renamed: Vec<String> = hosts
-            .lines()
-            .map(|l| if l.starts_with("127.0.1.1") { format!("127.0.1.1 {new}") } else { l.to_string() })
-            .collect();
-        let _ = std::fs::write(format!("{root}/etc/hosts"), renamed.join("\n") + "\n");
+    if let Ok(root) = crate::inroot::Root::new(format!("{MACHINES}/{new}")) {
+        let _ = root.write("/etc/hostname", format!("{new}\n").as_bytes());
+        if let Ok(hosts) = root.read("/etc/hosts", 1 << 20) {
+            let renamed: Vec<String> = String::from_utf8_lossy(&hosts)
+                .lines()
+                .map(|l| if l.starts_with("127.0.1.1") { format!("127.0.1.1 {new}") } else { l.to_string() })
+                .collect();
+            let _ = root.write("/etc/hosts", (renamed.join("\n") + "\n").as_bytes());
+        }
     }
-    isolate_network_of(old);
-    isolate_network_of(new);
+    apply_isolation();
     sh(&format!("machinectl enable {new} >/dev/null 2>&1"))?;
     if was_running {
         start(new)?;
@@ -615,24 +697,11 @@ fn info(name: &str) -> io::Result<String> {
     exists(name)?;
     let root = format!("{MACHINES}/{name}");
     let machine = list()?.into_iter().find(|m| m.name == name);
-    // e_machine of the machine's shell: 0xB7 arm64, 0x3E x86-64. Its
-    // symlinks (Alpine's /bin/sh -> /bin/busybox) are inside the machine.
-    let inside = |mut path: String| {
-        for _ in 0..8 {
-            let full = format!("{root}{path}");
-            match std::fs::read_link(&full) {
-                Ok(target) if target.is_absolute() => path = target.to_string_lossy().into_owned(),
-                Ok(target) => {
-                    let dir = Path::new(&path).parent().unwrap_or(Path::new("/"));
-                    path = dir.join(target).to_string_lossy().into_owned();
-                }
-                Err(_) => return std::fs::read(full).ok(),
-            }
-        }
-        None
-    };
-    let arch = inside("/bin/sh".into())
-        .or_else(|| inside("/usr/bin/sh".into()))
+    // e_machine of the machine's shell: 0xB7 arm64, 0x3E x86-64 (its
+    // symlinks, like Alpine's /bin/sh -> /bin/busybox, resolve inside it).
+    let arch = crate::inroot::Root::new(&root)
+        .and_then(|r| r.read("/bin/sh", 20))
+        .ok()
         .and_then(|elf| elf.get(18).copied())
         .map_or("unknown", |m| match m {
             0xB7 => "arm64",
@@ -686,9 +755,11 @@ fn copy(action: &str, name: &str, from: &str, to: &str, owner: &str) -> io::Resu
     if !running(name) {
         start(name)?;
     }
-    sh(&format!("machinectl {action} {name} '{from}' '{to}'"))?;
+    sh(&format!("machinectl {action} {name} '{from}' '{to}'")).map_err(|e| {
+        if e.to_string().contains("File exists") { io::Error::other(format!("{to} already exists; give another name, or remove it first")) } else { e }
+    })?;
     if action == "copy-to" && owner.bytes().all(|b| b.is_ascii_digit() || b == b':') && !owner.is_empty() {
-        let _ = sh(&format!("nsenter -t \"$(machinectl show {name} -p Leader --value)\" -m -- chown -R {owner} '{to}'"));
+        let _ = run_in(name, &format!("chown -R {owner} '{to}'"));
     }
     Ok(())
 }

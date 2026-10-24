@@ -124,7 +124,9 @@ pub fn push(paths: &Paths, name: &str, from: &std::path::Path, to: Option<&str>)
     let user = std::env::var("USER")?;
     let base = std::path::Path::new(&source).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
     let target = to.map(str::to_string).unwrap_or_else(|| format!("/home/{user}/{base}"));
-    let owner = format!("{}:{}", unsafe { libc::getuid() }, unsafe { libc::getgid() });
+    // "uid:": the user's own group in the machine (the Mac's gid can mean
+    // something else there: staff, 20, is Debian's dialout).
+    let owner = format!("{}:", unsafe { libc::getuid() });
     call(paths, "copy-to", &[name, &source, &target, &owner])?;
     println!("Copied {} to {name}:{target}", from.display());
     Ok(())
@@ -170,11 +172,25 @@ pub fn shell_command(name: &str, command: &[String]) -> Result<Vec<String>> {
     }
     let user = std::env::var("USER")?;
     let quote = |w: &str| format!("'{}'", w.replace('\'', "'\\''"));
-    let mut script = format!("exec nsenter -t \"$(machinectl show {name} -p Leader --value)\" -a -- su -l {user}");
+    let inner = command.iter().map(|w| quote(w)).collect::<Vec<_>>().join(" ");
+    // An isolated machine through its own systemd (`machinectl shell`),
+    // which keeps the machine's limits: nsenter would run the machine's su
+    // as the VM's unconfined root (agent/src/machines.rs, run_in).
+    // (`machinectl shell` drops a command's output without a terminal:
+    // systemd-run, which is confined the same way, for commands.)
+    let confined = if command.is_empty() {
+        format!("machinectl -q shell {user}@{name}")
+    } else {
+        format!(
+            "systemd-run -M {name} --uid={user} --wait --quiet --collect -p WorkingDirectory=~ \"$([ -t 0 ] && echo --pty || echo --pipe)\" /bin/sh -lc {}",
+            quote(&inner)
+        )
+    };
+    let mut direct = format!("nsenter -t \"$(machinectl show {name} -p Leader --value)\" -a -- su -l {user}");
     if !command.is_empty() {
-        let inner = command.iter().map(|w| quote(w)).collect::<Vec<_>>().join(" ");
-        script.push_str(&format!(" -c {}", quote(&inner)));
+        direct.push_str(&format!(" -c {}", quote(&inner)));
     }
+    let script = format!("if grep -qx '# berth: isolated' /etc/systemd/nspawn/{name}.nspawn 2>/dev/null; then exec {confined}; else exec {direct}; fi");
     // ssh hands the joined arguments to the VM's shell: quote the script once.
     Ok(vec!["sudo".into(), "sh".into(), "-c".into(), quote(&script)])
 }

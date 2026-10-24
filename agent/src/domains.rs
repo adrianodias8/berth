@@ -343,6 +343,8 @@ fn sync_now(table: &Shared) -> io::Result<()> {
     }
 
     apply(&up, &mapping)?;
+    // Docker (re)starting, and apply() above, put rules ahead of ours.
+    crate::machines::ensure_jumps();
     crate::files::sync_containers();
     let gone: Vec<(String, Ipv4Addr)> = {
         let mut t = table.write().unwrap();

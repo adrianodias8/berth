@@ -8,13 +8,19 @@
 //! user can read it), instead of trusting whoever connects.
 //!
 //! /srv/berth holds bind mounts of /var/lib/docker/volumes and
-//! /var/lib/machines, and `containers/<name>` symlinks to each running
-//! container's root filesystem: a bind mount would keep a stopped
-//! container's overlay alive, and its restart would then mount the same
-//! upper directory twice. Samba follows the links (wide links), so a
-//! container's absolute symlinks resolve in the VM, not the container.
-//! Everything is served as root: the Mac user can open what containers and
-//! machines wrote, whoever owns it in the VM.
+//! /var/lib/machines, and `containers/<name>`: relative symlinks into
+//! `.rootfs`, a mirror of where Docker mounts containers' root filesystems.
+//! The mirror is a recursive bind made a slave of the original, so each
+//! container's mount appears in it when Docker mounts it and goes when
+//! Docker unmounts it. A bind of each root filesystem instead would keep a
+//! stopped container's overlay alive, and its restart would mount the same
+//! upper directory twice.
+//!
+//! Links are only followed inside the share (`wide links = no`): one that
+//! a container or machine planted, pointing elsewhere in the VM (`/etc`,
+//! `/dev`), is refused rather than served as root. Everything is served as
+//! root: the Mac user can open what containers and machines wrote, whoever
+//! owns it in the VM.
 
 use std::io;
 use std::path::Path;
@@ -59,12 +65,19 @@ pub fn ensure(password: &str) -> io::Result<()> {
         let _ = std::fs::remove_file("/etc/exports.d/berth.exports");
         let _ = sh("exportfs -ra 2>/dev/null; systemctl disable --now nfs-server 2>/dev/null; true");
     }
-    for (name, source) in [("volumes", "/var/lib/docker/volumes"), ("machines", "/var/lib/machines")] {
+    // Recursive (a volume can be a mount of its own) and slaves (mounts and
+    // unmounts there show up here, ours don't go back).
+    for (name, source) in [
+        ("volumes", "/var/lib/docker/volumes"),
+        ("machines", "/var/lib/machines"),
+        (".rootfs", "/var/lib/docker/rootfs/overlayfs"),
+        (".overlay2", "/var/lib/docker/overlay2"),
+    ] {
         let target = format!("{ROOT}/{name}");
         std::fs::create_dir_all(&target)?;
         std::fs::create_dir_all(source)?;
         if !mounted(&target) {
-            sh(&format!("mount --bind {source} {target}"))?;
+            sh(&format!("mount --rbind {source} {target} && mount --make-rslave {target}"))?;
         }
     }
     std::fs::create_dir_all(format!("{ROOT}/containers"))?;
@@ -93,7 +106,7 @@ pub fn ensure(password: &str) -> io::Result<()> {
          \x20 printcap name = /dev/null\n\
          \x20 disable spoolss = yes\n\
          \x20 log level = 0\n\
-         \x20 allow insecure wide links = yes\n\
+         \x20 server signing = mandatory\n\
          \x20 vfs objects = fruit streams_xattr\n\
          \x20 fruit:metadata = stream\n\
          \x20 fruit:nfs_aces = no\n\
@@ -104,7 +117,8 @@ pub fn ensure(password: &str) -> io::Result<()> {
          \x20 force user = root\n\
          \x20 force group = root\n\
          \x20 follow symlinks = yes\n\
-         \x20 wide links = yes\n\
+         \x20 wide links = no\n\
+         \x20 hide files = /.rootfs/.overlay2/\n\
          \x20 case sensitive = yes\n"
     );
     let changed = std::fs::read_to_string(CONF).ok().as_deref() != Some(conf.as_str());
@@ -124,7 +138,9 @@ pub fn ensure(password: &str) -> io::Result<()> {
     if let Some(mut stdin) = child.stdin.take() {
         io::Write::write_all(&mut stdin, format!("{password}\n{password}\n").as_bytes())?;
     }
-    child.wait()?;
+    if !child.wait()?.success() {
+        return Err(io::Error::other("smbpasswd failed"));
+    }
     if changed || sh("systemctl is-active -q smbd").is_err() {
         sh("systemctl enable -q smbd && systemctl restart smbd")?;
     }
@@ -144,7 +160,8 @@ pub fn sync_containers() {
     for c in crate::docker::containers().unwrap_or_default() {
         let Some(name) = c.name().filter(|n| !n.is_empty() && !n.contains('/') && !n.starts_with('.')) else { continue };
         if let Some(rootfs) = rootfs(&c.id) {
-            wanted.insert(name.to_string(), rootfs);
+            // First come keeps a name (Docker and nerdctl can share one).
+            wanted.entry(name.to_string()).or_insert(rootfs);
         }
     }
     for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
@@ -162,14 +179,19 @@ pub fn sync_containers() {
     }
 }
 
-/// Where a running container's root filesystem is mounted in the VM:
-/// containerd's image store (Docker 29's default), or overlay2's merged dir.
+/// A running container's root filesystem, as a link target relative to
+/// `containers/`, inside the share's mirrors: containerd's image store
+/// (Docker 29's default), or overlay2's merged dir.
 fn rootfs(id: &str) -> Option<String> {
-    let snapshotter = format!("/var/lib/docker/rootfs/overlayfs/{id}");
-    if mounted(&snapshotter) {
-        return Some(snapshotter);
+    if !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    if mounted(&format!("{ROOT}/.rootfs/{id}")) {
+        return Some(format!("../.rootfs/{id}"));
     }
     let inspect = crate::docker::inspect(id).ok()?;
-    let merged = inspect["GraphDriver"]["Data"]["MergedDir"].as_str()?.to_string();
-    mounted(&merged).then_some(merged)
+    let merged = inspect["GraphDriver"]["Data"]["MergedDir"].as_str()?;
+    let layer = merged.strip_prefix("/var/lib/docker/overlay2/")?.strip_suffix("/merged")?;
+    let mirrored = format!("{ROOT}/.overlay2/{layer}/merged");
+    (layer.bytes().all(|b| b.is_ascii_alphanumeric()) && mounted(&mirrored)).then(|| format!("../.overlay2/{layer}/merged"))
 }

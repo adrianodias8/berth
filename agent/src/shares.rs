@@ -27,7 +27,9 @@ pub fn mount(tag: &str, dir: &str) -> std::io::Result<&'static str> {
     let mut last = std::io::Error::other("no driver");
     for fstype in ["virtiofs_poll", "virtiofs"] {
         let ty = std::ffi::CString::new(fstype)?;
-        if unsafe { libc::mount(tag.as_ptr(), dir.as_ptr(), ty.as_ptr(), 0, std::ptr::null()) } == 0 {
+        // Nothing set-uid or device-like from the Mac (anyone there can write /tmp).
+        let flags = libc::MS_NOSUID | libc::MS_NODEV;
+        if unsafe { libc::mount(tag.as_ptr(), dir.as_ptr(), ty.as_ptr(), flags, std::ptr::null()) } == 0 {
             return Ok(fstype);
         }
         last = std::io::Error::last_os_error();

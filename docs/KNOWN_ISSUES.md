@@ -58,10 +58,12 @@ fix one, remove it here in the same change.
   waits for it.
 - **Machine creation puts the user name and home into `sh -c` and `.nspawn`
   files unquoted.** These values come only from the Mac user.
-- **Any user in a machine can run commands on the Mac** with `mac`
-  (`/run/berth/mac.sock` is 0666), as the Mac user. Machine root can also
-  reach the VM's root through files berth reads in the machine. Machines are
-  trusted, like OrbStack's; don't run untrusted code in one.
+- **Integrated machines are trusted with the Mac**: any user in one can run
+  commands on the Mac with `mac` (`/run/berth/mac.sock` is 0666), and berth
+  enters them with nsenter, running the machine's own binaries as the VM's
+  root. For untrusted code use an isolated machine: no `mac`, home or SSH
+  agent, and berth reaches into it only through its own systemd, so its
+  limits hold (which is why isolated machines need a systemd distribution).
 - **`mac` doesn't pass window resizes** to the command on the Mac.
 - **Docker/Podman API calls have no read timeout** (`docker.rs`): a hung
   `podman.service` stalls the domain sync.

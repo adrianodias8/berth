@@ -64,6 +64,9 @@ and boot messages). `berth shell` opens a shell in the VM.
 - **`mac: /run/berth/mac.sock: ...`** in a machine made before berth had
   the `mac` command: restart the machine (`berth machine stop <name>`, then
   start) so it gets `/run/berth`.
+- **"isolated machines need a distribution with systemd"**: berth reaches
+  into isolated machines only through their own systemd (Alpine has none).
+  Isolated machines have no `mac` command, SSH agent or home folder.
 - **No SSH agent in a machine.** berth uses the Mac's `SSH_AUTH_SOCK` (the
   one launchd sets for your login session); agents configured only with
   `IdentityAgent` in `~/.ssh/config` aren't picked up.
