@@ -158,12 +158,18 @@ fn bind_name(ip: IpAddr) -> Option<&'static str> {
 /// Socket inodes held by processes in a container cgroup.
 fn container_sockets() -> HashSet<u64> {
     let mut inodes = HashSet::new();
+    // Processes in their own network namespace can't own a socket in our
+    // tables: skip reading their descriptors.
+    let ours = std::fs::read_link("/proc/self/ns/net").ok();
     let Ok(procs) = std::fs::read_dir("/proc") else { return inodes };
     for entry in procs.flatten() {
         let name = entry.file_name();
         let Some(pid) = name.to_str().filter(|n| n.bytes().all(|b| b.is_ascii_digit())) else { continue };
         let Ok(cgroup) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) else { continue };
         if !cgroup.lines().any(|line| line.rsplit(':').next().is_some_and(is_container_cgroup)) {
+            continue;
+        }
+        if ours.is_some() && std::fs::read_link(format!("/proc/{pid}/ns/net")).ok() != ours {
             continue;
         }
         let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { continue };

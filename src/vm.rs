@@ -44,10 +44,10 @@ define_class!(
         ) -> Bool {
             // Dup as in connect_vsock: our copy outlives the connection object.
             let fd = unsafe { libc::dup(connection.fileDescriptor()) };
-            widen_buffers(fd);
             if fd < 0 {
                 return Bool::NO;
             }
+            widen_buffers(fd);
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
             Bool::new(INCOMING.get().is_some_and(|tx| tx.send(fd).is_ok()))
         }

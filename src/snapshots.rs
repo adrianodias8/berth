@@ -63,6 +63,18 @@ fn root(paths: &Paths) -> PathBuf {
     paths.root.join("snapshots")
 }
 
+/// Write via a synced temp file and a rename: the marker decides what the
+/// next start does, so it must be all there or not at all.
+fn write_durably(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    let mut file = fs::File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn restore_marker(paths: &Paths) -> PathBuf {
     paths.data().join("restore.json")
 }
@@ -143,17 +155,38 @@ fn new_partial(paths: &Paths, name: &str) -> Result<PathBuf> {
     if root(paths).join(name).exists() {
         bail!("a snapshot named {name} already exists");
     }
+    // Leftovers of snapshots interrupted by a crash (snapshots are taken one
+    // at a time, so none is in progress).
+    for entry in fs::read_dir(root(paths)).into_iter().flatten().flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if file.starts_with('.') && file.ends_with(".partial") {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
     let partial = root(paths).join(format!(".{name}.partial"));
-    let _ = fs::remove_dir_all(&partial);
     fs::create_dir_all(&partial)?;
-    // A sticky exclusion (an xattr on the folder): no root needed.
-    let _ = std::process::Command::new("tmutil")
-        .arg("addexclusion")
-        .arg(root(paths))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    exclude_from_backups(&root(paths));
     Ok(partial)
+}
+
+/// A sticky Time Machine exclusion: an xattr on the folder, no root needed.
+/// `tmutil` takes seconds, so it runs in the background, and only once.
+fn exclude_from_backups(dir: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return };
+    let name = c"com.apple.metadata:com_apple_backup_excludeItem";
+    if unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0, 0, 0) } >= 0 {
+        return;
+    }
+    let dir = dir.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("tmutil")
+            .arg("addexclusion")
+            .arg(dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    });
 }
 
 fn now() -> u64 {
@@ -346,7 +379,7 @@ pub fn prepare_restore(paths: &Paths, name: &str) -> Result<Meta> {
         share: meta.share.clone(),
         consumed: false,
     };
-    fs::write(restore_marker(paths), serde_json::to_vec(&pending)?)?;
+    write_durably(&restore_marker(paths), &serde_json::to_vec(&pending)?)?;
     Ok(meta)
 }
 
@@ -406,7 +439,7 @@ pub async fn suspend(paths: &Paths, res: &Resources) -> Result<()> {
         share: crate::virtiofs::CURRENT.get().map(|s| s.as_str().to_string()),
         consumed: true,
     };
-    fs::write(restore_marker(paths), serde_json::to_vec(&pending)?)?;
+    write_durably(&restore_marker(paths), &serde_json::to_vec(&pending)?)?;
     Ok(())
 }
 

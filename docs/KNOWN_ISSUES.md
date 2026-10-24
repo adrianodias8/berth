@@ -70,6 +70,9 @@ fix one, remove it here in the same change.
 - **No IPv6 for names:** berth's DNS and mDNS answer A records only
   (`host.docker.internal`, `*.berth.local`), and there is no IPv6
   `host.docker.internal`.
+- **Toggling IPv6 restarts dockerd**, which stops running containers (also
+  ones kept across a suspend). Turning it off leaves IPv6 forwarding on in the
+  VM until it reboots.
 - **IPv6 egress is unverified:** the test Mac has no IPv6 internet, so NAT66
   from the VM to the internet hasn't been seen working.
 

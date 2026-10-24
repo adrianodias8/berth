@@ -435,6 +435,13 @@ async fn forward_udp(socket: tokio::net::UdpSocket, port: u16) {
     }
 }
 
+/// When a direct connection to the guest last timed out.
+static DIRECT_DOWN: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+fn direct_down() -> bool {
+    DIRECT_DOWN.lock().unwrap().is_some_and(|t| t.elapsed() < Duration::from_secs(10))
+}
+
 async fn forward(listener: TcpListener, port: u16, route: Route) {
     let target = format!("tcp {}:{port}", route.guest);
     let direct = route.direct;
@@ -452,14 +459,19 @@ async fn forward(listener: TcpListener, port: u16, route: Route) {
         tokio::spawn(async move {
             let _ = client.set_nodelay(true);
             let result = async {
-                let guest_ip = if direct { *crate::routes::GUEST_IP.lock().unwrap() } else { None };
-                if let Some(ip) = guest_ip
-                    && let Ok(Ok(mut guest)) =
-                        tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect((ip, port))).await
-                {
-                    guest.set_nodelay(true)?;
-                    tokio::io::copy_bidirectional_with_sizes(&mut client, &mut guest, crate::BUF, crate::BUF).await?;
-                    return anyhow::Ok(());
+                let guest_ip = if direct && !direct_down() { *crate::routes::GUEST_IP.lock().unwrap() } else { None };
+                if let Some(ip) = guest_ip {
+                    match tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect((ip, port))).await {
+                        Ok(Ok(mut guest)) => {
+                            guest.set_nodelay(true)?;
+                            tokio::io::copy_bidirectional_with_sizes(&mut client, &mut guest, crate::BUF, crate::BUF).await?;
+                            return anyhow::Ok(());
+                        }
+                        // No answer at all (a stale address after a restore, say):
+                        // don't make every connection wait for it.
+                        Err(_) => *DIRECT_DOWN.lock().unwrap() = Some(std::time::Instant::now()),
+                        Ok(Err(_)) => {}
+                    }
                 }
                 let mut guest = guest_stream(&target).await?;
                 tokio::io::copy_bidirectional_with_sizes(&mut client, &mut guest, crate::BUF, crate::BUF).await?;
@@ -474,7 +486,6 @@ async fn forward(listener: TcpListener, port: u16, route: Route) {
     }
 }
 
-/// GET from the guest's Docker API; returns the body reader after the headers.
 /// IDs of the running Docker containers.
 pub async fn running_containers() -> Result<Vec<String>> {
     let mut body = String::new();
@@ -496,6 +507,7 @@ pub async fn start_container(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// GET from the guest's Docker API; returns the body reader after the headers.
 async fn docker_get(path: &str) -> Result<BufReader<UnixStream>> {
     docker_get_from(DOCKER_TARGET, path).await
 }
