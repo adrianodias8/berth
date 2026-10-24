@@ -11,7 +11,10 @@
  *  - after sending a foreground request it polls the used ring for the
  *    reply for up to poll_us microseconds instead of sleeping until the
  *    interrupt: on macOS's custom Virtio devices getting the interrupt back
- *    into the guest costs more than most replies take to produce.
+ *    into the guest costs more than most replies take to produce;
+ *  - a chmod to the mode a file already has, while its cached attributes
+ *    are still valid, is answered here without a round trip (tools like
+ *    Composer chmod every file they write two or three times).
  */
 
 #include <linux/fs.h>
@@ -1547,6 +1550,92 @@ static void virtio_fs_poll_reply(struct virtio_fs_vq *fsvq, struct fuse_req *req
 	virtio_fs_requests_done_work(&fsvq->done_work);
 }
 
+/* berth: answer no-op chmods locally (see the top of the file). */
+static unsigned int skip_noop_chmod = 1;
+module_param(skip_noop_chmod, uint, 0644);
+MODULE_PARM_DESC(skip_noop_chmod, "Answer chmods that change nothing without asking the host (0: off)");
+static unsigned long noop_chmods;
+module_param(noop_chmods, ulong, 0444);
+
+static int virtio_fs_inode_is(struct inode *inode, void *nodeid)
+{
+	return get_node_id(inode) == *(u64 *)nodeid;
+}
+
+/*
+ * berth: if @req is a SETATTR that only sets the mode, to the one the inode
+ * already has, and its attributes are still within their timeout, reply
+ * with the cached attributes and end it. Only for foreground requests from
+ * __fuse_request_send() (see virtio_fs_send_req), which may be ended here.
+ */
+static bool virtio_fs_answer_locally(struct fuse_req *req)
+{
+	struct fuse_args *args = req->args;
+	struct fuse_conn *fc = req->fm->fc;
+	const struct fuse_setattr_in *in;
+	struct fuse_attr_out *out;
+	struct fuse_attr *attr;
+	struct fuse_inode *fi;
+	struct inode *inode;
+	struct timespec64 t;
+	u64 nodeid = req->in.h.nodeid, now;
+	u32 left_nsec;
+	bool same;
+
+	if (!READ_ONCE(skip_noop_chmod) || req->in.h.opcode != FUSE_SETATTR ||
+	    test_bit(FR_BACKGROUND, &req->flags) || !test_bit(FR_ISREPLY, &req->flags) ||
+	    args->in_numargs != 1 || args->in_args[0].size != sizeof(*in) ||
+	    args->out_numargs != 1 || args->out_args[0].size != sizeof(*out))
+		return false;
+	in = args->in_args[0].value;
+	if (in->valid != FATTR_MODE)
+		return false;
+
+	/* fuse_iget() hashes inodes by node ID on 64-bit kernels. */
+	inode = ilookup5(req->fm->sb, (unsigned long)nodeid, virtio_fs_inode_is, &nodeid);
+	if (!inode)
+		return false;
+	fi = get_fuse_inode(inode);
+	now = get_jiffies_64();
+	same = (inode->i_mode & 07777) == (in->mode & 07777) && time_before64(now, fi->i_time);
+	if (same) {
+		out = args->out_args[0].value;
+		memset(out, 0, sizeof(*out));
+		/* Keep the attributes' remaining validity, not a fresh timeout. */
+		out->attr_valid = div_u64_rem(jiffies64_to_nsecs(fi->i_time - now), NSEC_PER_SEC, &left_nsec);
+		out->attr_valid_nsec = left_nsec;
+		attr = &out->attr;
+		attr->ino = fi->orig_ino;
+		attr->size = i_size_read(inode);
+		attr->blocks = inode->i_blocks;
+		t = inode_get_atime(inode);
+		attr->atime = t.tv_sec;
+		attr->atimensec = t.tv_nsec;
+		t = inode_get_mtime(inode);
+		attr->mtime = t.tv_sec;
+		attr->mtimensec = t.tv_nsec;
+		t = inode_get_ctime(inode);
+		attr->ctime = t.tv_sec;
+		attr->ctimensec = t.tv_nsec;
+		attr->mode = inode->i_mode;
+		attr->nlink = inode->i_nlink;
+		attr->uid = from_kuid(fc->user_ns, inode->i_uid);
+		attr->gid = from_kgid(fc->user_ns, inode->i_gid);
+		attr->rdev = new_encode_dev(inode->i_rdev);
+		attr->blksize = 1 << inode->i_blkbits;
+	}
+	iput(inode);
+	if (!same)
+		return false;
+
+	req->out.h.error = 0;
+	req->out.h.unique = req->in.h.unique;
+	req->out.h.len = sizeof(req->out.h) + sizeof(*out);
+	WRITE_ONCE(noop_chmods, noop_chmods + 1);
+	fuse_request_end(req);
+	return true;
+}
+
 static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 {
 	unsigned int queue_id;
@@ -1558,6 +1647,9 @@ static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 		req->in.h.unique = fuse_get_unique(fiq);
 
 	clear_bit(FR_PENDING, &req->flags);
+
+	if (virtio_fs_answer_locally(req))
+		return;
 
 	fs = fiq->priv;
 	queue_id = VQ_REQUEST + fs->mq_map[raw_smp_processor_id()];

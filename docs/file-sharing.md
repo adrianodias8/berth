@@ -58,7 +58,7 @@ guest app ─ syscall ─ Linux FUSE ─ virtio-fs driver ═ virtqueue ═ Virt
 
 Most of a request's time was the framework delivering the reply interrupt
 back into the guest. `guest/kmod/virtiofs_poll/` is Linux 6.12's
-`fs/fuse/virtio_fs.c` with two changes (marked `berth:`):
+`fs/fuse/virtio_fs.c` with three changes (marked `berth:`):
 
 1. **Its own device ID.** It binds only device ID 62 and registers the
    filesystem `virtiofs_poll`, so the built-in driver keeps serving
@@ -70,6 +70,11 @@ back into the guest. `guest/kmod/virtiofs_poll/` is Linux 6.12's
      ones, which can be sent holding `fc->bg_lock`.
    - The guest kernel has no preempt count, so `preemptible()` can't be used
      as the guard.
+
+3. **No-op chmods answered in the guest.** A `chmod` to the mode a file
+   already has, while its cached attributes are valid, is answered from the
+   inode without a round trip (`skip_noop_chmod`, counter `noop_chmods`).
+   Composer chmods every file it writes two or three times.
 
 A round trip went from ~180 µs to ~18 µs (Apple's share: ~34 µs).
 
@@ -144,7 +149,7 @@ Results (M2 Max, seconds; `bench/results/2026-10-23-ddev-drupal.md`):
 | extract 20k files | 7.5 | 7.3 | **2.4** | 2.3 |
 | delete 20k files | 2.7 | 2.7 | **1.4** | 1.5 |
 | 4 parallel extracts | 20.4 | 12.8 | 7.7 | – |
-| DDEV `composer install` | fails* | 16 | 10–15 | 6.6 |
+| DDEV `composer install` | fails* | 16 | 8.6–9.5 | 6.6 |
 | DDEV `drush site:install` | fails* | 67 | 41–44 | 37 |
 
 \* `create-project` aborts on Apple's share (ownership), so the later steps
