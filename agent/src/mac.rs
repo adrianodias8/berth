@@ -43,7 +43,12 @@ pub fn run() {
         match listen(path) {
             Ok(listener) => {
                 std::thread::spawn(move || {
-                    for conn in listener.incoming().flatten() {
+                    for conn in listener.incoming() {
+                        let Ok(conn) = conn else {
+                            // Out of descriptors, typically: don't spin.
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            continue;
+                        };
                         std::thread::spawn(move || {
                             if let Err(err) = relay(conn, kind) {
                                 eprintln!("berth-agent: {kind}: {err}");
@@ -94,8 +99,10 @@ pub fn machine_ssh(name: &str, host: UnixStream) -> io::Result<()> {
         }
     }
     let ip = ip.ok_or_else(|| io::Error::other(format!("machine {name} has no address")))?;
+    let ssh = std::net::SocketAddr::from((ip, 22));
+    let connect = || std::net::TcpStream::connect_timeout(&ssh, std::time::Duration::from_secs(3));
     // A machine made before this has no sshd: set it up on first use.
-    if std::net::TcpStream::connect((ip, 22)).is_err()
+    if connect().is_err()
         && let Err(err) = crate::machines::ensure_sshd(name)
     {
         eprintln!("berth-agent: machines: sshd in {name}: {err}");
@@ -103,7 +110,7 @@ pub fn machine_ssh(name: &str, host: UnixStream) -> io::Result<()> {
     // sshd may still be starting just after boot.
     let mut last = None;
     for _ in 0..20 {
-        match std::net::TcpStream::connect((ip, 22)) {
+        match connect() {
             Ok(sshd) => return crate::splice(host, sshd),
             Err(err) => last = Some(err),
         }
@@ -188,7 +195,11 @@ fn client_run(args: Vec<String>) -> io::Result<i32> {
             return Err(io::Error::other("lost the connection to the Mac"));
         }
         let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
-        let mut body = vec![0u8; len.min(1 << 20)];
+        // The Mac sends at most 64 KiB; more means we lost the framing.
+        if len > 1 << 20 {
+            return Err(io::Error::other("bad frame from the Mac"));
+        }
+        let mut body = vec![0u8; len];
         conn.read_exact(&mut body)?;
         match head[0] {
             STDOUT => {

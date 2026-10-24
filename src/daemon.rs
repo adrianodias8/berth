@@ -124,37 +124,55 @@ async fn restart_outdated_agent() {
         if let Ok(mut guest) = guest_stream("exit").await {
             let _ = guest.read_to_end(&mut Vec::new()).await;
         }
+        // The new one has no token yet, nor the current proxy.
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if guest_stream("info memory").await.is_ok() {
+                hand_over().await;
+                break;
+            }
+        }
     }
+}
+
+/// What the agent keeps only in memory, or should follow: the token for
+/// requests to the Mac (macexec.rs) and the proxy (the Mac's changes with
+/// its network). Each bounded: a slow agent mustn't hold up the clock.
+async fn hand_over() {
+    let _ = tokio::time::timeout(Duration::from_secs(10), crate::macexec::push_token()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), crate::proxy::push()).await;
 }
 
 /// Keep the guest's clock on the Mac's: the VM's clock stops while the Mac
 /// sleeps, and NTP in the guest takes a long time to notice.
-/// Also hands the agent the token for requests to the Mac (macexec.rs),
-/// again after it restarts.
+/// Also hands the agent what it should know (hand_over), and mounts ~/Berth.
 async fn keep_clock() {
     // On a first boot the agent starts only once Docker is installed.
     while guest_stream("info memory").await.is_err() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    crate::macexec::push_token().await;
-    crate::proxy::push(&Paths::new()).await;
+    hand_over().await;
     tokio::spawn(async {
-        // Retried: on a first boot apt may still be busy in the VM.
-        for attempt in 0..20 {
+        // A mount left by a daemon that crashed points at a VM that's gone.
+        let _ = tokio::task::spawn_blocking(|| crate::files::unmount(&Paths::new())).await;
+        // Retried: the VM's address comes with the first route sync, and on
+        // a first boot apt may still be busy in the VM.
+        for attempt in 0..30 {
+            if stopping() {
+                return; // stop() has unmounted; don't mount again under it
+            }
             match crate::files::mount(&Paths::new()).await {
                 Ok(()) => return,
-                Err(err) if attempt == 0 => eprintln!("files: ~/Berth not mounted yet: {err:#}"),
+                Err(err) if attempt == 10 => eprintln!("files: ~/Berth not mounted yet: {err:#}"),
                 Err(_) => {}
             }
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            tokio::time::sleep(Duration::from_secs(if attempt < 10 { 3 } else { 30 })).await;
         }
     });
     loop {
         tokio::time::sleep(Duration::from_secs(15)).await;
         sync_clock().await;
-        crate::macexec::push_token().await;
-        // The Mac's proxy changes with its network.
-        crate::proxy::push(&Paths::new()).await;
+        hand_over().await;
     }
 }
 
@@ -298,7 +316,7 @@ pub fn run(paths: Paths) -> Result<()> {
 
     let mut restore = crate::snapshots::take_restore(&paths);
     // A suspended VM resumes with the settings it had: if they've changed
-    // since (CPUs, memory, file sharing), boot instead so they apply.
+    // since (CPUs, memory, file sharing, IPv6), boot instead so they apply.
     // Its disk then boots as after a crash, and its containers are started.
     if let Some(r) = &mut restore
         && r.consumed
@@ -308,7 +326,8 @@ pub fn run(paths: Paths) -> Result<()> {
         let share_changed = r.share.is_some_and(|saved| {
             (saved == crate::virtiofs::HomeShare::Apple) != (crate::virtiofs::configured_share(&paths) == "apple")
         });
-        if now.cpus != r.resources.cpus || now.memory != r.resources.memory || share_changed {
+        let ipv6_changed = r.ipv6.is_some_and(|saved| saved != crate::snapshots::ipv6_setting(&paths));
+        if now.cpus != r.resources.cpus || now.memory != r.resources.memory || share_changed || ipv6_changed {
             eprintln!("settings changed since the VM was suspended; booting it instead of resuming");
             r.state = None;
             r.share = None;
@@ -641,7 +660,7 @@ async fn docker_ready() -> bool {
 /// `berth stop`: suspend if asked and possible, else shut the guest down.
 async fn stop(suspend: bool, cpus: usize, memory: u64) {
     // Before the VM (its NFS server) goes away.
-    let _ = tokio::task::spawn_blocking(|| crate::files::unmount(&Paths::new())).await;
+    let _ = tokio::task::spawn_blocking(|| crate::files::unmount_for_stop(&Paths::new())).await;
     // Set before suspend waits for a running snapshot, so a snapshot queued
     // behind it is refused rather than run on a VM being stopped.
     if suspend && !STOPPING.load(Ordering::SeqCst) {
@@ -672,7 +691,7 @@ async fn shutdown() {
         return;
     }
     eprintln!("stopping VM");
-    let _ = tokio::task::spawn_blocking(|| crate::files::unmount(&Paths::new())).await;
+    let _ = tokio::task::spawn_blocking(|| crate::files::unmount_for_stop(&Paths::new())).await;
     if let Err(err) = vm::request_stop().await {
         eprintln!("stop request failed: {err:#}");
     }
@@ -688,7 +707,7 @@ async fn shutdown() {
 }
 
 fn exit(paths: &Paths) -> ! {
-    crate::files::unmount(paths);
+    crate::files::unmount_for_stop(paths);
     crate::routes::clear();
     for path in [paths.control_socket(), paths.docker_socket(), paths.ssh_socket(), paths.podman_socket(), paths.machine_ssh_socket(), paths.pid_file()] {
         let _ = std::fs::remove_file(path);

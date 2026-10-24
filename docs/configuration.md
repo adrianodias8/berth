@@ -10,7 +10,9 @@ berth config get stop
 berth config unset cpus         # back to the default
 ```
 
-`berth config set` checks the value. A missing file or key
+`berth config set` checks the value (`ipv6` and `finder` also take
+on/off/yes/no). `berth config` keeps keys it doesn't know; the app writes only
+the settings you change. A missing file or key
 means the default. Changes apply on the next start (`berth stop --shutdown
 && berth start`, or Restart in the app).
 
@@ -31,10 +33,10 @@ means the default. Changes apply on the next start (`berth stop --shutdown
 | `cpus` | every core | CPUs the VM may use, clamped to what Virtualization.framework allows |
 | `memory_mib` | half the Mac's RAM, 2–16 GiB | the most memory the VM may hold. The balloon returns what the guest doesn't use, so this is a ceiling, not a reservation |
 | `file_sharing` | `"berth"` on macOS 27 | `"apple"` uses Apple's virtiofs for the home folder (`docs/file-sharing.md`). Before macOS 27 it's always Apple's |
-| `ipv6` | `false` | IPv6 subnets for Docker networks, NAT'd out of the VM. Changing it restarts dockerd, which stops running containers |
+| `ipv6` | `false` | IPv6 subnets for Docker networks, NAT'd out of the VM. Changing it restarts dockerd, which stops running containers; a suspended VM boots instead of resuming |
 | `stop` | `"shutdown"` | `"suspend"`: `berth stop` saves the VM's state and the next start resumes it (see below) |
-| `proxy` | `"auto"` | the HTTP(S) proxy Docker uses for pulls and pushes (and apt in the VM): `"auto"` follows the Mac's settings (System Settings › Network › Proxies, checked every 15 s), `"none"`, or a URL. A proxy on the Mac's own `localhost` works. PAC files aren't followed. Containers don't get it: pass `HTTP_PROXY` yourself |
-| `finder` | `true` | Docker volumes and machines' files in Finder at `~/Berth`, over NFS from the VM, while berth runs |
+| `proxy` | `"auto"` | the HTTP(S) proxy Docker uses for pulls and pushes (and apt in the VM): `"auto"` follows the Mac's settings (System Settings › Network › Proxies, checked every 15 s), `"none"`, or an `http://` or `https://` URL. A proxy on the Mac's own `localhost` works. PAC files aren't followed. Containers don't get it: pass `HTTP_PROXY` yourself |
+| `finder` | `true` | Docker volumes and machines' files in Finder at `~/Berth`, over NFS from the VM, while berth runs; needs the IP route helper |
 
 ## Suspend instead of shutdown
 
@@ -54,10 +56,12 @@ start` resumes it in about 3 s, with containers still running.
 
 ## Proxy changes
 
-Docker reads its proxy when it starts, so a change restarts Docker in the
-VM, but only while no container runs: with `"auto"` the proxy changes with
-the Mac's network (a VPN, say), and that shouldn't stop your containers.
-Otherwise it applies as soon as none runs, or at the next start.
+Docker reads its proxy when it starts, and restarting it would stop
+containers, builds and pulls (with `"auto"` the proxy changes with the Mac's
+network, a VPN say), so a change applies when Docker next starts:
+`berth stop --shutdown && berth start`. Just after the VM boots, before
+anything runs, berth does restart Docker once if the proxy changed while
+the VM was off.
 
 ## Environment variables
 
@@ -81,7 +85,8 @@ These are for testing and debugging; set them for `berth start`.
 | `~/.berth/snapshots/` | snapshots (excluded from Time Machine) |
 | `~/.berth/guest/` | the guest agent, the exported kernel, boot markers |
 | `~/.berth/bin/` | the bundled `docker`, Compose, Buildx and `kubectl` |
-| `~/.berth/run/` | sockets: `docker.sock`, `podman.sock`, `ssh.sock`, the control socket |
+| `~/.berth/cache/` | the downloaded Debian image (kept by `berth delete`; excluded from Time Machine) |
+| `~/.berth/run/` | sockets (`docker.sock`, `podman.sock`, `ssh.sock`, `machine-ssh.sock`, the control socket) and the daemon's pid file |
 | `~/.berth/tls/` | the local CA for `https://*.berth.local` |
 | `~/.berth/log/` | `daemon.log` (the host side) and `console.log` (the VM's console) |
 | `~/.berth/ssh/` | the VM's SSH key, and `config` (`ssh berth`, `ssh <machine>.berth`), included from `~/.ssh/config` |

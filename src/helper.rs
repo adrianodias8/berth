@@ -4,8 +4,9 @@
 //! `sudo berth helper install`. It keeps a set of routes for private subnets
 //! via a VM on a vmnet bridge, points /var/run/docker.sock at the user's
 //! berth socket, and binds privileged loopback ports for port forwarding
-//! (macOS lets users bind ports below 1024 only on all interfaces), for one
-//! user.
+//! (macOS lets users bind ports below 1024 only on all interfaces), and
+//! mounts the VM's files at ~/Berth from a reserved port (the VM exports them
+//! only to such ports, which only root can use), for one user.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
@@ -39,7 +40,7 @@ pub struct Route {
 }
 
 /// Bumped when the helper gains abilities, so berth can ask for a reinstall.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize)]
 pub struct SetRoutes {
@@ -259,6 +260,17 @@ fn handle(stream: UnixStream, uid: u32, installed: &std::sync::Mutex<BTreeSet<Ro
     if let Ok(bind) = serde_json::from_str::<BindRequest>(&line) {
         return send_bound(&stream, &bind);
     }
+    if let Ok(req) = serde_json::from_str::<FilesRequest>(&line)
+        && line.contains("\"files_server\"")
+    {
+        let reply = match files(&req, uid) {
+            Ok(()) => "ok".to_string(),
+            Err(err) => format!("error: {err:#}"),
+        };
+        let mut stream = stream;
+        writeln!(stream, "{reply}")?;
+        return Ok(());
+    }
     let request: SetRoutes = serde_json::from_str(&line)?;
     let mut reply = reconcile(&request.routes, &mut installed.lock().unwrap());
     if let Some(target) = &request.docker_socket
@@ -438,6 +450,63 @@ fn parse_netstat_dest(dest: &str) -> Option<Cidr> {
     full[..octets.len()].copy_from_slice(&octets);
     let len = len.unwrap_or(8 * octets.len() as u8);
     Some(Cidr { net: u32::from(Ipv4Addr::from(full)) & mask(len), len })
+}
+
+/// Mount (or unmount) the VM's NFS export at the user's ~/Berth.
+#[derive(Serialize, Deserialize)]
+struct FilesRequest {
+    /// The VM's address; None to unmount.
+    files_server: Option<Ipv4Addr>,
+}
+
+/// The fixed NFS options (src/files.rs explains them); `resvport` is why
+/// root mounts it.
+pub const NFS_OPTIONS: &str =
+    "vers=3,tcp,resvport,port=2049,mountport=20048,nolocks,locallocks,soft,intr,timeo=20,retrans=2,rdirplus,acdirmax=3,nosuid,nodev";
+
+fn files(req: &FilesRequest, uid: u32) -> Result<()> {
+    let dir = home_of(uid).context("no home directory for the helper's user")?.join("Berth");
+    let Some(server) = req.files_server else {
+        let _ = Command::new("/sbin/umount").arg("-f").arg(&dir).output();
+        return Ok(());
+    };
+    // Only the VM: a private address on a VM bridge.
+    if !server.is_private() {
+        bail!("{server} is not a private address");
+    }
+    match interface_for(server) {
+        Some(iface) if iface.starts_with("bridge") => {}
+        _ => bail!("{server} is not on a VM bridge"),
+    }
+    // A plain folder of the user's, so nothing else gets covered.
+    match std::fs::symlink_metadata(&dir) {
+        Ok(m) if m.is_dir() && std::os::unix::fs::MetadataExt::uid(&m) == uid => {}
+        Ok(_) => bail!("{} is not a folder of the user's", dir.display()),
+        Err(e) => bail!("{}: {e}", dir.display()),
+    }
+    let out = Command::new("/sbin/mount_nfs").args(["-o", NFS_OPTIONS, &format!("{server}:/srv/berth")]).arg(&dir).output()?;
+    if !out.status.success() {
+        bail!("mount_nfs: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    eprintln!("berth-helper: mounted the VM's files at {}", dir.display());
+    Ok(())
+}
+
+/// Ask the helper to mount the VM's files at ~/Berth (None: unmount).
+pub fn mount_files(server: Option<Ipv4Addr>) -> Result<()> {
+    if !Path::new(SOCKET).exists() {
+        bail!("needs the berth helper (sudo berth helper install)");
+    }
+    let mut stream = UnixStream::connect(SOCKET)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(20)))?;
+    writeln!(stream, "{}", serde_json::to_string(&FilesRequest { files_server: server })?)?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    match line.trim() {
+        "ok" => Ok(()),
+        "" => bail!("the helper didn't answer (outdated helper? sudo berth helper install)"),
+        err => bail!("{}", err.strip_prefix("error: ").unwrap_or(err)),
+    }
 }
 
 /// A request for a listening socket on a privileged loopback port.

@@ -187,7 +187,7 @@ something here stops being true, fix it.
 - **Request counts are set by the tool and the guest kernel,** not the server:
   - **tar:** 5 per file (LOOKUP, CREATE, WRITE, SETATTR, GETATTR of the
     folder);
-  - **Composer:** ~12, including 2–3 `chmod`s per file, usually to the mode
+  - **Composer:** ~10-12, including 2–3 `chmod`s per file, usually to the mode
     it already has;
   - **why some can't be cut:** `O_EXCL` creates and `mkdir` always revalidate
     a cached "doesn't exist" entry, and creating a file always discards its

@@ -243,7 +243,8 @@ pub fn integrate_all() {
     // iptables rules don't survive a reboot; Docker makes DOCKER-USER once
     // it's up, which may be a while on boot.
     std::thread::spawn(|| {
-        for _ in 0..120 {
+        // Up to 30 min: a first boot installs Docker first.
+        for _ in 0..900 {
             if Command::new("iptables").args(["-w", "-L", "DOCKER-USER", "-n"]).output().is_ok_and(|o| o.status.success()) {
                 allow_forwarding();
                 return;

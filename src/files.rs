@@ -1,7 +1,8 @@
 //! ~/Berth in Finder: the VM's Docker volumes and machines, mounted over
 //! NFS from the VM (agent/src/files.rs). Mounted once the agent is up,
 //! unmounted before the VM stops: an NFS mount whose server went away hangs
-//! whatever touches it. Off with `"finder": false` in config.json.
+//! whatever touches it. Off with `"finder": false` in config.json. Needs
+//! the root helper: the VM accepts mounts from reserved ports only.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -11,8 +12,9 @@ use tokio::io::AsyncReadExt;
 
 use crate::paths::Paths;
 
-/// agent/src/files.rs MOUNTD_PORT.
-const MOUNTD_PORT: u16 = 20048;
+
+/// Set once the VM is on its way down: no more mounts after that.
+static STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn dir(paths: &Paths) -> PathBuf {
     paths.home.join("Berth")
@@ -57,38 +59,34 @@ pub async fn mount(paths: &Paths) -> Result<()> {
         bail!("the VM couldn't export its files: {}", reply.trim());
     }
     let Some(ip) = *crate::routes::GUEST_IP.lock().unwrap() else { bail!("no VM address yet") };
+    if STOPPED.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
+    }
     std::fs::create_dir_all(&dir)?;
+    // The VM exports only to reserved ports (or any local process could
+    // mount it, as root in the VM): root mounts it, through the helper.
     // Soft and interruptible: if the VM goes away first, calls fail instead
     // of hanging Finder. No locking: NFSv3's lock daemon isn't run.
-    let options = format!("vers=3,tcp,port=2049,mountport={MOUNTD_PORT},nolocks,locallocks,soft,intr,timeo=20,retrans=2,rdirplus,acdirmax=3");
-    let out = tokio::process::Command::new("/sbin/mount_nfs")
-        .args(["-o", &options, &format!("{ip}:/srv/berth")])
-        .arg(&dir)
-        .output()
-        .await?;
-    if !out.status.success() {
-        bail!("mount_nfs: {}", String::from_utf8_lossy(&out.stderr).trim());
-    }
+    tokio::task::spawn_blocking(move || crate::helper::mount_files(Some(ip))).await??;
     eprintln!("files: the VM's volumes and machines are in {}", dir.display());
     Ok(())
 }
 
-/// Before the VM stops. Forced: open files in Finder mustn't keep it busy.
+/// Before the VM stops: unmount, and mount no more.
+pub fn unmount_for_stop(paths: &Paths) {
+    STOPPED.store(true, std::sync::atomic::Ordering::SeqCst);
+    unmount(paths);
+}
+
+/// Forced: open files in Finder mustn't keep it busy. Root mounted it, so
+/// the helper unmounts it (bounded: stopping mustn't wait on it).
 pub fn unmount(paths: &Paths) {
-    let dir = dir(paths);
-    if mounted_type(&dir).as_deref() != Some("nfs") {
+    if mounted_type(&dir(paths)).as_deref() != Some("nfs") {
         return;
     }
-    let mut child = match std::process::Command::new("/sbin/umount").arg("-f").arg(&dir).spawn() {
-        Ok(child) => child,
-        Err(_) => return,
-    };
-    // Don't let a wedged unmount hold up stopping.
-    for _ in 0..50 {
-        if child.try_wait().ok().flatten().is_some() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let _ = child.kill();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(crate::helper::mount_files(None));
+    });
+    let _ = rx.recv_timeout(Duration::from_secs(5));
 }

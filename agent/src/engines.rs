@@ -48,8 +48,12 @@ fn enabled(unit: &str) -> bool {
     Command::new("systemctl").args(["is-active", "--quiet", unit]).status().is_ok_and(|s| s.success())
 }
 
+/// Whether Podman is on. Polled (every few seconds, and per domain sync),
+/// so no `systemctl` fork, and no connect either (the socket activates the
+/// whole service): `berth engine enable` enables the socket unit, which
+/// leaves this link.
 pub fn podman_enabled() -> bool {
-    enabled("podman.socket")
+    std::path::Path::new("/etc/systemd/system/sockets.target.wants/podman.socket").exists()
 }
 
 /// Containers use berth's DNS (for *.berth.local and the Mac's resolvers),

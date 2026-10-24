@@ -33,26 +33,44 @@ pub fn install(paths: &Paths) -> Result<bool> {
         write_private(&ours, &config)?;
     }
     let dir = paths.home.join(".ssh");
-    let user_config = dir.join("config");
-    let existing = std::fs::read_to_string(&user_config).unwrap_or_default();
-    if existing.lines().any(|l| l.trim() == INCLUDE) {
+    let mut user_config = dir.join("config");
+    // Only a missing file is empty: one we can't read (not UTF-8, no
+    // permission) must not be replaced by just our line.
+    let existing = match std::fs::read(&user_config) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => anyhow::bail!("reading ~/.ssh/config: {e}; add `{INCLUDE}` at its top yourself"),
+    };
+    if String::from_utf8_lossy(&existing).lines().any(|l| l.trim() == INCLUDE) {
         return Ok(false);
     }
     if !dir.exists() {
         std::fs::create_dir(&dir)?;
         std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
     }
-    write_private(&user_config, &format!("{INCLUDE}\n\n{existing}"))?;
+    // A link (dotfile managers) is edited where it points, not replaced.
+    if std::fs::symlink_metadata(&user_config).is_ok_and(|m| m.file_type().is_symlink()) {
+        user_config = std::fs::canonicalize(&user_config)?;
+    }
+    if !existing.is_empty() {
+        let backup = user_config.with_file_name("config.berth-backup");
+        if !backup.exists() {
+            std::fs::write(&backup, &existing)?;
+        }
+    }
+    let mut contents = format!("{INCLUDE}\n\n").into_bytes();
+    contents.extend_from_slice(&existing);
+    write_private(&user_config, &contents)?;
     Ok(true)
 }
 
 /// Replace a file atomically, readable only by the user.
-fn write_private(path: &Path, contents: &str) -> Result<()> {
+fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("berth-tmp");
     let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-    file.write_all(contents.as_bytes())?;
+    file.write_all(contents.as_ref())?;
     file.sync_all()?;
     std::fs::rename(&tmp, path)?;
     Ok(())

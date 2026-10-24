@@ -21,13 +21,15 @@ if [ "${1:-}" = --inner ]; then
     mount -t overlay overlay -o lowerdir=/,upperdir=/mnt/upper,workdir=/mnt/work /mnt/root
     r=/mnt/root
     # Still the VM's /proc here, where $pid is the container's PID 1. Its
-    # name resolution, so apt and curl work as from the container. As plain
-    # files: the VM's are symlinks into /run, which is replaced below.
+    # name resolution, so apt and curl work as from the container: plain
+    # files only (a symlink would be followed in the VM, not the container)
+    # and bounded, else the VM's. Copied, since the VM's are symlinks into
+    # /run, which is replaced below.
     for f in resolv.conf hosts; do
         src=/proc/$pid/root/etc/$f
-        [ -s "$src" ] || src=/etc/$f
+        { [ -f "$src" ] && [ ! -L "$src" ]; } || src=/etc/$f
         rm -f "$r/etc/$f"
-        cat "$src" > "$r/etc/$f" 2>/dev/null || true
+        head -c 65536 "$src" > "$r/etc/$f" 2>/dev/null || true
     done
     mount -t proc proc "$r/proc"   # the container's processes
     mount --rbind /dev "$r/dev"

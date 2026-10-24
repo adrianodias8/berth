@@ -52,7 +52,7 @@ struct SnapshotsView: View {
                 } description: {
                     Text("A snapshot saves the whole VM: containers, volumes, images, machines and, while the Mac is unlocked, running processes. Take one before a risky change, then go back to it.")
                 } actions: {
-                    Button("Take Snapshot…") { showCreate = true }
+                    Button("Take Snapshot…") { showCreate = true }.disabled(busy != nil)
                 }
             } else {
                 List(selection: $selection) {
@@ -71,9 +71,9 @@ struct SnapshotsView: View {
                         }
                         .tag(s.name)
                         .contextMenu {
-                            Button("Restore…") { confirmRestore = s }
+                            Button("Restore…") { confirmRestore = s }.disabled(busy != nil)
                             Divider()
-                            Button("Delete…", role: .destructive) { confirmDelete = s }
+                            Button("Delete…", role: .destructive) { confirmDelete = s }.disabled(busy != nil)
                         }
                     }
                 }
@@ -117,7 +117,13 @@ struct SnapshotsView: View {
         ) { s in
             Button("Delete", role: .destructive) { perform(s.name, ["delete", s.name]) }
         }
-        .task { reload() }
+        .task {
+            // Snapshots also come and go from the CLI.
+            while !Task.isCancelled {
+                if busy == nil { reload() }
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
     }
 
     private func reload() { snapshots = Snapshots.list() }

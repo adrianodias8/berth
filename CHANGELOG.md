@@ -6,6 +6,15 @@ are in the commit messages.
 ## Unreleased
 
 ### 2026-10-24
+- **Fixed:** files created with O_EXCL|O_NOFOLLOW on bind mounts (busybox
+  tar's extraction) failed with EINVAL on berth's share.
+- **Review fixes:** ~/.ssh/config is never replaced when it can't be read and
+  is edited through symlinks (with a backup); `berth import` keeps anonymous
+  volumes' data, doesn't copy volumes that are Mac folders, and reports
+  failures; `mac` sessions hang up their command when the machine side goes
+  away; ~/Berth is mounted by the root helper and only from reserved ports;
+  proxy changes never restart Docker; machines autostart reliably at boot;
+  the app merges its settings into config.json; fewer idle forks in the VM.
 
 - **Machines and the Mac:** `ssh <machine>.berth` (VS Code Remote-SSH), the
   `mac` command inside machines, and the Mac's SSH agent in machines and at
@@ -19,7 +28,8 @@ are in the commit messages.
   `<name>.<namespace>.svc.cluster.local`.
 - **Settings:** `berth config list|get|set|unset`, with values checked.
 - **Proxy:** Docker's pulls and pushes follow the Mac's proxy settings (or a
-  given URL), without restarting Docker under running containers.
+  given URL); a change applies at the next start, never restarting Docker
+  under containers, builds or pulls.
 - **Import:** `berth import orbstack|docker-desktop` copies images, volumes,
   networks and containers (optionally one Compose project).
 - **Alpine machines** stop with `berth machine stop` and with the VM (busybox

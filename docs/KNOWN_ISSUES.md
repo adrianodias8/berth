@@ -50,9 +50,13 @@ fix one, remove it here in the same change.
 - **The machines' sshd is installed on first `ssh <name>.berth`** with the
   distro's package manager: it needs the internet, and the first connection
   waits for it.
-- **Machine actions put the user name and home into `sh -c` and `.nspawn`
-  files unquoted.** These values come only from the Mac user. Start/stop
-  don't re-validate the machine name.
+- **Machine creation puts the user name and home into `sh -c` and `.nspawn`
+  files unquoted.** These values come only from the Mac user.
+- **Any user in a machine can run commands on the Mac** with `mac`
+  (`/run/berth/mac.sock` is 0666), as the Mac user. Machine root can also
+  reach the VM's root through files berth reads in the machine. Machines are
+  trusted, like OrbStack's; don't run untrusted code in one.
+- **`mac` doesn't pass window resizes** to the command on the Mac.
 - **Docker/Podman API calls have no read timeout** (`docker.rs`): a hung
   `podman.service` stalls the domain sync.
 - **mDNS:** no cap on the number of questions per query; the goodbye socket
@@ -87,14 +91,13 @@ fix one, remove it here in the same change.
 - **Direct boot gets turned off** if berth stops after the "trying" marker
   is written but before the guest clears it.
 - **Small edge cases:**
-  - an absurd `memory_mib` wraps around;
-  - the ssh `ProxyCommand` path isn't quoted, so a home folder with spaces
-    breaks it;
+  - an absurd `memory_mib` put in config.json by hand wraps around
+    (`berth config set` checks it);
   - a Docker binding only on `::1` maps to 127.0.0.1.
 
-- **`~/Berth` (NFS) trusts its client.** Any local user on the Mac can
-  mount the VM's export and gets root access to volumes and machines. Fine
-  on a single-user Mac; the export only accepts the Mac's VM-network address.
+- **`~/Berth` (NFS) gives root in the VM** to whoever mounts it. Only root
+  on the Mac can (the export needs a reserved port; the helper mounts it),
+  but another VM on the same vmnet bridge could spoof the Mac's address.
 
 ## Root helper and downloads
 

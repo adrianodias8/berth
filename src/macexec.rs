@@ -6,6 +6,7 @@
 //! our vsock port, containers included, and must not run commands here.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::time::Duration;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
@@ -94,8 +95,10 @@ pub async fn exec(guest: UnixStream) -> Result<()> {
     let cwd = if cwd.starts_with(&home) && cwd.is_dir() { cwd.to_path_buf() } else { home };
     // A login shell, for the user's PATH (Homebrew and the like).
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-    let mut cmd = std::process::Command::new(shell);
-    cmd.args(["-l", "-c", "exec \"$@\"", "mac"]).args(&req.args).current_dir(cwd);
+    // fish has no "$@": its arguments are $argv.
+    let run = if shell.ends_with("/fish") { "exec $argv" } else { "exec \"$@\"" };
+    let mut cmd = std::process::Command::new(&shell);
+    cmd.args(["-l", "-c", run, "mac"]).args(&req.args).current_dir(cwd);
     if !req.term.is_empty() {
         cmd.env("TERM", &req.term);
     }
@@ -156,19 +159,29 @@ async fn run_tty(mut cmd: std::process::Command, req: &Request, mut input: Guest
         return Err(std::io::Error::last_os_error().into());
     }
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-    let slave_fd = slave.as_raw_fd();
+    // openpty's fds aren't close-on-exec: everything else the daemon starts
+    // would inherit this session's pty and keep it from ever hanging up.
+    for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
     cmd.stdin(slave.try_clone()?).stdout(slave.try_clone()?).stderr(slave.try_clone()?);
     // Its own session with the pty as controlling terminal, so ^C and job
     // control reach the command.
     unsafe {
         cmd.pre_exec(move || {
-            if libc::setsid() < 0 || libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) < 0 {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
     }
     let mut child = tokio::process::Command::from(cmd).kill_on_drop(true).spawn()?;
+    let pid = child.id().unwrap_or(0) as libc::pid_t;
+    let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let still_running = {
+        let exited = exited.clone();
+        move || pid > 0 && !exited.load(std::sync::atomic::Ordering::SeqCst)
+    };
     drop(slave);
     let master = std::fs::File::from(master);
     // pty writes block too: the guest's input goes to a writer thread.
@@ -189,6 +202,15 @@ async fn run_tty(mut cmd: std::process::Command, req: &Request, mut input: Guest
                 break;
             }
         }
+        // A terminal sends no EOF: the `mac` side went away. Hang up, as a
+        // closed terminal would; kill whatever ignores that.
+        if still_running() {
+            unsafe { libc::kill(-pid, libc::SIGHUP) };
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            if still_running() {
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
+        }
     });
     // pty reads block; a thread keeps them off the async workers.
     let reader = std::thread::spawn(move || {
@@ -203,6 +225,7 @@ async fn run_tty(mut cmd: std::process::Command, req: &Request, mut input: Guest
         }
     });
     let status = child.wait().await?;
+    exited.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = tokio::task::spawn_blocking(move || reader.join()).await;
     Ok(exit_code(status))
 }

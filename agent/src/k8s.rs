@@ -36,10 +36,19 @@ WantedBy=multi-user.target
 /// `<name>.<namespace>.svc.cluster.local` domains (domains.rs). The Mac
 /// routes the service network here, where kube-proxy takes over.
 pub fn services() -> Vec<(String, String, std::net::Ipv4Addr)> {
-    if !active() {
+    SERVICES.lock().unwrap().clone()
+}
+
+/// The last list watch_services read: domain syncs use it rather than
+/// running kubectl (slow, and it can hang) under their lock.
+static SERVICES: std::sync::Mutex<Vec<(String, String, std::net::Ipv4Addr)>> = std::sync::Mutex::new(Vec::new());
+
+fn read_services() -> Vec<(String, String, std::net::Ipv4Addr)> {
+    // Only once Kubernetes was ever set up: no systemctl forks otherwise.
+    if !std::path::Path::new(UNIT).exists() || !active() {
         return Vec::new();
     }
-    let Ok(json) = sh(&format!("KUBECONFIG={KUBECONFIG} {BIN} kubectl get services -A -o json 2>/dev/null")) else {
+    let Ok(json) = sh(&format!("KUBECONFIG={KUBECONFIG} {BIN} kubectl get services -A -o json --request-timeout=5s 2>/dev/null")) else {
         return Vec::new();
     };
     let Ok(list) = serde_json::from_str::<serde_json::Value>(&json) else { return Vec::new() };
@@ -57,19 +66,21 @@ pub fn services() -> Vec<(String, String, std::net::Ipv4Addr)> {
 /// Services change without Docker events: ask for a domain sync when the
 /// list does.
 pub fn watch_services() {
-    let mut last = Vec::new();
     loop {
         std::thread::sleep(std::time::Duration::from_secs(5));
-        let now = services();
-        if now != last {
-            last = now;
+        let now = read_services();
+        let changed = *SERVICES.lock().unwrap() != now;
+        if changed {
+            *SERVICES.lock().unwrap() = now;
             crate::domains::request_sync();
         }
     }
 }
 
+/// Polled every few seconds: a running service has its cgroup, so no
+/// `systemctl` fork.
 pub fn active() -> bool {
-    Command::new("systemctl").args(["is-active", "--quiet", "k3s"]).status().is_ok_and(|s| s.success())
+    std::path::Path::new("/sys/fs/cgroup/system.slice/k3s.service").exists()
 }
 
 fn sh(script: &str) -> io::Result<String> {

@@ -144,22 +144,24 @@ bench() {
     local p0; p0=$(mem_mb); sleep 60; local p60; p60=$(mem_mb); sleep 60; local p120; p120=$(mem_mb)
     row "4 GiB page cache: after / +60 s / +120 s" "+$p0 / +$p60 / +$p120 MB" "" "$e"
 
-    # Bind-mount file I/O on a home directory path.
+    # Bind-mount file I/O on a home directory path. A command that fails
+    # (its status, right after it) is reported, not timed.
+    timed() { local rc=$?; if [ $rc = 0 ]; then row "$2" "$(since "$1") s" "" "$e"; else row "$2" "FAILED (exit $rc)" "" "$e"; fi; }
     prepare_files
     local m="$WORK/$e"; rm -rf "$m"; mkdir -p "$m"
     local t
     t=$(now); d run --rm -v "$WORK:/w" alpine true >/dev/null; local base; base=$(since "$t")
     row "Container run overhead (alpine true)" "$base s" "" "$e"
     t=$(now); d run --rm -v "$WORK:/w" alpine sh -c "cd /w/$e && tar -xf /w/small.tar" >/dev/null
-    row "Bind mount: extract 20,000 × 1 KB files" "$(since "$t") s" "" "$e"
-    t=$(now); d run --rm -v "$WORK:/w" alpine sh -c "find /w/$e -type f -exec cat {} + >/dev/null" >/dev/null
-    row "Bind mount: read all 20,000 files" "$(since "$t") s" "" "$e"
+    timed "$t" "Bind mount: extract 20,000 × 1 KB files"
+    t=$(now); d run --rm -v "$WORK:/w" alpine sh -c "[ \$(find /w/$e -type f | wc -l) = 20000 ] && find /w/$e -type f -exec cat {} + >/dev/null" >/dev/null
+    timed "$t" "Bind mount: read all 20,000 files"
     t=$(now); d run --rm -v "$WORK:/w" alpine sh -c "rm -rf /w/$e/d*" >/dev/null
-    row "Bind mount: delete 20,000 files" "$(since "$t") s" "" "$e"
+    timed "$t" "Bind mount: delete 20,000 files"
     t=$(now); d run --rm -v "$WORK:/w" alpine sh -c "dd if=/dev/zero of=/w/$e/big bs=1M count=1024 conv=fsync 2>/dev/null" >/dev/null
-    row "Bind mount: write 1 GiB (fsync)" "$(since "$t") s" "" "$e"
+    timed "$t" "Bind mount: write 1 GiB (fsync)"
     t=$(now); d run --rm -v "$WORK:/w" alpine sh -c "dd if=/w/$e/big of=/dev/null bs=1M 2>/dev/null" >/dev/null
-    row "Bind mount: read 1 GiB" "$(since "$t") s" "" "$e"
+    timed "$t" "Bind mount: read 1 GiB"
     rm -rf "$m"
 
     # Network: Mac ← container, through the port forward and the domain.

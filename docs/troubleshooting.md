@@ -68,12 +68,14 @@ and boot messages). `berth shell` opens a shell in the VM.
 
 ## Files
 
-- **`~/Berth` is empty.** It's only mounted while berth runs, and not with
-  `"finder": false`. `daemon.log` says why if the mount failed.
+- **`~/Berth` is empty.** It's only mounted while berth runs, with the IP route
+  helper installed (`sudo berth helper install`; the VM accepts mounts only
+  from root), and not with `"finder": false`. `daemon.log` says why if the
+  mount failed.
 
 - **A change on the Mac shows up late in a container.** Changes are
   forwarded from FSEvents, which takes ~0.6 s. Deleting a file on the Mac
-  doesn't raise an inotify event in containers.
+  raises no IN_DELETE in containers, only an attribute event on its folder.
 - **"Operation not permitted" changing ownership** (`chown`, `rsync -g`)
   on Apple's share: files there show as root-owned. Use berth's share
   (the default on macOS 27).

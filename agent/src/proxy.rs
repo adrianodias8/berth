@@ -1,9 +1,10 @@
 //! The proxy Docker (pulls, pushes) and apt use in the VM, as the host
 //! hands it over (src/proxy.rs): `proxy\n` then JSON until EOF, null for
-//! none. Docker reads it at start, so a change restarts dockerd, but only
-//! while no container runs: with "auto" the proxy changes with the Mac's
-//! network, and that mustn't stop anyone's containers. Otherwise it waits
-//! until none runs (the host asks again every 15 s) or Docker next starts.
+//! none. Docker reads it at start, and a restart would kill builds, pulls
+//! and containers in progress (with "auto" the proxy changes with the Mac's
+//! network), so a change applies when Docker next starts. Except just after
+//! the VM booted, before anything runs: then Docker is restarted once, so a
+//! proxy that changed while the VM was off applies now.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -14,8 +15,15 @@ use serde::Deserialize;
 const DOCKER_DROPIN: &str = "/etc/systemd/system/docker.service.d/berth-proxy.conf";
 const APT_CONF: &str = "/etc/apt/apt.conf.d/90berth-proxy";
 
-/// Written but not yet in the running dockerd.
-static PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// How long after the VM booted Docker may still be restarted.
+const BOOT_WINDOW_SECS: f64 = 120.0;
+
+fn just_booted() -> bool {
+    std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|u| u.split_whitespace().next()?.parse::<f64>().ok())
+        .is_some_and(|up| up < BOOT_WINDOW_SECS)
+}
 
 #[derive(Deserialize)]
 struct Proxy {
@@ -43,7 +51,8 @@ pub fn handle(mut host: UnixStream) -> io::Result<()> {
             let mut apt = String::from("// Written by berth (proxy setting).\n");
             for (name, value) in [("HTTP_PROXY", &http), ("HTTPS_PROXY", &https)] {
                 if let Some(v) = value {
-                    env.push_str(&format!("Environment=\"{name}={v}\"\n"));
+                    // systemd expands %-specifiers: a URL-encoded password has %.
+                    env.push_str(&format!("Environment=\"{name}={}\"\n", v.replace('%', "%%")));
                 }
             }
             env.push_str(&format!("Environment=\"NO_PROXY={no_proxy}\"\n"));
@@ -56,18 +65,14 @@ pub fn handle(mut host: UnixStream) -> io::Result<()> {
             (Some(env), Some(apt))
         }
     };
-    use std::sync::atomic::Ordering::SeqCst;
     let changed = write_or_remove(DOCKER_DROPIN, dropin.as_deref())?;
     write_or_remove(APT_CONF, apt.as_deref())?;
-    if changed {
-        PENDING.store(true, SeqCst);
-    }
-    let reply = if !PENDING.load(SeqCst) {
+    let booting = just_booted();
+    let reply = if !changed {
         "same".to_string()
-    } else if running_containers() {
-        if changed { "changed; applies once no container runs, or when Docker next starts" } else { "same" }.to_string()
+    } else if !booting || running_containers() {
+        "changed; applies when Docker next starts (berth stop --shutdown && berth start)".to_string()
     } else {
-        PENDING.store(false, SeqCst);
         let _ = Command::new("systemctl").arg("daemon-reload").status();
         let _ = Command::new("systemctl").args(["restart", "docker"]).status();
         format!("changed; Docker restarted with {}", proxy.as_ref().and_then(|p| p.https.as_ref().or(p.http.as_ref())).map_or("no proxy", |s| s))

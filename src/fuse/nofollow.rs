@@ -93,10 +93,13 @@ pub fn fstat(file: &fs::File) -> io::Result<Stat> {
     Ok(Stat(st))
 }
 
-/// `open(2)`, with `O_NOFOLLOW_ANY` added to `flags`.
+/// `open(2)`, with `O_NOFOLLOW_ANY` added to `flags`. It already refuses a
+/// symlink as the last component, and macOS rejects it combined with
+/// `O_NOFOLLOW` when creating (EINVAL: busybox tar's extraction failed).
 pub fn open(path: &Path, flags: libc::c_int, mode: u32) -> io::Result<fs::File> {
     let c = cstr(path)?;
-    let fd = unsafe { libc::open(c.as_ptr(), flags | libc::O_NOFOLLOW_ANY | libc::O_CLOEXEC, mode as libc::c_uint) };
+    let flags = (flags & !libc::O_NOFOLLOW) | libc::O_NOFOLLOW_ANY | libc::O_CLOEXEC;
+    let fd = unsafe { libc::open(c.as_ptr(), flags, mode as libc::c_uint) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -229,6 +232,11 @@ mod tests {
         hard_link(&dir.join("outside/secret"), &dir.join("real/hard")).unwrap();
         let names: Vec<_> = read_dir(&dir.join("real")).unwrap().into_iter().map(|e| e.0).collect();
         assert_eq!(names.len(), 3);
+        // A guest's O_NOFOLLOW (busybox tar creates with it) is fine, and
+        // still refuses a link at the end.
+        let excl = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
+        open(&dir.join("real/created"), excl, 0o644).unwrap();
+        assert!(open(&dir.join("real/l"), libc::O_RDONLY | libc::O_NOFOLLOW, 0).is_err());
         fs::remove_dir_all(dir).ok();
     }
 }

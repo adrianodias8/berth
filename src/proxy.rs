@@ -84,24 +84,32 @@ fn system() -> Option<(Option<String>, Option<String>, Vec<String>)> {
 }
 
 fn parse_scutil(text: &str) -> (Option<String>, Option<String>, Vec<String>) {
+    // Only the top level: `__SCOPED__` repeats per-interface settings inside,
+    // which must not override the system's.
     let mut values = std::collections::HashMap::new();
     let mut exceptions = Vec::new();
-    let mut in_exceptions = false;
+    let (mut depth, mut in_exceptions) = (0usize, false);
     for line in text.lines().map(str::trim) {
-        if line.starts_with("ExceptionsList") {
-            in_exceptions = true;
-            continue;
-        }
-        if in_exceptions {
-            if line == "}" {
+        if line == "}" {
+            depth = depth.saturating_sub(1);
+            if depth < 2 {
                 in_exceptions = false;
-            } else if let Some((_, v)) = line.split_once(" : ") {
-                exceptions.push(cidr(v.trim()));
             }
             continue;
         }
+        let opens = line.ends_with('{');
         if let Some((k, v)) = line.split_once(" : ") {
-            values.insert(k.trim().to_string(), v.trim().to_string());
+            if depth == 1 && !opens {
+                values.insert(k.trim().to_string(), v.trim().to_string());
+            } else if depth == 2 && in_exceptions {
+                exceptions.push(cidr(v.trim()));
+            }
+            if depth == 1 && opens && k.trim() == "ExceptionsList" {
+                in_exceptions = true;
+            }
+        }
+        if opens {
+            depth += 1;
         }
     }
     let proxy = |kind: &str| {
@@ -129,9 +137,10 @@ fn cidr(entry: &str) -> String {
 }
 
 /// Hand the proxy to the agent; it only acts on a change.
-pub async fn push(paths: &Paths) {
+pub async fn push() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let proxy = effective(paths);
+    // scutil is a process: off the async workers.
+    let Ok(proxy) = tokio::task::spawn_blocking(|| effective(&Paths::new())).await else { return };
     let Ok(json) = serde_json::to_string(&proxy) else { return };
     // In the body: exceptions can make it longer than a header may be.
     if let Ok(mut guest) = crate::daemon::guest_stream("proxy").await
@@ -166,5 +175,8 @@ mod tests {
         assert_eq!(https, None);
         assert_eq!(exceptions, [".local", "169.254.0.0/16"]);
         assert_eq!(parse_scutil("<dictionary> {\n  FTPPassive : 1\n}\n"), (None, None, vec![]));
+        // Per-interface settings don't count.
+        let scoped = "<dictionary> {\n  HTTPEnable : 0\n  __SCOPED__ : <dictionary> {\n    en0 : <dictionary> {\n      HTTPEnable : 1\n      HTTPProxy : 10.0.0.1\n      HTTPPort : 8080\n    }\n  }\n}\n";
+        assert_eq!(parse_scutil(scoped), (None, None, vec![]));
     }
 }

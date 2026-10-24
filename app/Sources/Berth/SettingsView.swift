@@ -41,8 +41,24 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 VStack(alignment: .leading) {
+                    Picker("Proxy for Docker", selection: Binding(
+                        get: { ["auto", "none"].contains(config.proxy ?? "auto") ? (config.proxy ?? "auto") : "url" },
+                        set: { config.proxy = $0 == "auto" ? nil : ($0 == "url" ? (config.proxy?.hasPrefix("http") == true ? config.proxy : "http://") : $0) }
+                    )) {
+                        Text("The Mac's settings").tag("auto")
+                        Text("None").tag("none")
+                        Text("URL").tag("url")
+                    }
+                    if let proxy = config.proxy, proxy.hasPrefix("http") {
+                        TextField("http://host:port", text: Binding(get: { proxy }, set: { config.proxy = $0 }))
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    Text("Used by Docker for pulls and pushes; applies when Berth next starts.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading) {
                     Toggle("Volumes and machines in Finder", isOn: Binding(get: { config.finder ?? true }, set: { config.finder = $0 ? nil : false }))
-                    Text("Mounted at ~/Berth while Berth runs.")
+                    Text("Mounted at ~/Berth while Berth runs (needs the IP route helper).")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if config != saved {
@@ -59,7 +75,7 @@ struct SettingsView: View {
                 Toggle("Start Berth when the app opens", isOn: $autoStart)
                 Toggle("Keep containers running across stops (resume on start)", isOn: Binding(
                     get: { config.stop == "suspend" },
-                    set: { config.stop = $0 ? "suspend" : nil; save(restart: false) }
+                    set: { setStop($0 ? "suspend" : nil) }
                 ))
                 Toggle("Open at login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { _, on in
@@ -184,9 +200,22 @@ struct SettingsView: View {
         Binding(get: { Double(memoryGiB) }, set: { config.memoryMib = Int($0) * 1024 })
     }
 
+    /// The suspend toggle applies at once and alone: other edits stay pending.
+    private func setStop(_ value: String?) {
+        var updated = saved
+        updated.stop = value
+        do {
+            try updated.save(over: saved)
+            saved.stop = value
+            config.stop = value
+        } catch {
+            engine.lastError = "Saving settings: \(error.localizedDescription)"
+        }
+    }
+
     private func save(restart: Bool) {
         do {
-            try config.save()
+            try config.save(over: saved)
             saved = config
             if restart { engine.restart() }
         } catch {

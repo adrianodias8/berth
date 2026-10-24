@@ -4,7 +4,8 @@
 //! The export root /srv/berth holds bind mounts of /var/lib/docker/volumes
 //! and /var/lib/machines. Requests are squashed to root: the Mac user can
 //! open what containers and machines wrote, whoever owns it in the VM. Only
-//! the Mac's address on the VM network may mount it.
+//! the Mac's address on the VM network may mount it, from a reserved port
+//! (root on the Mac: berth's helper).
 
 use std::io;
 use std::path::Path;
@@ -13,7 +14,7 @@ use std::process::Command;
 const ROOT: &str = "/srv/berth";
 const EXPORTS: &str = "/etc/exports.d/berth.exports";
 const NFS_CONF: &str = "/etc/nfs.conf.d/berth.conf";
-/// Fixed so the Mac can mount without asking rpcbind (src/files.rs).
+/// Fixed so the Mac can mount without asking rpcbind (src/helper.rs).
 pub const MOUNTD_PORT: u16 = 20048;
 
 fn sh(script: &str) -> io::Result<String> {
@@ -48,7 +49,9 @@ pub fn ensure() -> io::Result<()> {
     if mac.parse::<std::net::Ipv4Addr>().is_err() {
         return Err(io::Error::other("no default gateway"));
     }
-    let exports = format!("{ROOT} {mac}(rw,insecure,no_subtree_check,crossmnt,all_squash,anonuid=0,anongid=0)\n");
+    // `secure` (the default): reserved source ports only, which on the Mac
+    // only root has: its helper mounts it (src/helper.rs).
+    let exports = format!("{ROOT} {mac}(rw,secure,no_subtree_check,crossmnt,all_squash,anonuid=0,anongid=0)\n");
     let conf = format!("[mountd]\nport={MOUNTD_PORT}\n[nfsd]\nthreads=8\n");
     let mut changed = false;
     for (path, contents) in [(EXPORTS, &exports), (NFS_CONF, &conf)] {

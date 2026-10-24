@@ -83,7 +83,7 @@ fn main() {
     thread::spawn(boot::tune);
     thread::spawn(boot::export_kernel);
     thread::spawn(kmod::run);
-    thread::spawn(install_debug_helper);
+    thread::spawn(install_guest_files);
     mac::run();
     thread::spawn(machines::integrate_all);
     thread::spawn(move || domains::run(t1));
@@ -115,22 +115,45 @@ fn main() {
     }
 }
 
-/// `berth debug` runs this over SSH (guest/berth-debug.sh).
-fn install_debug_helper() {
+/// Files berth keeps in the VM's root filesystem:
+/// - `berth debug` runs the debug helper over SSH (guest/berth-debug.sh);
+/// - machines bind-mount /run/berth (mac.rs), so it must exist before they
+///   autostart at boot, and they start after us, once the home share (also
+///   bound in) is mounted.
+fn install_guest_files() {
+    let files: [(&str, &str, u32); 3] = [
+        ("/usr/local/libexec/berth-debug", include_str!("../../guest/berth-debug.sh"), 0o755),
+        ("/etc/tmpfiles.d/berth.conf", "d /run/berth 0755 root root -\n", 0o644),
+        (
+            "/etc/systemd/system/systemd-nspawn@.service.d/berth.conf",
+            "# berth: machines bind the home share and /run/berth (agent/src/main.rs).\n[Unit]\nAfter=berth-agent.service\n",
+            0o644,
+        ),
+    ];
+    let mut units_changed = false;
+    for (path, contents, mode) in files {
+        if std::fs::read_to_string(path).ok().as_deref() == Some(contents) {
+            continue;
+        }
+        if let Err(err) = install_file(path, contents, mode) {
+            eprintln!("berth-agent: installing {path}: {err}");
+        }
+        units_changed |= path.starts_with("/etc/systemd/");
+    }
+    if units_changed {
+        let _ = std::process::Command::new("systemctl").arg("daemon-reload").status();
+    }
+}
+
+fn install_file(path: &str, contents: &str, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    const PATH: &str = "/usr/local/libexec/berth-debug";
-    const SCRIPT: &str = include_str!("../../guest/berth-debug.sh");
-    if std::fs::read_to_string(PATH).ok().as_deref() == Some(SCRIPT) {
-        return;
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(dir)?;
     }
-    let tmp = format!("{PATH}.tmp");
-    let installed = std::fs::create_dir_all("/usr/local/libexec")
-        .and_then(|_| std::fs::write(&tmp, SCRIPT))
-        .and_then(|_| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)))
-        .and_then(|_| std::fs::rename(&tmp, PATH));
-    if let Err(err) = installed {
-        eprintln!("berth-agent: installing {PATH}: {err}");
-    }
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+    std::fs::rename(&tmp, path)
 }
 
 fn handle(fd: OwnedFd) -> io::Result<()> {

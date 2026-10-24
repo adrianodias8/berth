@@ -54,7 +54,8 @@ from its code.
   Settings): Docker networks get IPv6 subnets, NAT'd out of the VM. Reaching the
   internet over IPv6 needs IPv6 on the Mac; without it, IPv6 works between
   containers, the VM and the Mac
-- Docker pulls and pushes use the Mac's proxy settings (`"proxy"`: auto, none or a URL)
+- Docker pulls and pushes use the Mac's proxy settings (`"proxy"`: auto, none or a URL;
+  a change applies at the next start)
 - Container domains with no setup: `<container>.berth.local`,
   `<service>.<project>.berth.local` for Compose, any subdomain, plus custom names
   from the `dev.berth.domains` (or `dev.orbstack.domains`) label; `berth domains`
@@ -64,14 +65,16 @@ from its code.
   `.local` names (`berth tls trust`, or the app's setup)
 - Direct container IPs from the Mac (`curl 172.17.0.2`) for every bridge network
 - `host.docker.internal` reaches the Mac, including localhost-only servers
-  (on macOS 27 over berth's own tunnel device: ~20-30 Gbit/s both ways);
+  (on macOS 27 over berth's own tunnel device: ~21 Gbit/s Mac to container,
+  ~18-28 back);
   containers use the Mac's DNS, so VPN and split DNS apply
 
 **Development**
 - Bind mounts of your home directory at the same path, served by berth's own
   file sharing on macOS 27 (Apple's virtiofs before): 3x faster than Apple's on
-  small files and on par with OrbStack (20k files extracted in 2.3 s; OrbStack
-  2.3 s, Apple's 7.5 s), real file ownership in containers, and file change
+  small files and close to OrbStack (20k files extracted in 2.4-2.7 s; OrbStack
+  2.3 s, Apple's 7.9 s; reading them back is still 2.4x slower), real file
+  ownership in containers, and file change
   notifications forwarded so hot reload works (`docs/file-sharing.md`)
 - Kubernetes: `berth k8s enable` gives a single-node k3s using berth's Docker, so
   locally built images run in pods without a registry; `berth` kubectl context,
@@ -92,9 +95,9 @@ from its code.
     containers that mount `/run/host-services/ssh-auth.sock`, as with Docker
     Desktop: `-v /run/host-services/ssh-auth.sock:/agent.sock -e SSH_AUTH_SOCK=/agent.sock`
 - Files in Finder: `~/Berth/volumes` (Docker volumes) and `~/Berth/machines`
-  (machines' root folders), mounted from the VM while berth runs. Files open
-  as root in the VM, so anything there can be read and edited
-  (`"finder": false` turns it off)
+  (machines' root folders), mounted from the VM while berth runs, through the IP
+  route helper (the VM only accepts mounts from root). Files open as root in the
+  VM, so anything there can be read and edited (`"finder": false` turns it off)
 - Debug shell: `berth debug <container>` opens a root shell inside any
   container, distroless and scratch images included, with the VM's tools
   (bash, ps, ss, curl, `apt install` for more). It shares the container's
@@ -125,7 +128,8 @@ images, volumes, networks, Kubernetes, machines, terminals, logs, files and stat
   (`bench/results/2026-10-23-ddev-drupal.md`).
 - Memory used by a workload isn't returned to macOS after it ends (OrbStack in the
   same test didn't return it within 2 minutes either).
-- Deleting a file on the Mac doesn't raise an inotify event in containers.
+- Deleting a file on the Mac raises no IN_DELETE in containers, only an attribute
+  event on its folder (watchers that rescan the folder notice).
 - Anything in the VM can reach servers listening only on the Mac's loopback,
   through `host.docker.internal` (as with OrbStack), including the forwarded
   Kubernetes API on 6443.
@@ -168,17 +172,22 @@ its own. Closing the window keeps it in the menu bar.
   browser, copy domain/IP. Per container:
   - **Info**: image, domain, IPs, published ports, labels
   - **Logs**: live, follow mode
-  - **Terminal**: interactive shell over Docker's exec API (bash if present, else sh)
+  - **Terminal**: interactive shell over Docker's exec API (bash if present, else sh),
+    or the debug shell (the VM's tools, for images without a shell)
   - **Files**: browse, view and download files
   - **Stats**: live CPU and memory charts
 - **Images** (with pull and progress), **Volumes**, **Networks** (subnets, container
   counts, IP routing status)
-- **Machine**: a shell in the VM
+- **Kubernetes**: enable/disable, pods and services
+- **Machines**: create, start, stop and delete Linux machines, a terminal in each, and
+  a shell in the VM
 - **Snapshots**: create, restore and delete
-- **Settings**: CPUs, memory, file sharing, IPv6 for containers and whether stopping
-  keeps containers running (suspend), written to `~/.berth/config.json` and applied
-  on restart (`docs/configuration.md`); start on app launch, open at login, install
-  the IP route helper, trust the HTTPS certificate
+- **Settings**: CPUs, memory, file sharing, IPv6 for containers, Docker's proxy,
+  volumes and machines in Finder, Podman and nerdctl, and whether stopping keeps
+  containers running (suspend), merged into `~/.berth/config.json` and applied on
+  restart (`docs/configuration.md`); start on app launch, open at login, install the
+  IP route helper, trust the HTTPS certificate. Import and machines' `--arch` /
+  `--cloud-init` are CLI-only for now
 
 Launch arguments pick the starting screen, e.g.
 `open target/Berth.app --args -openSection Images` or
@@ -198,9 +207,13 @@ berth machine create dev  # an Ubuntu machine; then: berth machine shell dev
 berth config set memory_mib 8192   # settings; berth config list
 berth snapshot create before-migration   # then break things...
 berth snapshot restore before-migration  # ...and go back; also: list, delete
+                                         # (create --disk-only, restore --yes)
 berth import orbstack     # or docker-desktop: images, volumes, networks, containers
 berth debug web           # a shell with tools inside container `web`, even a distroless one
 berth shell               # SSH into the VM; `berth shell uname -a` runs a command
+berth nerdctl ps          # nerdctl in the VM (with `berth engine enable nerdctl`)
+berth tls status          # also: berth k8s status|disable, berth engine disable <name>
+berth machine list        # also: start, stop, delete, shell <name>
 berth stop                # --suspend: save the VM so the next start resumes it
 berth delete --yes        # wipe the VM disk (containers, images, volumes)
 ```
@@ -296,7 +309,7 @@ berth's CA (`~/.berth/tls`) and issues a 30-day certificate per name on first us
 The CA carries an X.509 name constraint permitting only `.local`, and the daemon
 refuses any other name, so trusting it cannot be abused for real sites.
 
-- `src/vm.rs`: VM configuration (EFI, virtio disk, NAT, virtiofs, Rosetta, vsock,
+- `src/vm.rs`: VM configuration (direct kernel boot, or EFI the first time, virtio disk, NAT, virtiofs, Rosetta, vsock,
   balloon) and helpers that run calls on the main dispatch queue, where the VM lives
 - `src/daemon.rs`: background process; control socket, socket bridges, shutdown
 - `src/ports.rs`: published-port forwarding driven by Docker events
@@ -325,6 +338,11 @@ refuses any other name, so trusting it cannot be abused for real sites.
 - `src/files.rs` (agent: `files.rs`): `~/Berth` in Finder over NFS
 - `guest/berth-debug.sh`: `berth debug`
 - `src/import.rs`: `berth import` from OrbStack or Docker Desktop
+- `src/config.rs`: `berth config`; `src/proxy.rs` (agent: `proxy.rs`): Docker's proxy
+- `src/context.rs`: the `berth` docker context
+- agent: `boot.rs` (direct boot, kernel export), `docker.rs` (Docker API client),
+  `engine.rs` (docker-ce install), `memory.rs` (balloon, memory pressure),
+  `kmod.rs` (the polling driver's build), `tunnel.rs`, `mac.rs`, `files.rs`
 - `src/tls.rs`: the local CA, per-name certificates, keychain trust
 - `src/provision.rs`: image download and checksum, disk clone, SSH key, cloud-init seed
 - `guest/user-data.yaml`: guest provisioning (Docker, mounts, Rosetta binfmt, agent unit)
@@ -340,7 +358,7 @@ discussions) and the limits above:
 - **File sharing**: close the remaining Composer gap (fewer round trips per
   file); push invalidations to the guest instead of relying on FSEvents
   touches; prebuilt guest modules, so the polling driver needs no download
-- **Machines**: cloud-init / custom images; per-machine and per-volume snapshots
+- **Machines**: custom images, isolated machines; per-machine and per-volume snapshots
   next to the whole-VM ones
 - **Linux GUI apps**: first a console window (virtio-gpu 2D, clipboard via
   spice-vdagent), then per-app windows like WSLg (a compositor in the machine,

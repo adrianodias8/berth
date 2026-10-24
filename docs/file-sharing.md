@@ -14,9 +14,9 @@ How the VM sees your Mac's home folder, and how to work on it.
 tag `home` and is mounted at your home path, so `docker run -v
 ~/project:/app` sees the same paths as on the Mac.
 
-Apple's share: ~450 µs per request, no control over caching, and files show
-as root-owned in containers, so tools that set group ownership (`rsync -g`,
-DDEV's `composer create-project`) fail.
+Apple's share: no control over caching (every lookup crosses to the Mac),
+and files show as root-owned in containers, so tools that set group
+ownership (`rsync -g`, DDEV's `composer create-project`) fail.
 
 ## berth's share
 
@@ -145,12 +145,14 @@ berth shell -- python3 $PWD/bench/fs/latency.py ~/.berth-fsbench/small.tar   # w
 bench/ddev-drupal.sh <label>                          # DDEV + Drupal CMS, see bench/results
 ```
 
-Results (M2 Max, seconds; `bench/results/2026-10-23-ddev-drupal.md`):
+Results (M2 Max, seconds; `bench/fs` runs and `bench/results/2026-10-23-ddev-drupal.md`,
+DDEV re-measured on 2026-10-24, `bench/results/2026-10-24-compare.md`):
 
 | | Apple's share | berth, built-in driver | berth, polling driver (default) | OrbStack 2.2.5 |
 |---|---|---|---|---|
 | extract 20k files | 7.5 | 7.3 | **2.4** | 2.3 |
 | delete 20k files | 2.7 | 2.7 | **1.4** | 1.5 |
+| read all 20k files (`compare.sh`) | 2.9 | – | 2.0 | 0.8 |
 | 4 parallel extracts | 20.4 | 12.8 | 7.7 | – |
 | DDEV `composer install` | fails* | 16 | 8.9–9.2 | 6.6 |
 | DDEV `drush site:install` | fails* | 67 | 39–41 | 37 |
@@ -160,7 +162,9 @@ can't run.
 
 ### Known limits
 
-- Composer is still ~1.4x behind OrbStack. It sends ~10 requests per file
+- Reading many small files is ~2.4x slower than OrbStack: each file still
+  costs a lookup, an attribute fetch and a read round trip.
+- Composer is still ~1.4x behind OrbStack. It sends ~10-12 requests per file
   (the guest kernel and Composer decide that), its unzip runs in parallel,
   and APFS serializes metadata changes. Creating a file on APFS costs ~53 µs
   on its own.

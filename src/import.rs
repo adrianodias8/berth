@@ -21,6 +21,14 @@ use serde_json::{Value, json};
 
 use crate::paths::Paths;
 
+/// Things skipped because they failed: reported, then the import fails.
+static FAILED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn failed(what: &str, err: &anyhow::Error) {
+    eprintln!("  {what} skipped: {err:#}");
+    FAILED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub struct Options {
     pub images: bool,
     pub volumes: bool,
@@ -96,7 +104,7 @@ pub fn run(paths: &Paths, from: &Path, opts: Options) -> Result<()> {
         .unwrap_or_default()
         .iter()
         .filter_map(|c| c["Id"].as_str())
-        .filter_map(|id| src.json("GET", &format!("/containers/{id}/json"), None).ok())
+        .filter_map(|id| src.json("GET", &format!("/containers/{id}/json"), None).inspect_err(|e| failed(&format!("container {id}"), e)).ok())
         // Kubernetes' containers belong to its cluster, not to Docker users.
         .filter(|c| !c["Config"]["Labels"].as_object().is_some_and(|l| l.contains_key("io.kubernetes.pod.name")))
         .filter(|c| opts.project.as_ref().is_none_or(|p| c["Config"]["Labels"]["com.docker.compose.project"] == p.as_str()))
@@ -121,8 +129,13 @@ pub fn run(paths: &Paths, from: &Path, opts: Options) -> Result<()> {
     if opts.containers {
         recreate(&dst, &containers, opts.dry_run)?;
     }
-    println!("Done.");
-    Ok(())
+    match FAILED.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => {
+            println!("Done.");
+            Ok(())
+        }
+        n => bail!("{n} item(s) couldn't be imported (above); the rest was"),
+    }
 }
 
 const BUILTIN_NETWORKS: [&str; 3] = ["bridge", "host", "none"];
@@ -158,7 +171,7 @@ fn networks(src: &Api, dst: &Api, scope: Option<&Scope>, dry_run: bool) -> Resul
             "Options": net["Options"],
         });
         if let Err(err) = dst.json("POST", "/networks/create", Some(&body)) {
-            eprintln!("  skipped: {err:#}");
+            failed("network", &err);
         }
     }
     Ok(())
@@ -261,16 +274,30 @@ fn volumes(src: &Api, dst: &Api, scope: Option<&Scope>, dry_run: bool) -> Result
         std::io::stdout().flush()?;
         let started = std::time::Instant::now();
         let body = json!({ "Name": name, "Driver": "local", "Labels": v["Labels"], "DriverOpts": v["Options"] });
-        dst.json("POST", "/volumes/create", Some(&body))?;
-        let reader = Helper::create(src, &src_image, name)?;
-        let writer = Helper::create(dst, &dst_image, name)?;
-        // The archive is the folder /berth-volume itself: unpacking it at /
-        // lands in the new volume, owners and modes kept.
-        let mut tar = src.stream("GET", &format!("/containers/{}/archive?path=/berth-volume", reader.id))?;
-        let copied = dst.upload("PUT", &format!("/containers/{}/archive?path=/", writer.id), &mut tar, "application/x-tar");
-        drop((reader, writer));
-        copied.with_context(|| format!("copying volume {name}"))?;
-        println!(" ({:.0?})", started.elapsed());
+        // A volume that is a folder on the Mac (o=bind, device=...) or a
+        // network share: the same data on both sides, so only its definition.
+        let elsewhere = v["Options"].as_object().is_some_and(|o| o.contains_key("device") || o.contains_key("type"));
+        let copied = dst.json("POST", "/volumes/create", Some(&body)).and_then(|_| {
+            if elsewhere {
+                return Ok(());
+            }
+            let reader = Helper::create(src, &src_image, name)?;
+            let writer = Helper::create(dst, &dst_image, name)?;
+            // The archive is the folder /berth-volume itself: unpacking it at
+            // / lands in the new volume, owners and modes kept.
+            let mut tar = src.stream("GET", &format!("/containers/{}/archive?path=/berth-volume", reader.id))?;
+            dst.upload("PUT", &format!("/containers/{}/archive?path=/", writer.id), &mut tar, "application/x-tar").map(|_| ())
+        });
+        match copied {
+            Ok(()) if elsewhere => println!(" (points outside Docker: definition only)"),
+            Ok(()) => println!(" ({:.0?})", started.elapsed()),
+            Err(err) => {
+                println!();
+                // Half a volume would be skipped as present next time.
+                let _ = dst.json("DELETE", &format!("/volumes/{}", urlencode(name)), None);
+                failed(&format!("volume {name}"), &err);
+            }
+        }
     }
     Ok(())
 }
@@ -297,7 +324,8 @@ impl<'a> Helper<'a> {
 
 impl Drop for Helper<'_> {
     fn drop(&mut self) {
-        let _ = self.api.json("DELETE", &format!("/containers/{}?force=1", self.id), None);
+        // v=1: an image's VOLUMEs would leave anonymous volumes behind.
+        let _ = self.api.json("DELETE", &format!("/containers/{}?force=1&v=1", self.id), None);
     }
 }
 
@@ -336,7 +364,7 @@ fn recreate(dst: &Api, containers: &[Value], dry_run: bool) -> Result<()> {
         }
         match create_container(dst, c, &name) {
             Ok(()) => made += 1,
-            Err(err) => eprintln!("  skipped: {err:#}"),
+            Err(err) => failed(&format!("container {name}"), &err),
         }
     }
     if made > 0 {
@@ -358,6 +386,44 @@ fn create_container(dst: &Api, c: &Value, name: &str) -> Result<()> {
     if let Some(h) = host.as_object_mut() {
         for key in ["ContainerIDFile", "CgroupParent", "Runtime"] {
             h.remove(key);
+        }
+        // Volumes that aren't in Binds or Mounts (an image's VOLUME, e.g.
+        // postgres' data) were imported under their names: reattach them,
+        // or the container would get a new empty one.
+        let declared: HashSet<String> = h
+            .get("Binds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|b| b.as_str()?.split(':').nth(1).map(str::to_string))
+            .chain(h.get("Mounts").and_then(Value::as_array).into_iter().flatten().filter_map(|m| m["Target"].as_str().map(str::to_string)))
+            .collect();
+        let extra: Vec<Value> = c["Mounts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| m["Type"] == "volume" && m["Destination"].as_str().is_some_and(|d| !declared.contains(d)))
+            .map(|m| json!({ "Type": "volume", "Source": m["Name"], "Target": m["Destination"], "ReadOnly": m["RW"] == false }))
+            .collect();
+        // Compose lists anonymous volumes in Mounts with no Source: name the
+        // imported one, or Docker makes a new empty volume there too.
+        let actual = |target: &str| {
+            c["Mounts"].as_array().into_iter().flatten().find(|m| m["Type"] == "volume" && m["Destination"] == target).map(|m| m["Name"].clone())
+        };
+        if let Some(list) = h.get_mut("Mounts").and_then(Value::as_array_mut) {
+            for m in list.iter_mut().filter(|m| m["Type"] == "volume" && m["Source"].as_str().is_none_or(str::is_empty)) {
+                if let Some(name) = m["Target"].as_str().and_then(actual) {
+                    m["Source"] = name;
+                }
+            }
+        }
+        if !extra.is_empty() {
+            let mounts = h.entry("Mounts").or_insert_with(|| json!([]));
+            if let Some(list) = mounts.as_array_mut() {
+                list.extend(extra);
+            } else {
+                *mounts = Value::Array(extra);
+            }
         }
     }
     obj.insert("HostConfig".into(), host);
@@ -435,7 +501,7 @@ impl Api {
         let body: Box<dyn Read> = if headers.get("transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked")) {
             Box::new(Chunked { inner: reader, left: 0, done: false })
         } else if let Some(len) = headers.get("content-length").and_then(|v| v.parse::<u64>().ok()) {
-            Box::new(reader.take(len))
+            Box::new(Exact { inner: reader.take(len), left: len })
         } else {
             Box::new(reader)
         };
@@ -486,6 +552,24 @@ impl Api {
     }
 }
 
+/// A body of known length that must not end early (a short read would
+/// pass for all of it).
+struct Exact<R> {
+    inner: R,
+    left: u64,
+}
+
+impl<R: Read> Read for Exact<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 && self.left > 0 && !buf.is_empty() {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
 /// An HTTP chunked body.
 struct Chunked<R> {
     inner: R,
@@ -533,6 +617,15 @@ mod tests {
         let mut body = String::new();
         Chunked { inner: &raw[..], left: 0, done: false }.read_to_string(&mut body).unwrap();
         assert_eq!(body, "Wikipedia");
+    }
+
+    #[test]
+    fn short_bodies_are_errors() {
+        let mut body = String::new();
+        assert!(Exact { inner: &b"abc"[..], left: 5 }.read_to_string(&mut body).is_err());
+        let mut body = String::new();
+        Exact { inner: &b"abcde"[..], left: 5 }.read_to_string(&mut body).unwrap();
+        assert_eq!(body, "abcde");
     }
 
     #[test]

@@ -94,7 +94,7 @@ struct BerthConfig: Codable, Equatable {
     /// "auto" (the Mac's proxy settings; the default), "none" or a URL (src/proxy.rs).
     var proxy: String?
 
-    enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey, CaseIterable {
         case cpus
         case memoryMib = "memory_mib"
         case fileSharing = "file_sharing"
@@ -108,11 +108,31 @@ struct BerthConfig: Codable, Equatable {
         (try? JSONDecoder().decode(BerthConfig.self, from: Data(contentsOf: BerthPaths.config))) ?? BerthConfig()
     }
 
-    func save() throws {
+    /// Write the keys that differ from `baseline` into config.json as it is
+    /// now: keys the app doesn't know, and changes made meanwhile with
+    /// `berth config`, stay. A file that isn't valid JSON is left alone.
+    func save(over baseline: BerthConfig) throws {
         try FileManager.default.createDirectory(at: BerthPaths.root, withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(self).write(to: BerthPaths.config, options: .atomic)
+        var file: [String: Any] = [:]
+        if let data = try? Data(contentsOf: BerthPaths.config), !data.isEmpty {
+            guard let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                throw NSError(domain: "berth", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                    "~/.berth/config.json isn't valid JSON; fix it (or `berth config list`) first"])
+            }
+            file = dict
+        }
+        let mine = try Self.dictionary(self), theirs = try Self.dictionary(baseline)
+        for key in CodingKeys.allCases.map(\.rawValue) {
+            let new = mine[key] as? NSObject, old = theirs[key] as? NSObject
+            guard new != old else { continue }
+            file[key] = new
+        }
+        let data = try JSONSerialization.data(withJSONObject: file, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: BerthPaths.config, options: .atomic)
+    }
+
+    private static func dictionary(_ config: BerthConfig) throws -> [String: Any] {
+        (try JSONSerialization.jsonObject(with: JSONEncoder().encode(config)) as? [String: Any]) ?? [:]
     }
 }
 
@@ -212,10 +232,17 @@ final class Engine: ObservableObject {
     }
 
     func restart() {
+        guard state == .running || state == .starting else { return }
         Task {
             stop(shutdown: true)
-            while status != nil { try? await Task.sleep(for: .milliseconds(500)) }
-            start()
+            // Start again only once it's really down (a stop can fail).
+            for _ in 0..<120 {
+                if status == nil {
+                    start()
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(500))
+            }
         }
     }
 
@@ -245,6 +272,9 @@ final class Engine: ObservableObject {
             clearLists()
         case (nil, .starting) where !startInFlight:
             // `berth start` returned but the daemon is gone.
+            state = .stopped
+        case (nil, .failed):
+            // A stop that timed out (a long suspend) finished after all.
             state = .stopped
         case (let s?, _) where s.docker:
             if state != .running && state != .stopping {
