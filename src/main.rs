@@ -380,14 +380,16 @@ fn start(paths: &Paths) -> Result<()> {
     provision::ensure(paths)?;
 
     let log = std::fs::OpenOptions::new().create(true).append(true).open(paths.daemon_log())?;
-    let mut child = Command::new(std::env::current_exe()?)
-        .arg("daemon")
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .process_group(0)
-        .spawn()
-        .context("spawning daemon")?;
+    let spawn = || -> Result<std::process::Child> {
+        let mut cmd = Command::new(std::env::current_exe()?);
+        cmd.arg("daemon").stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log.try_clone()?).process_group(0);
+        if first_boot {
+            cmd.env("BERTH_FIRST_BOOT", "1");
+        }
+        cmd.spawn().context("spawning daemon")
+    };
+    let mut child = spawn()?;
+    let mut retried = false;
 
     if first_boot {
         println!("First boot: installing Docker in the VM. This takes a few minutes.");
@@ -401,6 +403,14 @@ fn start(paths: &Paths) -> Result<()> {
         std::thread::sleep(Duration::from_millis(200));
         ticks += 1;
         if let Some(code) = child.try_wait()? {
+            // The watchdog gave up on this boot and asked for a safe one.
+            if !retried && vm::safe_boot(paths) {
+                retried = true;
+                print!("\nThe VM didn't come up; starting it in safe mode");
+                std::io::stdout().flush()?;
+                child = spawn()?;
+                continue;
+            }
             println!();
             bail!(
                 "daemon exited ({}). See {}",
@@ -488,6 +498,9 @@ fn status(paths: &Paths) -> Result<()> {
                 );
             }
             println!("Socket:  {}", paths.docker_socket().display());
+            if !s.file_sharing.is_empty() {
+                println!("Files:   {}", s.file_sharing);
+            }
             if !s.ports.is_empty() {
                 println!("Ports:   {}", s.ports.join(", "));
             }

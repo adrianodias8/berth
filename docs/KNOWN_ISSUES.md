@@ -4,19 +4,8 @@ Open findings from the code review of 2026-10-24, most important first
 within each area. Fixed findings aren't listed (see the git log). When you
 fix one, remove it here in the same change.
 
-## File sharing (experimental share, `src/fuse.rs`)
+## File sharing (berth's share, `src/fuse.rs`)
 
-These block making berth's share the default.
-
-- **Symlink races can escape the share.** Every operation works on a full
-  path, and a symlink in any component is followed. A container that swaps a
-  directory for a symlink between a LOOKUP and its use can get a node whose
-  path points outside the bind mount (anything your user can reach, such as
-  `~/.ssh`).
-
-  Fix: keep a directory handle per node and use `*at` calls, with
-  `O_NOFOLLOW_ANY` / `AT_SYMLINK_NOFOLLOW_ANY` (macOS 11+), and
-  `renameatx_np(RENAME_NOFOLLOW_ANY)`. Canonicalize the root once.
 - **A removed file may lose its data.** A file removed while open in the
   guest stays readable only if berth already had it open (its cached file),
   which is usual but not guaranteed (eviction past 4096 cached files is
@@ -28,6 +17,14 @@ These block making berth's share the default.
   the guest kernel does locally.
 - **Stale eviction queue.** Entries for forgotten nodes stay queued, so
   eviction can start early.
+- **Module build needs network and ~200 MB.** The agent fetches kernel
+  headers and gcc with apt. Offline, or on a kernel Debian no longer ships
+  headers for, the share runs on the built-in driver (slower). Shipping
+  prebuilt modules per Debian kernel would avoid both.
+- **Safe mode needs direct boot.** If the guest kernel was never exported
+  (EFI boot only), a broken mount setup can't be rescued automatically.
+- **A snapshot restore takes ~16 s**, mostly stopping the current VM. A
+  restore could reuse the running VM's process instead.
 - **Polling driver: device hot-unplug.** If the device disappeared while a
   task was polling, the poller could touch a freed queue (unmount and `rmmod`
   can't trigger it). Fix: count pollers and wait for them in

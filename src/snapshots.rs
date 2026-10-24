@@ -284,6 +284,9 @@ pub fn prepare_restore(paths: &Paths, name: &str) -> Result<Meta> {
     if dir.join("boot").is_dir() {
         copy_dir(&dir.join("boot"), &paths.guest().join("boot"))?;
     }
+    // The snapshot's disk may predate the polling driver (agent/src/kmod.rs):
+    // start with the built-in one until the agent confirms it again.
+    let _ = fs::remove_file(paths.guest().join("kmod-ready"));
     let state = dir.join(STATE);
     let pending = Pending {
         state: (meta.with_memory && state.exists()).then_some(state),

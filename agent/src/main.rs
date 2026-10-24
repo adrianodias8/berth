@@ -29,6 +29,7 @@ mod engine;
 mod engines;
 mod hostnet;
 mod k8s;
+mod kmod;
 mod machines;
 mod mdns;
 mod memory;
@@ -58,6 +59,7 @@ fn main() {
     thread::spawn(memory::ensure_kernel_args);
     thread::spawn(boot::tune);
     thread::spawn(boot::export_kernel);
+    thread::spawn(kmod::run);
     thread::spawn(move || domains::run(t1));
     thread::spawn(move || mdns::run(t2));
     thread::spawn(move || dns::run(t3));

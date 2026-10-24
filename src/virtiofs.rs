@@ -1,19 +1,24 @@
-//! Experimental: berth's own virtio-fs device on macOS 27's custom Virtio API
-//! (VZCustomVirtioDeviceConfiguration), serving FUSE from fuse.rs. Apple's
-//! built-in virtiofs doesn't let us choose caching; this does.
+//! berth's own virtio-fs device on macOS 27's custom Virtio API
+//! (VZCustomVirtioDeviceConfiguration), serving FUSE from fuse.rs: how the
+//! VM sees your home folder on macOS 27 (tag `home`, in place of Apple's
+//! built-in virtiofs; see `home_share`). Apple's share is still used on
+//! older macOS or with `"file_sharing": "apple"` in ~/.berth/config.json.
 //!
 //! The classes are new in macOS 27 and absent from objc2-virtualization, so
-//! they're declared here and looked up at runtime: on older systems the
-//! device is simply not added.
+//! they're declared here and looked up at runtime.
 //!
-//! Enabled with BERTH_EXPERIMENTAL_FS=1. The share appears in the guest under
-//! the tag `berthfs` (mount -t virtiofs berthfs /mnt/berthfs), next to the
-//! regular `home` share. Tunables: BERTH_FS_ENTRY_TIMEOUT / _ATTR_TIMEOUT
-//! / _NEGATIVE_TIMEOUT (seconds, default 1), BERTH_FS_WRITEBACK=1, BERTH_FS_POLL_US (default
-//! 100), BERTH_FS_QUEUES (request queues, default 1), BERTH_FS_THREADS=1
-//! (serve concurrent requests on worker threads), BERTH_FS_STATS=1,
-//! BERTH_FS_TRACE=1 (log every request), BERTH_FS_POLL_DRIVER=1 (present
-//! the device for the polling guest driver: `mount -t virtiofs_poll`).
+//! The device is presented as a plain virtio-fs device (ID 26, served by the
+//! guest's built-in driver) until the agent has built berth's polling driver
+//! for the kernel that's booting (agent/src/kmod.rs); then under berth's
+//! own ID, which only that driver binds. A `kmod-trying` marker makes a
+//! failed attempt fall back on the next start.
+//!
+//! Tunables: BERTH_FILE_SHARING=apple|berth, BERTH_FS_ENTRY_TIMEOUT /
+//! _ATTR_TIMEOUT / _NEGATIVE_TIMEOUT (seconds, default 1),
+//! BERTH_FS_WRITEBACK=1, BERTH_FS_POLL_US (default 100), BERTH_FS_QUEUES
+//! (request queues, default 1), BERTH_FS_THREADS=0|1, BERTH_FS_STATS=1,
+//! BERTH_FS_TRACE=1 (log every request), BERTH_FS_POLL_DRIVER=0|1 (force the
+//! device ID).
 //!
 //! Where the time goes: the framework takes ~70 µs to deliver each queue
 //! notification to us and about as long to get a reply back to the guest,
@@ -60,7 +65,7 @@ const VIRTIO_ID_FS: u16 = 26;
 /// The same device under its own ID, bound only by berth's polling guest
 /// driver (guest/kmod/virtiofs_poll) instead of the built-in one.
 const BERTH_FS_DEVICE_ID: u16 = 62;
-const TAG: &str = "berthfs";
+const TAG: &str = "home";
 /// Queue 0 is the high-priority queue (FORGET etc.), then the request
 /// queues (Linux 6.11+ spreads CPUs over several, but more didn't help).
 const DEFAULT_REQUEST_QUEUES: u16 = 1;
@@ -127,6 +132,9 @@ impl VZCustomVirtioDeviceConfiguration {
         #[unsafe(method(setProvider:))]
         #[unsafe(method_family = none)]
         pub unsafe fn setProvider(&self, provider: Option<&VZCustomVirtioDeviceProvider>);
+        #[unsafe(method(setSupportsSaveRestore:))]
+        #[unsafe(method_family = none)]
+        pub unsafe fn setSupportsSaveRestore(&self, supports: bool);
     );
 }
 
@@ -214,6 +222,16 @@ extern_protocol!(
             device: &VZCustomVirtioDevice,
             queue: &VZVirtioQueue,
         );
+
+        #[optional]
+        #[unsafe(method(customVirtioDeviceSaveStateForRestore:))]
+        #[unsafe(method_family = none)]
+        unsafe fn customVirtioDeviceSaveStateForRestore(&self, device: &VZCustomVirtioDevice) -> Option<Retained<NSData>>;
+
+        #[optional]
+        #[unsafe(method(customVirtioDeviceShouldRestore:saveState:))]
+        #[unsafe(method_family = none)]
+        unsafe fn customVirtioDeviceShouldRestore_saveState(&self, device: &VZCustomVirtioDevice, save_state: &NSData) -> bool;
     }
 );
 
@@ -278,6 +296,29 @@ define_class!(
         #[unsafe(method(customVirtioDevice:didReceiveNotificationForQueue:))]
         fn did_notify(&self, _device: &VZCustomVirtioDevice, queue: &VZVirtioQueue) {
             self.run(queue);
+        }
+
+        /// For a VM snapshot (snapshots.rs): what the guest's kernel refers
+        /// to. The VM is paused; let requests still being served finish so
+        /// none is lost in the saved queues.
+        #[unsafe(method_id(customVirtioDeviceSaveStateForRestore:))]
+        fn save_state(&self, _device: &VZCustomVirtioDevice) -> Option<Retained<NSData>> {
+            let done = &self.ivars().done;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while done.in_flight.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+                if !done.flush() {
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+            }
+            done.flush();
+            Some(NSData::with_bytes(&self.ivars().server.save_state()))
+        }
+
+        #[unsafe(method(customVirtioDeviceShouldRestore:saveState:))]
+        fn restore_state(&self, _device: &VZCustomVirtioDevice, save_state: &NSData) -> bool {
+            let ok = self.ivars().server.restore_state(&save_state.to_vec());
+            eprintln!("virtiofs: {} the share's state from the snapshot", if ok { "restored" } else { "couldn't restore" });
+            ok
         }
     }
 );
@@ -514,10 +555,76 @@ static KEEP: Mutex<Vec<Keep>> = Mutex::new(Vec::new());
 
 /// The device configuration, or None when the API isn't available (macOS < 27)
 /// or the experiment is off.
-pub fn device(root: &std::path::Path) -> Option<Retained<NSObject>> {
-    if std::env::var_os("BERTH_EXPERIMENTAL_FS").is_none() || AnyClass::get(c"VZCustomVirtioDeviceConfiguration").is_none() {
-        return None;
+/// How the VM gets the home folder.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HomeShare {
+    /// Apple's built-in virtiofs.
+    Apple,
+    /// berth's device; `poll_driver` when presented for the polling driver.
+    Berth { poll_driver: bool },
+}
+
+impl HomeShare {
+    pub fn describe(self) -> &'static str {
+        match self {
+            HomeShare::Apple => "Apple's virtiofs",
+            HomeShare::Berth { poll_driver: true } => "berth (polling driver)",
+            HomeShare::Berth { poll_driver: false } => "berth (built-in driver)",
+        }
     }
+}
+
+/// What this start uses, for `berth status`.
+pub static CURRENT: std::sync::OnceLock<HomeShare> = std::sync::OnceLock::new();
+
+/// Decide how to share home for this start (and leave the marker that makes
+/// a failed polling-driver attempt fall back next time).
+pub fn home_share(paths: &crate::paths::Paths) -> HomeShare {
+    #[derive(serde::Deserialize, Default)]
+    struct Config {
+        file_sharing: Option<String>,
+    }
+    let setting = std::env::var("BERTH_FILE_SHARING").ok().or_else(|| {
+        std::fs::read(paths.config())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Config>(&b).ok())
+            .and_then(|c| c.file_sharing)
+    });
+    let share = if setting.as_deref() == Some("apple")
+        || AnyClass::get(c"VZCustomVirtioDeviceConfiguration").is_none()
+        || crate::vm::safe_boot(paths)
+    {
+        HomeShare::Apple
+    } else {
+        HomeShare::Berth { poll_driver: poll_driver_ready(paths) }
+    };
+    let _ = CURRENT.set(share);
+    share
+}
+
+/// The guest has the polling driver for the kernel about to boot, and the
+/// last attempt with it came up.
+fn poll_driver_ready(paths: &crate::paths::Paths) -> bool {
+    let guest = paths.guest();
+    let (ready, release, trying) = (guest.join("kmod-ready"), guest.join("boot/release"), guest.join("boot/kmod-trying"));
+    if let Ok(forced) = std::env::var("BERTH_FS_POLL_DRIVER") {
+        return forced != "0";
+    }
+    if trying.exists() {
+        eprintln!("virtiofs: the polling driver didn't come up last time; using the built-in one");
+        let _ = std::fs::remove_file(&trying);
+        let _ = std::fs::remove_file(&ready);
+        return false;
+    }
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string());
+    let ok = matches!((read(&ready), read(&release)), (Some(a), Some(b)) if !a.is_empty() && a == b);
+    if ok {
+        let _ = std::fs::write(&trying, "");
+    }
+    ok
+}
+
+fn device(root: &std::path::Path, poll_driver: bool) -> Retained<NSObject> {
     let num = |var: &str, default: f64| std::env::var(var).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(default);
     let policy = CachePolicy {
         entry: Duration::from_secs_f64(num("BERTH_FS_ENTRY_TIMEOUT", 1.0)),
@@ -526,13 +633,13 @@ pub fn device(root: &std::path::Path) -> Option<Retained<NSObject>> {
         writeback: std::env::var_os("BERTH_FS_WRITEBACK").is_some(),
     };
     let request_queues = (num("BERTH_FS_QUEUES", DEFAULT_REQUEST_QUEUES as f64) as u16).clamp(1, 16);
-    let poll_driver = std::env::var_os("BERTH_FS_POLL_DRIVER").is_some();
     // With the polling guest driver the transport is cheap enough that our
     // serving thread becomes the limit for parallel work.
     let threaded = num("BERTH_FS_THREADS", if poll_driver { 1.0 } else { 0.0 }) != 0.0;
     eprintln!(
-        "virtiofs: experimental device '{TAG}' for {} ({policy:?}, {request_queues} request queues, {})",
+        "virtiofs: sharing {} as '{TAG}' ({}; {policy:?}, {request_queues} request queues, {})",
         root.display(),
+        if poll_driver { "polling driver" } else { "built-in driver" },
         if threaded { "threaded" } else { "single-threaded" }
     );
 
@@ -564,15 +671,16 @@ pub fn device(root: &std::path::Path) -> Option<Retained<NSObject>> {
         config.setVirtioQueueCount(1 + request_queues);
         config.setDeviceSpecificConfiguration(Some(&specific));
         config.setProvider(Some(&provider));
+        config.setSupportsSaveRestore(true);
         KEEP.lock().unwrap().push(Keep(device));
-        Some(Retained::into_super(config))
+        Retained::into_super(config)
     }
 }
 
-/// Attach the device (if any) to a VM configuration.
-pub fn attach(config: &objc2_virtualization::VZVirtualMachineConfiguration, root: &std::path::Path) {
-    if let Some(device) = device(root) {
-        let devices = NSArray::from_retained_slice(&[device]);
+/// Add berth's file sharing device for `root` to a VM configuration.
+pub fn attach(config: &objc2_virtualization::VZVirtualMachineConfiguration, root: &std::path::Path, poll_driver: bool) {
+    {
+        let devices = NSArray::from_retained_slice(&[device(root, poll_driver)]);
         unsafe {
             let _: () = msg_send![config, setCustomVirtioDevices: &*devices];
         }

@@ -47,8 +47,18 @@ fn lazy_efi_mount() {
 /// a direct boot worked.
 pub fn export_kernel() {
     let Some(dir) = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join("boot"))) else { return };
+    // A safe boot's command line is the host's one-off (vm.rs): keep the
+    // exported one.
+    if std::fs::read_to_string("/proc/cmdline").is_ok_and(|c| c.contains("berth.safe=1")) {
+        let _ = std::fs::remove_file(dir.join("trying"));
+        let _ = std::fs::remove_file(dir.join("kmod-trying"));
+        return;
+    }
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::remove_file(dir.join("trying"));
+    // Same for the host's polling-driver attempt (vm.rs): we're up, so the
+    // home share mounted.
+    let _ = std::fs::remove_file(dir.join("kmod-trying"));
 
     let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
     let release = release.trim();
@@ -80,6 +90,7 @@ pub fn export_kernel() {
         .chain(["console=hvc0".to_string()])
         .collect();
     let _ = std::fs::write(dir.join("cmdline"), cmdline.join(" "));
+    let _ = std::fs::write(dir.join("release"), release);
     if changed {
         // A new kernel gets a fresh chance at direct boot.
         let _ = std::fs::remove_file(dir.join("direct-failed"));

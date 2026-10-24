@@ -86,6 +86,9 @@ pub struct Status {
     /// to macOS.
     #[serde(default)]
     pub memory_allowed: u64,
+    /// How the home folder is shared (virtiofs.rs).
+    #[serde(default)]
+    pub file_sharing: String,
 }
 
 static STOPPING: AtomicBool = AtomicBool::new(false);
@@ -111,6 +114,37 @@ async fn sync_clock() {
     {
         eprintln!("clock: guest was {drift:.1}s off, corrected");
     }
+}
+
+/// If the guest agent doesn't answer soon after boot (a broken mount
+/// setup leaves it without the home folder it runs from), leave word for a
+/// safe boot (vm.rs) and give up; `berth start` retries once that way.
+async fn watchdog() {
+    let paths = Paths::new();
+    let safe = paths.guest().join("boot/safe-boot");
+    if std::env::var_os("BERTH_FIRST_BOOT").is_some() {
+        return; // provisioning starts the agent only after installing Docker
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if crate::memory::GUEST_USED.load(std::sync::atomic::Ordering::Relaxed) > 0 || guest_stream("info memory").await.is_ok() {
+            if crate::vm::safe_boot(&paths) {
+                eprintln!("safe boot: up; the agent repaired the guest's mounts");
+                let _ = std::fs::remove_file(&safe);
+            }
+            return;
+        }
+    }
+    if crate::vm::safe_boot(&paths) {
+        eprintln!("safe boot: the guest didn't come up either; see {}", paths.console_log().display());
+        let _ = std::fs::remove_file(&safe);
+        return;
+    }
+    eprintln!("watchdog: the guest agent didn't come up within 90 s; next start boots in safe mode");
+    let _ = std::fs::write(&safe, "");
+    let _ = vm::force_stop().await;
+    std::process::exit(3);
 }
 
 /// The VM booted (rather than resuming a saved state).
@@ -228,6 +262,7 @@ async fn serve(paths: Paths, cpus: usize, memory: u64) -> Result<()> {
     tokio::spawn(crate::routes::run_periodic());
     tokio::spawn(serve_host_connections(memory));
     tokio::spawn(after_restore());
+    tokio::spawn(watchdog());
     tokio::spawn(keep_clock());
 
     let cleanup_paths = Paths::new();
@@ -283,6 +318,7 @@ async fn handle_control(stream: UnixStream, cpus: usize, memory: u64) -> Result<
                 container_ips: crate::routes::state(),
                 memory_used: crate::memory::GUEST_USED.load(std::sync::atomic::Ordering::Relaxed),
                 memory_allowed: crate::memory::TARGET.load(std::sync::atomic::Ordering::Relaxed),
+                file_sharing: crate::virtiofs::CURRENT.get().map_or("", |s| s.describe()).to_string(),
             })?
         }
         Request::K8s { action } => {

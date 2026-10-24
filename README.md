@@ -49,9 +49,11 @@ from its code.
   containers use the Mac's DNS, so VPN and split DNS apply
 
 **Development**
-- Bind mounts of your home directory at the same path, with file change
-  notifications forwarded so hot reload works (edits and new files; deletions are
-  seen on the watcher's next rescan)
+- Bind mounts of your home directory at the same path, served by berth's own
+  file sharing on macOS 27 (Apple's virtiofs before): 3x faster than Apple's on
+  small files and on par with OrbStack (20k files extracted in 2.3 s; OrbStack
+  2.3 s, Apple's 7.5 s), real file ownership in containers, and file change
+  notifications forwarded so hot reload works (`docs/file-sharing.md`)
 - Kubernetes: `berth k8s enable` gives a single-node k3s using berth's Docker, so
   locally built images run in pods without a registry; `berth` kubectl context,
   API on `localhost:6443`, pod and service IPs reachable from the Mac
@@ -74,13 +76,12 @@ from its code.
 images, volumes, networks, Kubernetes, machines, terminals, logs, files and stats.
 
 **Limits** (measured against OrbStack 2.2.5 in `bench/results/`)
-- Small-file I/O on bind mounts is ~3.5x slower: Apple's virtiofs costs ~450 µs
-  per operation, and nothing on the guest side changes that.
-- DDEV + Drupal CMS: `ddev composer create-project` fails on Apple's virtiofs
-  (the project folder shows as root-owned in containers, so `rsync -g` can't
-  set its group). It works on berth's own share (below); with its polling guest
-  driver small-file extraction matches OrbStack and Composer is ~1.5x slower;
-  warm page loads are on par (`bench/results/2026-10-23-ddev-drupal.md`).
+- Before macOS 27 (Apple's virtiofs), small-file I/O on bind mounts is ~3.5x
+  slower than OrbStack, and DDEV's `composer create-project` fails (the project
+  folder shows as root-owned in containers).
+- On berth's own share, Composer-heavy work is still ~1.5x slower than OrbStack
+  (DDEV Drupal CMS `composer install` 10–15 s vs 6.6 s); page loads are on par
+  (`bench/results/2026-10-23-ddev-drupal.md`).
 - Memory used by a workload isn't returned to macOS after it ends (OrbStack in the
   same test didn't return it within 2 minutes either).
 - Deleting a file on the Mac doesn't raise an inotify event in containers.
@@ -227,6 +228,9 @@ refuses any other name, so trusting it cannot be abused for real sites.
 - `src/daemon.rs`: background process; control socket, socket bridges, shutdown
 - `src/ports.rs`: published-port forwarding driven by Docker events
 - `src/routes.rs`, `src/helper.rs`: container subnet routes and the root helper
+- `src/virtiofs.rs`, `src/fuse.rs` (+ `fuse/nofollow.rs`): berth's file sharing
+  device and FUSE server; `guest/kmod/virtiofs_poll`: its polling guest driver,
+  built in the VM by `agent/src/kmod.rs`
 - `src/watch.rs`: FSEvents → inotify forwarding for bind mounts
 - `src/memory.rs`: balloon controller
 - `src/k8s.rs`, `src/machines.rs`: Kubernetes and Linux machines (agent: `k8s.rs`, `machines.rs`)
@@ -252,13 +256,9 @@ Logs are in `~/.berth/log/` (`daemon.log`, `console.log`).
 Informed by OrbStack users' most-requested features (public issue tracker and
 discussions) and the limits above:
 
-- **berth's own file sharing as the default** (macOS 27): a virtio-fs server on
-  the new custom Virtio device API plus a polling guest driver, today behind
-  `BERTH_EXPERIMENTAL_FS=1` (`docs/file-sharing.md`). It matches OrbStack on
-  small-file extraction (2.3 s for 20k files, Apple's share 7.8 s) and handles
-  ownership like OrbStack. Left: path handling hardened against symlink races,
-  building and loading the module automatically, mounting it at the home path
-  in place of Apple's, and wider testing (`docs/KNOWN_ISSUES.md`)
+- **File sharing**: close the remaining Composer gap (fewer round trips per
+  file, e.g. guest-side handling of no-op chmods); push invalidations to the
+  guest instead of relying on FSEvents touches
 - **Machines**: cloud-init / custom images; per-machine and per-volume snapshots
   next to the whole-VM ones
 - **Linux GUI apps**: first a console window (virtio-gpu 2D, clipboard via

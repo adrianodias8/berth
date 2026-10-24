@@ -29,6 +29,12 @@ struct SettingsView: View {
                     Text("A ceiling, not a reservation: the VM returns memory it isn't using.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                if ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27 {
+                    Picker("File sharing", selection: Binding(get: { config.fileSharing ?? "berth" }, set: { config.fileSharing = $0 })) {
+                        Text("berth (faster)").tag("berth")
+                        Text("Apple's virtiofs").tag("apple")
+                    }
+                }
                 if config != saved {
                     HStack {
                         Text("Restart Berth to apply.").foregroundStyle(.secondary)

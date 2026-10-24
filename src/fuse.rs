@@ -11,11 +11,14 @@ use std::ffi::{CString, OsStr};
 use std::fs;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+mod nofollow;
+use nofollow::Stat;
 
 const FUSE_ROOT_ID: u64 = 1;
 const KERNEL_MINOR: u32 = 31;
@@ -188,6 +191,37 @@ struct Dir {
     entries: Vec<(Vec<u8>, u64, u32)>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedNode {
+    id: u64,
+    path: PathBuf,
+    lookups: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum SavedHandle {
+    File(PathBuf),
+    Dir(PathBuf),
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedState {
+    nodes: Vec<SavedNode>,
+    handles: Vec<(u64, SavedHandle)>,
+    next_fh: u64,
+    no_open: bool,
+}
+
+/// The path an open file has now (F_GETPATH).
+fn fd_path(file: &fs::File) -> Option<PathBuf> {
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0)?;
+    Some(PathBuf::from(OsStr::from_bytes(&buf[..end])))
+}
+
 #[derive(Clone)]
 enum Handle {
     File(Arc<fs::File>),
@@ -280,6 +314,9 @@ type Reply = Result<Vec<u8>, i32>;
 
 impl Server {
     pub fn new(root: PathBuf, policy: CachePolicy) -> Self {
+        // No path below the root may contain a symlink (nofollow.rs), so the
+        // root itself must have none either.
+        let root = fs::canonicalize(&root).unwrap_or(root);
         let mut nodes = HashMap::new();
         nodes.insert(FUSE_ROOT_ID, Node { path: root.clone(), lookups: 1, file: None });
         Self {
@@ -293,6 +330,76 @@ impl Server {
             opcode_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
             no_open: AtomicBool::new(false),
         }
+    }
+
+    /// What the guest's kernel holds references to (node IDs, open handles)
+    /// and what was negotiated, for a VM snapshot: on restore the guest
+    /// carries on with the same IDs (virtiofs.rs). Cached open files aren't
+    /// saved; they're reopened by path as needed.
+    pub fn save_state(&self) -> Vec<u8> {
+        let nodes: Vec<SavedNode> = self
+            .nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, n)| SavedNode { id: *id, path: n.path.clone(), lookups: n.lookups })
+            .collect();
+        let handles: Vec<(u64, SavedHandle)> = self
+            .handles
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(fh, h)| {
+                Some((
+                    *fh,
+                    match h {
+                        Handle::Dir(d) => SavedHandle::Dir(d.path.clone()),
+                        Handle::File(f) => SavedHandle::File(fd_path(f)?),
+                    },
+                ))
+            })
+            .collect();
+        let state = SavedState {
+            nodes,
+            handles,
+            next_fh: self.next_fh.load(Ordering::Relaxed),
+            no_open: self.no_open.load(Ordering::Relaxed),
+        };
+        serde_json::to_vec(&state).unwrap_or_default()
+    }
+
+    /// Take over the state `save_state` produced. False if it's unreadable.
+    pub fn restore_state(&self, bytes: &[u8]) -> bool {
+        let Ok(state) = serde_json::from_slice::<SavedState>(bytes) else { return false };
+        let mut nodes = HashMap::new();
+        for n in state.nodes {
+            nodes.insert(n.id, Node { path: n.path, lookups: n.lookups, file: None });
+        }
+        nodes.entry(FUSE_ROOT_ID).or_insert(Node { path: self.root.clone(), lookups: 1, file: None });
+        let mut handles = HashMap::new();
+        for (fh, h) in state.handles {
+            // A handle whose file is gone now just fails like a stale one.
+            let reopened = match h {
+                SavedHandle::Dir(path) => {
+                    let mut entries = vec![(b".".to_vec(), 0, libc::DT_DIR as u32), (b"..".to_vec(), 0, libc::DT_DIR as u32)];
+                    entries.extend(nofollow::read_dir(&path).unwrap_or_default());
+                    Some(Handle::Dir(Arc::new(Dir { path, entries })))
+                }
+                SavedHandle::File(path) => Self::open_file(&path, 2, 0)
+                    .or_else(|_| Self::open_file(&path, 0, 0))
+                    .ok()
+                    .map(|f| Handle::File(Arc::new(f))),
+            };
+            if let Some(handle) = reopened {
+                handles.insert(fh, handle);
+            }
+        }
+        *self.nodes.lock().unwrap() = nodes;
+        *self.handles.lock().unwrap() = handles;
+        self.cached.lock().unwrap().clear();
+        self.next_fh.store(state.next_fh, Ordering::Relaxed);
+        self.no_open.store(state.no_open, Ordering::Relaxed);
+        true
     }
 
     /// (opcode, requests, average µs) for every opcode seen, most frequent first.
@@ -500,7 +607,7 @@ impl Server {
     /// is gone: unknown to us, or no longer on disk.
     fn vanished(&self, nodeid: u64) -> bool {
         self.path(nodeid).is_err()
-            || self.path(nodeid).is_ok_and(|p| fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound))
+            || self.path(nodeid).is_ok_and(|p| nofollow::lstat(&p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound))
     }
 
     /// The node `ino` no longer has the name `path`.
@@ -541,40 +648,46 @@ impl Server {
         }
     }
 
-    fn attr(out: &mut Out, nodeid: u64, m: &fs::Metadata) {
+    fn attr(out: &mut Out, nodeid: u64, m: &Stat) {
+        let (atime, mtime, ctime) = (m.atime(), m.mtime(), m.ctime());
         out.u64(nodeid)
             .u64(m.size())
             .u64(m.blocks())
-            .u64(m.atime() as u64)
-            .u64(m.mtime() as u64)
-            .u64(m.ctime() as u64)
-            .u32(m.atime_nsec() as u32)
-            .u32(m.mtime_nsec() as u32)
-            .u32(m.ctime_nsec() as u32)
+            .u64(atime.0 as u64)
+            .u64(mtime.0 as u64)
+            .u64(ctime.0 as u64)
+            .u32(atime.1)
+            .u32(mtime.1)
+            .u32(ctime.1)
             .u32(m.mode())
-            .u32(m.nlink() as u32)
+            .u32(m.nlink())
             .u32(m.uid())
             .u32(m.gid())
-            .u32(m.rdev() as u32)
-            .u32(m.blksize() as u32)
+            .u32(m.rdev())
+            .u32(m.blksize())
             .u32(0);
     }
 
     /// Register (or re-reference) the node at `path` and reply fuse_entry_out.
     fn entry(&self, path: PathBuf) -> Reply {
-        let m = fs::symlink_metadata(&path).map_err(|e| io_errno(&e))?;
+        let m = nofollow::lstat(&path).map_err(|e| io_errno(&e))?;
         self.entry_with(path, &m)
     }
 
     /// `entry` for a path the guest just created, noted for the watcher.
     fn entry_noted(&self, path: PathBuf) -> Reply {
-        let m = fs::symlink_metadata(&path).map_err(|e| io_errno(&e))?;
-        crate::watch::guest_wrote(&path, &m);
+        let m = nofollow::lstat(&path).map_err(|e| io_errno(&e))?;
+        Self::noted(&path, &m);
         self.entry_with(path, &m)
     }
 
     /// `entry` for a path whose metadata the caller already has.
-    fn entry_with(&self, path: PathBuf, m: &fs::Metadata) -> Reply {
+    /// Tell the FSEvents watcher this is the guest's own change.
+    fn noted(path: &Path, m: &Stat) {
+        crate::watch::guest_wrote(path, m.modified(), if m.is_dir() { 0 } else { m.size() });
+    }
+
+    fn entry_with(&self, path: PathBuf, m: &Stat) -> Reply {
         let nodeid = if path == self.root { FUSE_ROOT_ID } else { m.ino() };
         let stale = {
             let mut nodes = self.nodes.lock().unwrap();
@@ -611,7 +724,7 @@ impl Server {
         }
     }
 
-    fn attr_reply(&self, nodeid: u64, m: &fs::Metadata) -> Vec<u8> {
+    fn attr_reply(&self, nodeid: u64, m: &Stat) -> Vec<u8> {
         let mut out = Out::default();
         out.u64(self.policy.attr.as_secs()).u32(self.policy.attr.subsec_nanos()).u32(0);
         Self::attr(&mut out, nodeid, m);
@@ -622,8 +735,8 @@ impl Server {
         // The open file when there is one: also right after the name was
         // removed or replaced, while the guest still has it open.
         let m = match self.path_and_file(nodeid)? {
-            (_, Some(file)) => file.metadata(),
-            (path, None) => fs::symlink_metadata(path),
+            (_, Some(file)) => nofollow::fstat(&file),
+            (path, None) => nofollow::lstat(&path),
         }
         .map_err(|e| io_errno(&e))?;
         Ok(self.attr_reply(nodeid, &m))
@@ -645,12 +758,10 @@ impl Server {
         let (path, cached) = self.path_and_file(nodeid)?;
         let file = self.handle_file(fh).or(cached);
         let fd = file.as_ref().map(|f| f.as_raw_fd());
-        let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| lerr::EINVAL)?;
         let stat = || match &file {
-            Some(f) => f.metadata(),
-            None => fs::symlink_metadata(&path),
+            Some(f) => nofollow::fstat(f),
+            None => nofollow::lstat(&path),
         };
-        let os_err = || io_errno(&std::io::Error::last_os_error());
         // Attributes known to be current, saving a stat for the reply.
         let mut current = None;
 
@@ -662,13 +773,11 @@ impl Server {
                 current = Some(m);
             } else {
                 let mode = (mode & 0o7777) as libc::mode_t;
-                let rc = match fd {
-                    Some(fd) => unsafe { libc::fchmod(fd, mode) },
-                    None => unsafe { libc::chmod(c.as_ptr(), mode) },
+                let result = match fd {
+                    Some(fd) => if unsafe { libc::fchmod(fd, mode) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) },
+                    None => nofollow::chmod(&path, u32::from(mode)),
                 };
-                if rc != 0 {
-                    return Err(os_err());
-                }
+                result.map_err(|e| io_errno(&e))?;
             }
         }
         if valid & (FATTR_UID | FATTR_GID) != 0 {
@@ -677,23 +786,20 @@ impl Server {
             // We run as the user, so ownership changes mostly fail (guest
             // root extracting a tarball, Linux group IDs): ignore EPERM like
             // Apple's share does, and the file stays the user's.
-            let rc = match fd {
-                Some(fd) => unsafe { libc::fchown(fd, u, g) },
-                None => unsafe { libc::lchown(c.as_ptr(), u, g) },
+            let result = match fd {
+                Some(fd) => if unsafe { libc::fchown(fd, u, g) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) },
+                None => nofollow::chown(&path, u, g),
             };
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EPERM) {
-                    return Err(io_errno(&err));
-                }
-            } else {
-                current = None;
+            match result {
+                Ok(()) => current = None,
+                Err(err) if err.raw_os_error() == Some(libc::EPERM) => {}
+                Err(err) => return Err(io_errno(&err)),
             }
         }
         if valid & FATTR_SIZE != 0 {
             let result = match &file {
                 Some(f) => f.set_len(size),
-                None => fs::OpenOptions::new().write(true).open(&path).and_then(|f| f.set_len(size)),
+                None => nofollow::open(&path, libc::O_WRONLY, 0).and_then(|f| f.set_len(size)),
             };
             result.map_err(|e| io_errno(&e))?;
             current = None;
@@ -713,47 +819,41 @@ impl Server {
                 ts(valid & FATTR_ATIME != 0, valid & FATTR_ATIME_NOW != 0, atime, atimensec),
                 ts(valid & FATTR_MTIME != 0, valid & FATTR_MTIME_NOW != 0, mtime, mtimensec),
             ];
-            let rc = match fd {
-                Some(fd) => unsafe { libc::futimens(fd, times.as_ptr()) },
-                None => unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) },
+            let result = match fd {
+                Some(fd) => if unsafe { libc::futimens(fd, times.as_ptr()) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) },
+                None => nofollow::utimes(&path, &times),
             };
-            if rc != 0 {
-                return Err(os_err());
-            }
+            result.map_err(|e| io_errno(&e))?;
             current = None;
         }
         let m = match current {
             Some(m) => m,
             None => stat().map_err(|e| io_errno(&e))?,
         };
-        crate::watch::guest_wrote(&path, &m);
+        Self::noted(&path, &m);
         Ok(self.attr_reply(nodeid, &m))
     }
 
     fn readlink(&self, nodeid: u64) -> Reply {
-        let target = fs::read_link(self.path(nodeid)?).map_err(|e| io_errno(&e))?;
-        Ok(target.as_os_str().as_bytes().to_vec())
+        nofollow::read_link(&self.path(nodeid)?).map_err(|e| io_errno(&e))
     }
 
     fn symlink(&self, parent: u64, name: &[u8], target: &[u8]) -> Reply {
         let path = self.child(parent, name)?;
-        std::os::unix::fs::symlink(OsStr::from_bytes(target), &path).map_err(|e| io_errno(&e))?;
+        nofollow::symlink(OsStr::from_bytes(target), &path).map_err(|e| io_errno(&e))?;
         self.entry_noted(path)
     }
 
     fn mkdir(&self, parent: u64, name: &[u8], mode: u32) -> Reply {
         let path = self.child(parent, name)?;
-        let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| lerr::EINVAL)?;
-        if unsafe { libc::mkdir(c.as_ptr(), (mode & 0o7777) as libc::mode_t) } != 0 {
-            return Err(io_errno(&std::io::Error::last_os_error()));
-        }
+        nofollow::mkdir(&path, mode).map_err(|e| io_errno(&e))?;
         self.entry_noted(path)
     }
 
     fn remove(&self, parent: u64, name: &[u8], dir: bool) -> Reply {
         let path = self.child(parent, name)?;
-        let ino = fs::symlink_metadata(&path).map(|m| m.ino()).ok();
-        if dir { fs::remove_dir(&path) } else { fs::remove_file(&path) }.map_err(|e| io_errno(&e))?;
+        let ino = nofollow::lstat(&path).map(|m| m.ino()).ok();
+        nofollow::remove(&path, dir).map_err(|e| io_errno(&e))?;
         crate::watch::guest_removed(&path);
         // A removed file may still be open in the guest: keep its node (and
         // open file) but never reopen the name, which may get a new file.
@@ -765,11 +865,11 @@ impl Server {
 
     fn rename(&self, olddir: u64, old: &[u8], newdir: u64, new: &[u8]) -> Reply {
         let (from, to) = (self.child(olddir, old)?, self.child(newdir, new)?);
-        let replaced = fs::symlink_metadata(&to).map(|m| m.ino()).ok();
-        fs::rename(&from, &to).map_err(|e| io_errno(&e))?;
+        let replaced = nofollow::lstat(&to).map(|m| m.ino()).ok();
+        nofollow::rename(&from, &to).map_err(|e| io_errno(&e))?;
         crate::watch::guest_removed(&from);
-        if let Ok(m) = fs::symlink_metadata(&to) {
-            crate::watch::guest_wrote(&to, &m);
+        if let Ok(m) = nofollow::lstat(&to) {
+            Self::noted(&to, &m);
         }
         // Whatever the new name replaced is now nameless: it must never be
         // reopened by that path (it would be the moved file).
@@ -788,7 +888,7 @@ impl Server {
 
     fn link(&self, old: u64, newdir: u64, name: &[u8]) -> Reply {
         let (from, to) = (self.path(old)?, self.child(newdir, name)?);
-        fs::hard_link(&from, &to).map_err(|e| io_errno(&e))?;
+        nofollow::hard_link(&from, &to).map_err(|e| io_errno(&e))?;
         self.entry_noted(to)
     }
 
@@ -806,7 +906,6 @@ impl Server {
     }
 
     fn open_file(path: &Path, flags: u32, mode: u32) -> Result<fs::File, i32> {
-        let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| lerr::EINVAL)?;
         let mut mac = mac_open_flags(flags);
         // With writeback caching the kernel may read from write-only files.
         if mac & libc::O_ACCMODE == libc::O_WRONLY {
@@ -815,11 +914,7 @@ impl Server {
         // O_APPEND would make our positioned writes append; the kernel sends
         // the right offsets itself.
         mac &= !libc::O_APPEND;
-        let fd = unsafe { libc::open(c.as_ptr(), mac, mode as libc::c_uint) };
-        if fd < 0 {
-            return Err(io_errno(&std::io::Error::last_os_error()));
-        }
-        Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
+        nofollow::open(path, mac, mode).map_err(|e| io_errno(&e))
     }
 
     fn open_out(fh: u64) -> Vec<u8> {
@@ -837,8 +932,8 @@ impl Server {
     fn create(&self, parent: u64, name: &[u8], flags: u32, mode: u32) -> Reply {
         let path = self.child(parent, name)?;
         let file = Arc::new(Self::open_file(&path, flags | 0o100, mode & 0o7777)?);
-        let m = file.metadata().map_err(|e| io_errno(&e))?;
-        crate::watch::guest_wrote(&path, &m);
+        let m = nofollow::fstat(&file).map_err(|e| io_errno(&e))?;
+        Self::noted(&path, &m);
         let mut body = self.entry_with(path.clone(), &m)?;
         // A no-open kernel never sends RELEASE, even for created files: keep
         // the file as the node's (closed when evicted) and reply fh 0.
@@ -931,8 +1026,8 @@ impl Server {
             f = self.reopen_writable(nodeid)?;
             f.write_all_at(data, offset).map_err(|e| io_errno(&e))?;
         }
-        if let (Ok(path), Ok(m)) = (self.path(nodeid), f.metadata()) {
-            crate::watch::guest_wrote(&path, &m);
+        if let (Ok(path), Ok(m)) = (self.path(nodeid), nofollow::fstat(&f)) {
+            Self::noted(&path, &m);
         }
         let mut out = Out::default();
         out.u32(data.len() as u32).u32(0);
@@ -968,21 +1063,8 @@ impl Server {
     fn opendir(&self, nodeid: u64) -> Reply {
         let path = self.path(nodeid)?;
         let mut entries = vec![(b".".to_vec(), nodeid, libc::DT_DIR as u32), (b"..".to_vec(), 0, libc::DT_DIR as u32)];
-        for entry in fs::read_dir(&path).map_err(|e| io_errno(&e))?.flatten() {
-            let kind = entry.file_type().map_or(0, |t| {
-                if t.is_dir() {
-                    libc::DT_DIR
-                } else if t.is_symlink() {
-                    libc::DT_LNK
-                } else if t.is_file() {
-                    libc::DT_REG
-                } else {
-                    libc::DT_UNKNOWN
-                }
-            }) as u32;
-            let ino = entry.metadata().map_or(0, |m| m.ino());
-            entries.push((entry.file_name().as_bytes().to_vec(), ino, kind));
-        }
+        // DT_* values are the same on macOS and Linux.
+        entries.extend(nofollow::read_dir(&path).map_err(|e| io_errno(&e))?);
         let fh = self.new_handle(Handle::Dir(Arc::new(Dir { path, entries })));
         Ok(Self::open_out(fh))
     }
@@ -1028,6 +1110,7 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
 
     fn header(opcode: u32, nodeid: u64, body: &[u8]) -> Vec<u8> {
         let mut out = Out::default();
@@ -1352,6 +1435,60 @@ mod tests {
         assert_eq!(reply(&s, op::UNLINK, FUSE_ROOT_ID, &name("config.json")).0, 0);
         assert_eq!(read(new), (0, b"new".to_vec()));
         assert_eq!(reply(&s, op::FSYNC, new, &[0; 16]).0, 0);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_directory_swapped_for_a_symlink_leads_nowhere() {
+        let dir = tempdir("swap");
+        let share = dir.join("share");
+        fs::create_dir_all(share.join("d")).unwrap();
+        fs::create_dir_all(dir.join("outside")).unwrap();
+        fs::write(dir.join("outside/secret"), "keys").unwrap();
+        let s = Server::new(share.clone(), CachePolicy { negative: Duration::ZERO, ..CachePolicy::default() });
+        let (_, body) = reply(&s, op::LOOKUP, FUSE_ROOT_ID, &name("d"));
+        let d = u64::from_le_bytes(body[0..8].try_into().unwrap());
+        // A container swaps the directory it looked up for a symlink out.
+        fs::rename(share.join("d"), share.join("d2")).unwrap();
+        std::os::unix::fs::symlink(dir.join("outside"), share.join("d")).unwrap();
+        let (err, _) = reply(&s, op::LOOKUP, d, &name("secret"));
+        assert_ne!(err, 0, "nothing outside the share is reachable");
+        let mut create = Out::default();
+        create.u32(0o1 | 0o100).u32(0o644).u32(0).u32(0);
+        create.0.extend_from_slice(&name("planted"));
+        assert_ne!(reply(&s, op::CREATE, d, &create.0).0, 0);
+        assert!(!dir.join("outside/planted").exists());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn state_survives_save_and_restore() {
+        let dir = tempdir("save");
+        fs::create_dir_all(dir.join("d")).unwrap();
+        fs::write(dir.join("d/f"), "data").unwrap();
+        let s = Server::new(dir.clone(), CachePolicy::default());
+        let mut init = Out::default();
+        init.u32(7).u32(41).u32(131072).u32(FUSE_NO_OPEN_SUPPORT);
+        reply(&s, op::INIT, 0, &init.0);
+        let (_, body) = reply(&s, op::LOOKUP, FUSE_ROOT_ID, &name("d"));
+        let d = u64::from_le_bytes(body[0..8].try_into().unwrap());
+        let (_, body) = reply(&s, op::LOOKUP, d, &name("f"));
+        let f = u64::from_le_bytes(body[0..8].try_into().unwrap());
+        let (_, body) = reply(&s, op::OPENDIR, d, &[0; 8]);
+        let dh = u64::from_le_bytes(body[0..8].try_into().unwrap());
+        let saved = s.save_state();
+
+        // A fresh server (the daemon after a restore) carries on with the IDs.
+        let t = Server::new(dir.clone(), CachePolicy::default());
+        assert!(t.restore_state(&saved));
+        assert!(!t.restore_state(b"garbage"));
+        let mut read = Out::default();
+        read.u64(0).u64(0).u32(100).u32(0).u64(0).u32(0).u32(0);
+        assert_eq!(reply(&t, op::READ, f, &read.0), (0, b"data".to_vec()), "no-open mode and the node came back");
+        let mut rd = Out::default();
+        rd.u64(dh).u64(0).u32(4096).u32(0).u64(0).u32(0).u32(0);
+        assert_eq!(reply(&t, op::READDIR, d, &rd.0).0, 0, "open directory handle came back");
+        assert_eq!(reply(&t, op::OPEN, f, &[0; 8]).0, -lerr::ENOSYS);
         fs::remove_dir_all(dir).ok();
     }
 

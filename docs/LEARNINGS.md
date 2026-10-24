@@ -157,6 +157,25 @@ something here stops being true, fix it.
   - **Echo suppression:** compare the exact state (modification time and
     size, or removed) the guest's change left. Time windows broke real
     deletions.
+- **`mount(8)` canonicalizes sources:**
+  - **The trap:** a source like `home` becomes `/home` when such a directory
+    exists. It doesn't happen for types `mount` knows (`virtiofs`), but it
+    does for helpers (`mount.berth` got `/home`) and for unknown types
+    (`virtiofs_poll`). So the virtio-fs tag didn't match, home didn't mount,
+    and the agent, which lives in home, never started.
+  - **The fix:** strip the path in the helper and use `--no-canonicalize`.
+- **Anything in the boot path needs a way back.** Booting with
+  `fstab=0 systemd.mount-extra=home:<path>:virtiofs:rw` (and `rw` instead of
+  `ro`) brings a guest up whatever its fstab says; berth's safe mode does
+  this automatically.
+- **Symlinks:** macOS has `O_NOFOLLOW_ANY`, `AT_SYMLINK_NOFOLLOW_ANY` and
+  `RENAME_NOFOLLOW_ANY`, but no flag for `mkdirat`, `symlinkat` or `linkat`;
+  open the parent with `O_NOFOLLOW_ANY` for those. Tests: the temp folder is
+  under `/var`, itself a symlink.
+- **Custom Virtio devices and snapshots:** set `supportsSaveRestore` and
+  implement the two delegate methods. Use `method_id` in objc2's
+  `define_class!` for the one returning NSData. Let in-flight requests
+  finish before saving.
 - **Ownership:** guest root extracting tarballs, or Linux group IDs, makes
   `chown` fail on the Mac. Ignore EPERM like Apple's share does.
 - **The guest kernel** (Debian 6.12) builds FUSE and virtio-fs in (`=y`),

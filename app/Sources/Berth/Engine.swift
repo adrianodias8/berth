@@ -83,10 +83,13 @@ enum Control {
 struct BerthConfig: Codable, Equatable {
     var cpus: Int?
     var memoryMib: Int?
+    /// "berth" (its own share, macOS 27; the default) or "apple" (src/virtiofs.rs).
+    var fileSharing: String?
 
     enum CodingKeys: String, CodingKey {
         case cpus
         case memoryMib = "memory_mib"
+        case fileSharing = "file_sharing"
     }
 
     static func load() -> BerthConfig {

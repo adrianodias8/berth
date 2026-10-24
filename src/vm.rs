@@ -165,14 +165,27 @@ fn direct_boot(paths: &Paths) -> Option<Retained<VZBootLoader>> {
     let dir = paths.guest().join("boot");
     let (kernel, initrd, trying, failed) =
         (dir.join("vmlinuz"), dir.join("initrd.img"), dir.join("trying"), dir.join("direct-failed"));
-    if trying.exists() {
+    // A safe boot needs our command line, so it boots directly whatever the
+    // markers say (if it fails too, the next start uses EFI).
+    let safe = safe_boot(paths);
+    if trying.exists() && !safe {
         eprintln!("boot: last direct boot didn't come up; using EFI");
         let _ = fs::rename(&trying, &failed);
     }
     let cmdline = fs::read_to_string(dir.join("cmdline")).ok()?;
-    if failed.exists() || !kernel.exists() || !initrd.exists() || cmdline.trim().is_empty() {
+    if (failed.exists() && !safe) || !kernel.exists() || !initrd.exists() || cmdline.trim().is_empty() {
         return None;
     }
+    let cmdline = if safe {
+        // Mount home straight away (Apple's share, see virtiofs::home_share)
+        // instead of through /etc/fstab, whatever it says; the agent then
+        // repairs it (agent/src/kmod.rs).
+        let home = paths.home.to_string_lossy();
+        let args: Vec<&str> = cmdline.split_whitespace().map(|a| if a == "ro" { "rw" } else { a }).collect();
+        format!("{} fstab=0 systemd.mount-extra=home:{home}:virtiofs:rw berth.safe=1", args.join(" "))
+    } else {
+        cmdline
+    };
     fs::write(&trying, "").ok()?;
     unsafe {
         let boot = VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &file_url(&kernel));
@@ -180,6 +193,12 @@ fn direct_boot(paths: &Paths) -> Option<Retained<VZBootLoader>> {
         boot.setCommandLine(&NSString::from_str(cmdline.trim()));
         Some(Retained::into_super(boot))
     }
+}
+
+/// The last start didn't come up (daemon.rs's watchdog): boot without the
+/// guest's /etc/fstab, with home on Apple's share.
+pub fn safe_boot(paths: &Paths) -> bool {
+    paths.guest().join("boot/safe-boot").exists()
 }
 
 /// Build and validate the VM configuration. Must run on the main thread.
@@ -269,15 +288,20 @@ fn build_config(paths: &Paths, res: &Resources) -> Result<Retained<VZVirtualMach
         net.setAttachment(Some(&VZNATNetworkDeviceAttachment::new()));
         config.setNetworkDevices(&NSArray::from_retained_slice(&[Retained::into_super(net)]));
 
-        // Shared directories: the macOS home directory and, if available, Rosetta.
-        let home = VZVirtioFileSystemDeviceConfiguration::initWithTag(
-            VZVirtioFileSystemDeviceConfiguration::alloc(),
-            &NSString::from_str("home"),
-        );
-        let home_dir = VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &file_url(&paths.home), false);
-        let home_share = VZSingleDirectoryShare::initWithDirectory(VZSingleDirectoryShare::alloc(), &home_dir);
-        home.setShare(Some(&home_share));
-        let mut shares = vec![Retained::into_super(home)];
+        // Shared directories: the macOS home directory (berth's own device on
+        // macOS 27, see virtiofs.rs; Apple's otherwise) and, if available, Rosetta.
+        let home_share = crate::virtiofs::home_share(paths);
+        let mut shares = Vec::new();
+        if home_share == crate::virtiofs::HomeShare::Apple {
+            let home = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                VZVirtioFileSystemDeviceConfiguration::alloc(),
+                &NSString::from_str("home"),
+            );
+            let home_dir = VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &file_url(&paths.home), false);
+            let share = VZSingleDirectoryShare::initWithDirectory(VZSingleDirectoryShare::alloc(), &home_dir);
+            home.setShare(Some(&share));
+            shares.push(Retained::into_super(home));
+        }
         if VZLinuxRosettaDirectoryShare::availability() == VZLinuxRosettaAvailability::Installed {
             let rosetta = VZLinuxRosettaDirectoryShare::initWithError(VZLinuxRosettaDirectoryShare::alloc())
                 .map_err(|e| ns_error(&e))
@@ -292,8 +316,9 @@ fn build_config(paths: &Paths, res: &Resources) -> Result<Retained<VZVirtualMach
             eprintln!("Rosetta is not installed; x86-64 images will not run. Install it with `softwareupdate --install-rosetta`.");
         }
         config.setDirectorySharingDevices(&NSArray::from_retained_slice(&shares));
-        // Experimental berth virtio-fs (macOS 27+, BERTH_EXPERIMENTAL_FS=1).
-        crate::virtiofs::attach(&config, &paths.home);
+        if let crate::virtiofs::HomeShare::Berth { poll_driver } = home_share {
+            crate::virtiofs::attach(&config, &paths.home, poll_driver);
+        }
 
         // Guest console goes to a log file for debugging.
         let console_fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);

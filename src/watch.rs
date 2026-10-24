@@ -46,9 +46,10 @@ fn note(path: &Path, sig: Signature) {
     changes.insert(path.to_path_buf(), (sig, Instant::now()));
 }
 
-/// The file server wrote `path` for the guest; `meta` is its state after.
-pub fn guest_wrote(path: &Path, meta: &std::fs::Metadata) {
-    note(path, signature_of(meta));
+/// The file server wrote `path` for the guest, leaving it with this
+/// modification time and length (0 for directories).
+pub fn guest_wrote(path: &Path, modified: std::time::SystemTime, len: u64) {
+    note(path, Some((modified, len)));
 }
 
 /// The file server removed (or renamed away) `path` for the guest.
@@ -281,7 +282,8 @@ mod tests {
         let (mine, theirs) = (dir.join("from-guest"), dir.join("from-mac"));
         std::fs::write(&mine, "x").unwrap();
         std::fs::write(&theirs, "x").unwrap();
-        guest_wrote(&mine, &std::fs::metadata(&mine).unwrap());
+        let m = std::fs::metadata(&mine).unwrap();
+        guest_wrote(&mine, m.modified().unwrap(), m.len());
         let mut seen = HashMap::new();
         assert_eq!(changed(&mut seen, [mine.clone(), theirs.clone()].into()), vec![theirs]);
         assert!(seen.contains_key(&mine), "still recorded");
