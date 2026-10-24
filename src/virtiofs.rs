@@ -236,7 +236,8 @@ extern_protocol!(
 );
 
 pub struct Ivars {
-    server: Arc<Server>,
+    /// What answers the requests: the file server, or the tunnel (fuse/tunnel.rs).
+    backend: Backend,
     /// The serial queue the framework runs the device on: every queue and
     /// element call happens here.
     device_queue: DispatchRetained<DispatchQueue>,
@@ -247,6 +248,11 @@ pub struct Ivars {
     /// Every virtqueue seen so far, by index, so one poll covers them all.
     /// Device queue only.
     queues: RefCell<Vec<Option<Retained<VZVirtioQueue>>>>,
+}
+
+enum Backend {
+    Files(Arc<Server>),
+    Tunnel(Arc<crate::fuse::tunnel::Tunnel>),
 }
 
 /// A served request: the job, its reply, and the time spent serving it.
@@ -304,6 +310,10 @@ define_class!(
         #[unsafe(method_id(customVirtioDeviceSaveStateForRestore:))]
         fn save_state(&self, _device: &VZCustomVirtioDevice) -> Option<Retained<NSData>> {
             let done = &self.ivars().done;
+            // Reads waiting for data from the Mac would never finish.
+            if let Backend::Tunnel(tunnel) = &self.ivars().backend {
+                tunnel.cancel_all();
+            }
             let deadline = Instant::now() + Duration::from_secs(5);
             while done.in_flight.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
                 if !done.flush() {
@@ -311,14 +321,23 @@ define_class!(
                 }
             }
             done.flush();
-            Some(NSData::with_bytes(&self.ivars().server.save_state()))
+            Some(NSData::with_bytes(&match &self.ivars().backend {
+                Backend::Files(server) => server.save_state(),
+                // Connections don't survive a restore: nothing to save.
+                Backend::Tunnel(_) => Vec::new(),
+            }))
         }
 
         #[unsafe(method(customVirtioDeviceShouldRestore:saveState:))]
         fn restore_state(&self, _device: &VZCustomVirtioDevice, save_state: &NSData) -> bool {
-            let ok = self.ivars().server.restore_state(&save_state.to_vec());
-            eprintln!("virtiofs: {} the share's state from the snapshot", if ok { "restored" } else { "couldn't restore" });
-            ok
+            match &self.ivars().backend {
+                Backend::Files(server) => {
+                    let ok = server.restore_state(&save_state.to_vec());
+                    eprintln!("virtiofs: {} the share's state from the snapshot", if ok { "restored" } else { "couldn't restore" });
+                    ok
+                }
+                Backend::Tunnel(_) => true,
+            }
         }
     }
 );
@@ -365,10 +384,10 @@ impl Job {
 }
 
 impl FsDevice {
-    fn new(server: Server, device_queue: DispatchRetained<DispatchQueue>, threaded: bool) -> Retained<Self> {
+    fn new(backend: Backend, device_queue: DispatchRetained<DispatchQueue>, threaded: bool) -> Retained<Self> {
         let workers = threaded.then(|| DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(DispatchQoS::UserInitiated)));
         let this = Self::alloc().set_ivars(Ivars {
-            server: Arc::new(server),
+            backend,
             device_queue,
             workers,
             done: Arc::default(),
@@ -420,7 +439,10 @@ impl FsDevice {
         done.polling.store(false, Ordering::SeqCst);
         done.flush();
         if let Some(idle) = stats::enabled().then(stats::due).flatten() {
-            let ops = ivars.server.opcode_counts();
+            let ops = match &ivars.backend {
+                Backend::Files(server) => server.opcode_counts(),
+                Backend::Tunnel(_) => Vec::new(),
+            };
             eprintln!("virtiofs: by opcode{} {:?}", if idle { " (idle)" } else { "" }, ops.iter().map(|(op, n, us)| format!("{op}:{n}@{us:.1}µs")).collect::<Vec<_>>());
         }
     }
@@ -443,11 +465,28 @@ impl FsDevice {
                 continue;
             }
             next = unsafe { queue.nextElement() };
+            let server = match &ivars.backend {
+                Backend::Files(server) => server,
+                Backend::Tunnel(tunnel) => {
+                    // Answered whenever the Mac side is ready, from its runtime.
+                    ivars.done.in_flight.fetch_add(1, Ordering::SeqCst);
+                    let (done, device_queue) = (ivars.done.clone(), ivars.device_queue.clone());
+                    tunnel.handle(request, move |reply| {
+                        done.list.lock().unwrap().push((job, reply, Duration::ZERO));
+                        if !done.polling.load(Ordering::SeqCst) {
+                            device_queue.exec_async(move || {
+                                done.flush();
+                            });
+                        }
+                    });
+                    continue;
+                }
+            };
             let concurrent = next.is_some() || ivars.done.in_flight.load(Ordering::SeqCst) > 0;
             match &ivars.workers {
                 Some(workers) if concurrent && !hiprio => {
                     ivars.done.in_flight.fetch_add(1, Ordering::SeqCst);
-                    let (server, done, device_queue) = (ivars.server.clone(), ivars.done.clone(), ivars.device_queue.clone());
+                    let (server, done, device_queue) = (server.clone(), ivars.done.clone(), ivars.device_queue.clone());
                     workers.exec_async(move || {
                         let t = Instant::now();
                         let reply = server.handle(&request);
@@ -461,7 +500,7 @@ impl FsDevice {
                 }
                 _ => {
                     let t = Instant::now();
-                    let reply = ivars.server.handle(&request);
+                    let reply = server.handle(&request);
                     job.complete(reply, t.elapsed());
                 }
             }
@@ -649,6 +688,9 @@ fn poll_driver_ready(paths: &crate::paths::Paths) -> bool {
     ok
 }
 
+/// The tunnel's device tag (fuse/tunnel.rs, agent/src/tunnel.rs).
+const TUNNEL_TAG: &str = "berth-tunnel";
+
 fn device(root: &std::path::Path, poll_driver: bool) -> Retained<NSObject> {
     let num = |var: &str, default: f64| std::env::var(var).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(default);
     let policy = CachePolicy {
@@ -675,10 +717,31 @@ fn device(root: &std::path::Path, poll_driver: bool) -> Retained<NSObject> {
         None,
         Some(&DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(DispatchQoS::UserInteractive))),
     );
-    let device = FsDevice::new(Server::new(root.to_path_buf(), policy), queue.clone(), threaded);
+    let device = FsDevice::new(Backend::Files(Arc::new(Server::new(root.to_path_buf(), policy))), queue.clone(), threaded);
+    configure(device, queue, TAG, request_queues, poll_driver)
+}
+
+/// The tunnel device: connections from the VM to the Mac's loopback.
+fn tunnel_device(poll_driver: bool) -> Retained<NSObject> {
+    let queue = DispatchQueue::new_with_target(
+        "dev.berth.tunnel",
+        None,
+        Some(&DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(DispatchQoS::UserInteractive))),
+    );
+    let device = FsDevice::new(Backend::Tunnel(crate::fuse::tunnel::Tunnel::new()), queue.clone(), false);
+    configure(device, queue, TUNNEL_TAG, 1, poll_driver)
+}
+
+fn configure(
+    device: Retained<FsDevice>,
+    queue: DispatchRetained<DispatchQueue>,
+    tag: &str,
+    request_queues: u16,
+    poll_driver: bool,
+) -> Retained<NSObject> {
     unsafe {
         let mut config_space = vec![0u8; 40];
-        config_space[..TAG.len()].copy_from_slice(TAG.as_bytes());
+        config_space[..tag.len()].copy_from_slice(tag.as_bytes());
         config_space[36..40].copy_from_slice(&(request_queues as u32).to_le_bytes()); // num_request_queues
         let specific = VZVirtioDeviceSpecificConfiguration::initWithConfigurationData(
             VZVirtioDeviceSpecificConfiguration::alloc(),
@@ -702,10 +765,20 @@ fn device(root: &std::path::Path, poll_driver: bool) -> Retained<NSObject> {
     }
 }
 
-/// Add berth's file sharing device for `root` to a VM configuration.
-pub fn attach(config: &objc2_virtualization::VZVirtualMachineConfiguration, root: &std::path::Path, poll_driver: bool) {
+/// Add berth's devices to a VM configuration (macOS 27): the home share
+/// when `share` is berth's, and the tunnel either way.
+pub fn attach(config: &objc2_virtualization::VZVirtualMachineConfiguration, root: &std::path::Path, share: HomeShare) {
+    if AnyClass::get(c"VZCustomVirtioDeviceConfiguration").is_none() {
+        return;
+    }
+    let poll_driver = share == HomeShare::Berth { poll_driver: true };
+    let mut devices = Vec::new();
+    if let HomeShare::Berth { poll_driver } = share {
+        devices.push(device(root, poll_driver));
+    }
+    devices.push(tunnel_device(poll_driver));
     {
-        let devices = NSArray::from_retained_slice(&[device(root, poll_driver)]);
+        let devices = NSArray::from_retained_slice(&devices);
         unsafe {
             let _: () = msg_send![config, setCustomVirtioDevices: &*devices];
         }

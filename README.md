@@ -56,7 +56,8 @@ from its code.
   detected (override: `dev.berth.http-port`), HTTPS uses a local CA limited to
   `.local` names (`berth tls trust`, or the app's setup)
 - Direct container IPs from the Mac (`curl 172.17.0.2`) for every bridge network
-- `host.docker.internal` reaches the Mac, including localhost-only servers;
+- `host.docker.internal` reaches the Mac, including localhost-only servers
+  (on macOS 27 over berth's own tunnel device: ~20-30 Gbit/s both ways);
   containers use the Mac's DNS, so VPN and split DNS apply
 
 **Development**

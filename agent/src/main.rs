@@ -40,6 +40,7 @@ mod listeners;
 mod machines;
 mod mdns;
 mod memory;
+mod tunnel;
 mod web;
 
 use std::io::{self, Read, Write};

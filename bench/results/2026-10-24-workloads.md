@@ -4,11 +4,11 @@
 <context>`, each engine with the other idle; internet rows depend on the
 connection (runs back to back).
 
-| Workload | OrbStack | berth before | berth after vsock buffers |
-|---|---|---|---|
-| container run (mean of 10) | 0.27 s | 0.31 s | 0.32 s |
-| Mac -> container, 2 GiB HTTP via host.docker.internal | **30.2 Gbit/s** | 3.4 Gbit/s | 6.9 Gbit/s |
-| container -> Mac, 1 GiB HTTP POST | 17.8 Gbit/s | 18.6 Gbit/s | **29.6 Gbit/s** |
+| Workload | OrbStack | berth before | berth after vsock buffers | berth with the tunnel device |
+|---|---|---|---|---|
+| container run (mean of 10) | 0.27 s | 0.31 s | 0.32 s | |
+| Mac -> container, 2 GiB HTTP via host.docker.internal | **30.2 Gbit/s** | 3.4 Gbit/s | 6.9 Gbit/s | 21–25 Gbit/s |
+| container -> Mac, 1 GiB HTTP POST | 17.8 Gbit/s | 18.6 Gbit/s | **29.6 Gbit/s** | 18–28 Gbit/s |
 | internet download, 100 MB | 126 Mbit/s | 101 Mbit/s | – |
 | DNS lookup, mean of 200 | 1.10 ms | **0.65 ms** | – |
 | pull node:22-alpine | 3.76 s | 3.85 s | – |
@@ -26,3 +26,14 @@ connection (runs back to back).
   network stack.
 - docker build: the 10 MB context travels over the Docker socket bridge
   (vsock, Mac -> VM: the slow direction).
+
+## Tunnel device
+
+Parallel downloads showed the vsock limit is the device's, not per
+connection: berth stayed at ~5.8 Gbit/s aggregate with 1 or 4 streams
+(OrbStack: 3.2 -> 17.6). host.docker.internal now goes over a second berth
+virtio-fs device, `berth-tunnel` (src/fuse/tunnel.rs, agent/src/tunnel.rs):
+each connection is a pair of FUSE stream files (direct I/O, no position),
+reads answered asynchronously when the Mac side has data, and each READ
+filled with everything already buffered. Mac -> container 6.9 -> 21-25
+Gbit/s. vsock remains the fallback (Apple's share, older macOS).

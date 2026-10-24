@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 mod nofollow;
+pub mod tunnel;
 use nofollow::Stat;
 
 const FUSE_ROOT_ID: u64 = 1;

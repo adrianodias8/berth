@@ -317,9 +317,7 @@ fn build_config(paths: &Paths, res: &Resources) -> Result<Retained<VZVirtualMach
             eprintln!("Rosetta is not installed; x86-64 images will not run. Install it with `softwareupdate --install-rosetta`.");
         }
         config.setDirectorySharingDevices(&NSArray::from_retained_slice(&shares));
-        if let crate::virtiofs::HomeShare::Berth { poll_driver } = home_share {
-            crate::virtiofs::attach(&config, &paths.home, poll_driver);
-        }
+        crate::virtiofs::attach(&config, &paths.home, home_share);
 
         // Guest console goes to a log file for debugging.
         let console_fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);

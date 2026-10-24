@@ -93,6 +93,7 @@ pub fn configure_docker() -> io::Result<()> {
 }
 
 pub fn run() {
+    crate::tunnel::mount();
     let listener = match TcpListener::bind(("0.0.0.0", REDIRECT_PORT)) {
         Ok(l) => l,
         Err(err) => {
@@ -118,6 +119,13 @@ fn forward(conn: TcpStream) -> io::Result<()> {
         return Ok(());
     }
     conn.set_nodelay(true)?;
+    // berth's tunnel device carries Mac -> VM data several times faster
+    // than vsock (agent/src/tunnel.rs); vsock when it isn't there.
+    match crate::tunnel::connect(dst.port()) {
+        Some(Ok((down, up))) => return crate::tunnel::relay(conn, down, up),
+        Some(Err(err)) if err.raw_os_error() == Some(libc::ECONNREFUSED) => return Ok(()),
+        _ => {}
+    }
     let mut host = UnixStream::from(vsock_connect(VMADDR_CID_HOST, HOST_VSOCK_PORT)?);
     writeln!(host, "tcp {}", dst.port())?;
     crate::splice(conn, host)

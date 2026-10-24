@@ -105,6 +105,12 @@ something here stops being true, fix it.
 - **Docker's FORWARD policy is DROP**, which also kills Podman and nerdctl
   traffic. berth adds `DOCKER-USER` accepts for DNAT'd traffic, the VM's
   NAT subnet, and `podman+`, `nerdctl+` and `ve-+` interfaces.
+- **vsock's ceiling is the device's:** Mac -> VM tops out at ~6 Gbit/s in
+  total, however many connections, after widening buffers (macOS Unix
+  socket 8 KB by default; Linux vsock credit 256 KB). Splitting a transfer
+  over connections can't help. berth's own virtio-fs device, carrying
+  connections as FUSE stream files (FOPEN_DIRECT_IO | FOPEN_STREAM), does
+  21-25 Gbit/s. Apple's NAT network does ~10.5 Gbit/s Mac -> VM.
 - **Ports below 1024:** macOS lets ordinary users bind them only on all
   interfaces, not `127.0.0.1`. DDEV's router binds `127.0.0.1:80/443`, so the
   helper binds those and passes the socket back over SCM_RIGHTS.
