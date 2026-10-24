@@ -75,7 +75,8 @@ from its code.
   notifications forwarded so hot reload works (`docs/file-sharing.md`)
 - Kubernetes: `berth k8s enable` gives a single-node k3s using berth's Docker, so
   locally built images run in pods without a registry; `berth` kubectl context,
-  API on `localhost:6443`, pod and service IPs reachable from the Mac
+  API on `localhost:6443`, pod and service IPs reachable from the Mac, and
+  every service by name: `curl http://web.default.svc.cluster.local`
 - Linux machines: `berth machine create dev --distro ubuntu:noble` (Debian,
   Fedora, Alpine, Arch, Rocky, Alma, openSUSE…) with your user, sudo, your Mac
   home, systemd, and `dev.berth.local`; `berth machine shell dev`

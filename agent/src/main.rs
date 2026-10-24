@@ -91,6 +91,7 @@ fn main() {
     thread::spawn(move || dns::run(t3));
     thread::spawn(hostnet::run);
     thread::spawn(listeners::run);
+    thread::spawn(k8s::watch_services);
 
     let listener = match vsock_listen(PORT) {
         Ok(fd) => fd,

@@ -32,6 +32,42 @@ RestartSec=5
 WantedBy=multi-user.target
 ";
 
+/// Services with a cluster IP, as (name, namespace, IP), for their
+/// `<name>.<namespace>.svc.cluster.local` domains (domains.rs). The Mac
+/// routes the service network here, where kube-proxy takes over.
+pub fn services() -> Vec<(String, String, std::net::Ipv4Addr)> {
+    if !active() {
+        return Vec::new();
+    }
+    let Ok(json) = sh(&format!("KUBECONFIG={KUBECONFIG} {BIN} kubectl get services -A -o json 2>/dev/null")) else {
+        return Vec::new();
+    };
+    let Ok(list) = serde_json::from_str::<serde_json::Value>(&json) else { return Vec::new() };
+    list["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            let ip = s["spec"]["clusterIP"].as_str()?.parse().ok()?; // not headless ("None")
+            Some((s["metadata"]["name"].as_str()?.to_string(), s["metadata"]["namespace"].as_str()?.to_string(), ip))
+        })
+        .collect()
+}
+
+/// Services change without Docker events: ask for a domain sync when the
+/// list does.
+pub fn watch_services() {
+    let mut last = Vec::new();
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let now = services();
+        if now != last {
+            last = now;
+            crate::domains::request_sync();
+        }
+    }
+}
+
 pub fn active() -> bool {
     Command::new("systemctl").args(["is-active", "--quiet", "k3s"]).status().is_ok_and(|s| s.success())
 }

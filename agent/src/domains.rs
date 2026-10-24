@@ -330,6 +330,18 @@ fn sync_now(table: &Shared) -> io::Result<()> {
         });
     }
 
+    // Kubernetes services, at their own cluster IPs (routed from the Mac).
+    for (name, namespace, ip) in crate::k8s::services() {
+        entries.push(Entry {
+            domain: format!("{name}.{namespace}.svc.cluster.local"),
+            wildcard: false,
+            subdomains_only: false,
+            ip,
+            container: format!("k8s:{namespace}/{name}"),
+            from_label: false,
+        });
+    }
+
     apply(&up, &mapping)?;
     let gone: Vec<(String, Ipv4Addr)> = {
         let mut t = table.write().unwrap();

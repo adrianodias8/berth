@@ -10,6 +10,8 @@ are in the commit messages.
 - **Machines and the Mac:** `ssh <machine>.berth` (VS Code Remote-SSH), the
   `mac` command inside machines, and the Mac's SSH agent in machines and at
   `/run/host-services/ssh-auth.sock`.
+- **Kubernetes:** services resolve on the Mac as
+  `<name>.<namespace>.svc.cluster.local`.
 - **Settings:** `berth config list|get|set|unset`, with values checked.
 - **Proxy:** Docker's pulls and pushes follow the Mac's proxy settings (or a
   given URL), without restarting Docker under running containers.
