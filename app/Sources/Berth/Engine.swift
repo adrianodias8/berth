@@ -189,11 +189,13 @@ final class Engine: ObservableObject {
         }
     }
 
-    func stop() {
+    /// `shutdown` overrides the "stop" setting (a restart must apply settings,
+    /// which a suspended VM wouldn't).
+    func stop(shutdown: Bool = false) {
         guard state == .running || state == .starting else { return }
         state = .stopping
         Task.detached {
-            let result = Self.run([BerthPaths.cli, "stop"])
+            let result = Self.run([BerthPaths.cli, "stop"] + (shutdown ? ["--shutdown"] : []))
             guard result.code != 0 else { return }
             await MainActor.run {
                 // Still up: leave "Stopping…" so the buttons work again.
@@ -205,7 +207,7 @@ final class Engine: ObservableObject {
 
     func restart() {
         Task {
-            stop()
+            stop(shutdown: true)
             while status != nil { try? await Task.sleep(for: .milliseconds(500)) }
             start()
         }

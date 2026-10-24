@@ -637,6 +637,24 @@ pub static CURRENT: std::sync::OnceLock<HomeShare> = std::sync::OnceLock::new();
 /// share it was saved with.
 pub static FORCED: std::sync::OnceLock<HomeShare> = std::sync::OnceLock::new();
 
+/// The file sharing setting: "apple" or "berth" (BERTH_FILE_SHARING, else
+/// config.json's "file_sharing", else berth's).
+pub fn configured_share(paths: &crate::paths::Paths) -> String {
+    #[derive(serde::Deserialize, Default)]
+    struct Config {
+        file_sharing: Option<String>,
+    }
+    std::env::var("BERTH_FILE_SHARING")
+        .ok()
+        .or_else(|| {
+            std::fs::read(paths.config())
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Config>(&b).ok())
+                .and_then(|c| c.file_sharing)
+        })
+        .unwrap_or_else(|| "berth".into())
+}
+
 /// Decide how to share home for this start (and leave the marker that makes
 /// a failed polling-driver attempt fall back next time).
 pub fn home_share(paths: &crate::paths::Paths) -> HomeShare {
@@ -644,17 +662,7 @@ pub fn home_share(paths: &crate::paths::Paths) -> HomeShare {
         let _ = CURRENT.set(forced);
         return forced;
     }
-    #[derive(serde::Deserialize, Default)]
-    struct Config {
-        file_sharing: Option<String>,
-    }
-    let setting = std::env::var("BERTH_FILE_SHARING").ok().or_else(|| {
-        std::fs::read(paths.config())
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Config>(&b).ok())
-            .and_then(|c| c.file_sharing)
-    });
-    let share = if setting.as_deref() == Some("apple")
+    let share = if configured_share(paths) == "apple"
         || AnyClass::get(c"VZCustomVirtioDeviceConfiguration").is_none()
         || crate::vm::safe_boot(paths)
     {

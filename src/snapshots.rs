@@ -29,6 +29,10 @@ use crate::vm::Resources;
 
 const STATE: &str = "state.vzvmsave";
 
+/// One pause/save/clone/resume at a time: a second one resuming the VM in
+/// the middle would pair a saved memory with a later disk.
+static LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Meta {
     pub name: String,
@@ -141,18 +145,25 @@ fn now() -> u64 {
 
 /// Snapshot the running VM (in the daemon). Returns what was saved.
 pub async fn create_running(paths: &Paths, name: &str, with_memory: bool, res: &Resources) -> Result<Meta> {
+    let _lifecycle = LIFECYCLE.lock().await;
+    if crate::daemon::stopping() {
+        bail!("berth is stopping");
+    }
     let partial = new_partial(paths, name)?;
     let running = crate::ports::running_containers().await.unwrap_or_default();
+    let mut paused = false;
     let result = async {
         let mut saved_memory = false;
         if with_memory {
             crate::vm::pause().await?;
+            paused = true;
             match crate::vm::save_state(partial.join(STATE)).await {
                 Ok(()) => saved_memory = true,
                 Err(err) => {
                     eprintln!("snapshot {name}: can't save the VM's state ({err:#}); saving its disk only");
                     let _ = fs::remove_file(partial.join(STATE));
                     crate::vm::resume().await?;
+                    paused = false;
                 }
             }
         }
@@ -163,9 +174,11 @@ pub async fn create_running(paths: &Paths, name: &str, with_memory: bool, res: &
                 let _ = guest.read_to_end(&mut Vec::new()).await;
             }
             crate::vm::pause().await?;
+            paused = true;
         }
         let disk = save_files(paths, &partial);
         crate::vm::resume().await?;
+        paused = false;
         Ok::<_, anyhow::Error>(Meta {
             name: name.to_string(),
             created: now(),
@@ -186,8 +199,11 @@ pub async fn create_running(paths: &Paths, name: &str, with_memory: bool, res: &
         }
         Err(err) => {
             let _ = fs::remove_dir_all(&partial);
-            // Never leave the VM paused because a snapshot failed.
-            let _ = crate::vm::resume().await;
+            // Never leave the VM paused because a snapshot failed (but don't
+            // resume one we didn't pause).
+            if paused {
+                let _ = crate::vm::resume().await;
+            }
             Err(err)
         }
     }
@@ -349,6 +365,7 @@ fn suspend_dir(paths: &Paths) -> PathBuf {
 /// leave a pending restore that the next start resumes. The VM must then be
 /// stopped without a guest shutdown, so its disk stays as saved.
 pub async fn suspend(paths: &Paths, res: &Resources) -> Result<()> {
+    let _lifecycle = LIFECYCLE.lock().await;
     let dir = suspend_dir(paths);
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;

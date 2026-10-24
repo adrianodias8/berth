@@ -1597,7 +1597,10 @@ static bool virtio_fs_answer_locally(struct fuse_req *req)
 		return false;
 	fi = get_fuse_inode(inode);
 	now = get_jiffies_64();
-	same = (inode->i_mode & 07777) == (in->mode & 07777) && time_before64(now, fi->i_time);
+	/* Cached attributes count only if nothing marked them stale since. */
+	same = (inode->i_mode & 07777) == (in->mode & 07777) && time_before64(now, fi->i_time) &&
+	       !(READ_ONCE(fi->inval_mask) & STATX_BASIC_STATS) &&
+	       !test_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 	if (same) {
 		out = args->out_args[0].value;
 		memset(out, 0, sizeof(*out));

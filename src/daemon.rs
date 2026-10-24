@@ -99,6 +99,11 @@ pub struct Status {
 
 static STOPPING: AtomicBool = AtomicBool::new(false);
 
+/// The VM is on its way down: no more snapshots.
+pub fn stopping() -> bool {
+    STOPPING.load(Ordering::SeqCst)
+}
+
 fn yes() -> bool {
     true
 }
@@ -234,7 +239,25 @@ pub fn run(paths: Paths) -> Result<()> {
         let _ = std::fs::remove_file(sock);
     }
 
-    let restore = crate::snapshots::take_restore(&paths);
+    let mut restore = crate::snapshots::take_restore(&paths);
+    // A suspended VM resumes with the settings it had: if they've changed
+    // since (CPUs, memory, file sharing), boot instead so they apply.
+    // Its disk then boots as after a crash, and its containers are started.
+    if let Some(r) = &mut restore
+        && r.consumed
+        && r.state.is_some()
+    {
+        let now = Resources::load(&paths);
+        let share_changed = r.share.is_some_and(|saved| {
+            (saved == crate::virtiofs::HomeShare::Apple) != (crate::virtiofs::configured_share(&paths) == "apple")
+        });
+        if now.cpus != r.resources.cpus || now.memory != r.resources.memory || share_changed {
+            eprintln!("settings changed since the VM was suspended; booting it instead of resuming");
+            r.state = None;
+            r.share = None;
+            r.resources = now;
+        }
+    }
     let res = match &restore {
         Some(r) => Resources { cpus: r.resources.cpus, memory: r.resources.memory },
         None => Resources::load(&paths),

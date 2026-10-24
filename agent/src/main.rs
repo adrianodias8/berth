@@ -157,6 +157,26 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
     }
 }
 
+/// The mode of `fd`, from the filesystem rather than the cache (statx with
+/// AT_STATX_FORCE_SYNC sends a GETATTR on FUSE).
+fn force_stat_mode(fd: &OwnedFd) -> io::Result<u32> {
+    let mut buf = [0u8; 256];
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            fd.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_STATX_FORCE_SYNC,
+            0x7ffu32, // STATX_BASIC_STATS
+            buf.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u32::from(u16::from_ne_bytes([buf[28], buf[29]])) & 0o7777) // stx_mode
+}
+
 /// The VM's clock doesn't run while the Mac sleeps (and a restored snapshot
 /// wakes up with the time it was saved at); NTP polls too rarely to notice.
 fn set_clock(secs: &str, mut host: UnixStream) -> io::Result<()> {
@@ -208,13 +228,24 @@ fn touch(path: &str) -> io::Result<()> {
     if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    let mut mode = st.st_mode & 0o7777;
+    // Ask the share for fresh attributes first: that's what makes the guest
+    // see the Mac's new size and mtime (and drop stale pages). The chmod
+    // alone may be answered from cache (berth's driver skips no-op chmods).
+    let fresh = force_stat_mode(&fd);
+    if let Ok(m) = fresh {
+        mode = m;
+    }
     // An O_PATH handle can't fchmod; its /proc/self/fd entry can be chmodded.
     let proc = std::ffi::CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(io::Error::other)?;
-    let mode = st.st_mode & 0o7777;
-    if unsafe { libc::chmod(proc.as_ptr(), mode) } == 0 {
-        return Ok(());
-    }
-    let err = io::Error::last_os_error();
+    let chmod = if fresh.as_ref().is_err_and(|e| e.raw_os_error() == Some(libc::ESTALE)) {
+        Err(io::Error::from_raw_os_error(libc::ESTALE))
+    } else if unsafe { libc::chmod(proc.as_ptr(), mode) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    };
+    let Err(err) = chmod else { return Ok(()) };
     if err.raw_os_error() != Some(libc::ESTALE) {
         return Err(err);
     }

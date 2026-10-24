@@ -122,7 +122,7 @@ fn forward(conn: TcpStream) -> io::Result<()> {
     // berth's tunnel device carries Mac -> VM data several times faster
     // than vsock (agent/src/tunnel.rs); vsock when it isn't there.
     match crate::tunnel::connect(dst.port()) {
-        Some(Ok((down, up))) => return crate::tunnel::relay(conn, down, up),
+        Some(Ok((down, up, slot))) => return crate::tunnel::relay(conn, down, up, slot),
         Some(Err(err)) if err.raw_os_error() == Some(libc::ECONNREFUSED) => return Ok(()),
         _ => {}
     }
