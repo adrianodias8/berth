@@ -3,3 +3,4 @@ target-dev/
 app/.build/
 app/.swiftpm/
 bench/results/*.md.*
+.claude/
