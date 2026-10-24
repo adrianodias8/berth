@@ -62,8 +62,14 @@ fn password(paths: &Paths) -> Result<String> {
     let mut bytes = [0u8; 32];
     unsafe { libc::arc4random_buf(bytes.as_mut_ptr().cast(), bytes.len()) };
     let new: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
+    // A new file with 0600 from the start, then renamed over: never a moment
+    // with the password readable, nor half written.
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
     file.write_all(new.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, &path)?;
     Ok(new)
 }
 
@@ -85,7 +91,8 @@ pub async fn mount(paths: &Paths) -> Result<()> {
     }
     std::fs::create_dir_all(&dir)?;
     let target = dir.clone();
-    tokio::task::spawn_blocking(move || netfs_mount(ip, &target, &password)).await??;
+    // Foundation objects on a thread without a pool of its own.
+    tokio::task::spawn_blocking(move || objc2::rc::autoreleasepool(|_| netfs_mount(ip, &target, &password))).await??;
     eprintln!("files: the VM's volumes, machines and containers are in {}", dir.display());
     Ok(())
 }

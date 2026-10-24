@@ -216,9 +216,10 @@ pub fn bind_roots<'a>(sources: impl Iterator<Item = &'a str>, home: &Path) -> BT
         std::iter::once(home).chain(crate::virtiofs::EXTRA_SHARES.iter().map(|(_, p)| Path::new(*p))).collect();
     sources
         .map(PathBuf::from)
-        // A file mount is watched through its directory.
-        .map(|p| if p.is_dir() { p } else { p.parent().map_or(p.clone(), Path::to_path_buf) })
-        // Inside a shared folder, never a whole one (a file mounted straight from ~).
+        // A file mount is watched as itself: its folder can be all of
+        // $TMPDIR or an external disk, busy with other apps' files.
+        .filter(|p| p.exists())
+        // Inside a shared folder, never a whole one.
         .filter(|p| shared.iter().any(|root| p.starts_with(root) && p != root))
         .collect()
 }
@@ -319,8 +320,8 @@ mod tests {
         let s = |p: &Path| p.to_str().unwrap().to_string();
         let sources = [s(&home.join("app")), "/var/run/docker.sock".into(), s(&home), s(&home.join(".env"))];
         let roots = bind_roots(sources.iter().map(String::as_str), &home);
-        // Only the app dir: not /var/run, not ~ itself, not ~ via ~/.env.
-        assert_eq!(roots.into_iter().collect::<Vec<_>>(), vec![home.join("app")]);
+        // The app dir and the .env file itself: not /var/run, not ~.
+        assert_eq!(roots.into_iter().collect::<Vec<_>>(), vec![home.join(".env"), home.join("app")]);
         std::fs::remove_dir_all(home).ok();
     }
 }

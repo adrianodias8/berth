@@ -41,7 +41,14 @@ struct MachinesView: View {
     @State private var machines: [LinuxMachine] = []
     @State private var selection: String? = "berth-vm"
     @State private var showCreate = false
-    @State private var busy: String?
+    /// Machines with an action under way, and ones being created (minutes).
+    @State private var busy: Set<String> = []
+    @State private var creating: [String] = []
+    @State private var confirmDelete: String?
+    @State private var renaming: String?
+    @State private var newName = ""
+    /// `berth machine info|logs` output, shown in a sheet.
+    @State private var report: MachineReport?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -58,24 +65,38 @@ struct MachinesView: View {
                                 Text(m.os).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                             }
                             Spacer()
-                            if busy == m.name { ProgressView().controlSize(.small) }
+                            if busy.contains(m.name) { ProgressView().controlSize(.small) }
                         }
                         .tag(m.name)
                         .contextMenu {
                             if m.isRunning {
                                 Button("Stop") { act("stop", m.name) }
+                                Button("Restart") { act("restart", m.name) }
                                 Button("Open \(m.name).berth.local") {
                                     NSWorkspace.shared.open(URL(string: "http://\(m.name).berth.local")!)
                                 }
                             } else {
                                 Button("Start") { act("start", m.name) }
                             }
+                            Button("Open in Finder") {
+                                NSWorkspace.shared.open(URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Berth/machines/\(m.name)"))
+                            }
                             Button("Copy Domain") { copy("\(m.name).berth.local") }
                             Divider()
-                            Button("Delete", role: .destructive) { act("delete", m.name) }
+                            Button("Info…") { showReport(m.name, ["info", m.name], title: "\(m.name)") }
+                            Button("Logs…") { showReport(m.name, ["logs", m.name, "-n", "300"], title: "\(m.name) logs") }
+                            Button("Rename…") { newName = m.name; renaming = m.name }
+                            Divider()
+                            Button("Delete…", role: .destructive) { confirmDelete = m.name }
                         }
                     }
-                    if machines.isEmpty {
+                    ForEach(creating, id: \.self) { name in
+                        HStack {
+                            ProgressView().controlSize(.small)
+                            Text("Creating \(name)…").foregroundStyle(.secondary)
+                        }
+                    }
+                    if machines.isEmpty && creating.isEmpty {
                         Text("No machines yet").foregroundStyle(.secondary)
                     }
                 }
@@ -115,6 +136,36 @@ struct MachinesView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .sheet(isPresented: $showCreate) { CreateMachineSheet { create($0) } }
+        .sheet(item: $report) { r in
+            VStack(alignment: .leading, spacing: 10) {
+                Text(r.title).font(.headline)
+                ScrollView {
+                    Text(r.text).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                HStack { Spacer(); Button("Close") { report = nil }.keyboardShortcut(.defaultAction) }
+            }
+            .padding()
+            .frame(width: 620, height: 420)
+        }
+        .confirmationDialog("Delete \(confirmDelete ?? "")?", isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } })) {
+            Button("Delete Machine", role: .destructive) {
+                if let name = confirmDelete { act("delete", name) }
+                confirmDelete = nil
+            }
+        } message: {
+            Text("Its files and everything installed in it are deleted. This can't be undone.")
+        }
+        .alert("Rename \(renaming ?? "")", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
+            TextField("New name", text: $newName)
+            Button("Rename") {
+                if let old = renaming { act("rename", old, [old, newName]) }
+                renaming = nil
+            }
+            Button("Cancel", role: .cancel) { renaming = nil }
+        } message: {
+            Text("1–12 characters: a–z, 0–9 and -. A running machine restarts.")
+        }
         .task {
             while !Task.isCancelled {
                 await refresh()
@@ -128,20 +179,28 @@ struct MachinesView: View {
         if let list = try? await Machines.list() { machines = list }
     }
 
-    private func act(_ action: String, _ name: String) {
-        busy = name
+    private func act(_ action: String, _ name: String, _ args: [String]? = nil) {
+        busy.insert(name)
         Task {
-            do { _ = try await Machines.call(action, [name]) } catch { engine.lastError = "\(action) \(name): \(error.localizedDescription)" }
-            if action == "delete", selection == name { selection = "berth-vm" }
-            busy = nil
+            do { _ = try await Machines.call(action, args ?? [name]) } catch { engine.lastError = "\(action) \(name): \(error.localizedDescription)" }
+            if action == "delete" || action == "rename", selection == name { selection = action == "rename" ? args?.last : "berth-vm" }
+            busy.remove(name)
             try? await Task.sleep(for: .seconds(2))
             await refresh()
         }
     }
 
+    /// The CLI's own rendering, so the app shows what `berth machine` prints.
+    private func showReport(_ name: String, _ args: [String], title: String) {
+        Task {
+            let result = await Task.detached { Engine.run([BerthPaths.cli, "machine"] + args) }.value
+            report = MachineReport(title: title, text: result.output.isEmpty ? "(nothing)" : result.output)
+        }
+    }
+
     private func create(_ new: NewMachine) {
         let name = new.name
-        busy = name
+        creating.append(name)
         Task {
             let user = NSUserName()
             do {
@@ -157,9 +216,15 @@ struct MachinesView: View {
             } catch {
                 engine.lastError = "Create \(name): \(error.localizedDescription)"
             }
-            busy = nil
+            creating.removeAll { $0 == name }
         }
     }
+}
+
+struct MachineReport: Identifiable {
+    let id = UUID()
+    let title: String
+    let text: String
 }
 
 struct NewMachine {
@@ -183,6 +248,14 @@ struct CreateMachineSheet: View {
     @State private var arch = "arm64"
     @State private var cloudInit: URL?
     @State private var cloudInitError: String?
+    /// Read when chosen: a file that later becomes unreadable mustn't turn
+    /// into "no cloud-init" silently.
+    @State private var userData = ""
+    @State private var pickingMounts = false
+    @State private var pickingCloudInit = false
+
+    /// Network isolation implies isolation.
+    private var isIsolated: Bool { isolated || isolateNetwork }
 
     private let distros = [
         ("Ubuntu 24.04", "ubuntu:noble"), ("Debian 13", "debian:trixie"), ("Fedora 44", "fedora:44"),
@@ -190,39 +263,33 @@ struct CreateMachineSheet: View {
         ("AlmaLinux 10", "almalinux:10"), ("openSUSE Tumbleweed", "opensuse:tumbleweed"),
     ]
 
-    /// The chosen user data, read when creating.
-    private var userData: String? { cloudInit.flatMap { try? String(contentsOf: $0, encoding: .utf8) } }
-
-    private func addMount() {
-        let panel = NSOpenPanel()
-        panel.message = "A folder to share with the machine (in your home, /Volumes or /tmp)"
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = true
-        guard panel.runModal() == .OK else { return }
-        mounts += panel.urls.map { $0.resolvingSymlinksInPath() }
+    /// The path the VM sees: realpath keeps /private (/tmp is the VM's own
+    /// there), where URL.resolvingSymlinksInPath drops it.
+    private func vmPath(_ url: URL) -> URL {
+        guard let real = realpath(url.path, nil) else { return url }
+        defer { free(real) }
+        return URL(fileURLWithPath: String(cString: real))
     }
 
-    private func chooseCloudInit() {
-        let panel = NSOpenPanel()
-        panel.message = "cloud-init user data (#cloud-config)"
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+    private func cloudInitChosen(_ url: URL) {
         cloudInit = url
         let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        userData = text
         cloudInitError = text.hasPrefix("#cloud-config") || text.hasPrefix("#!") ? nil : "Starts with #cloud-config (or #! for a script)."
     }
 
     private var validName: Bool {
-        (1...12).contains(name.count) && name.allSatisfy { $0.isLowercase || $0.isNumber || $0 == "-" } && !name.hasPrefix("-")
+        (1...12).contains(name.count) && name.allSatisfy { $0.isASCII && ($0.isLowercase || $0.isNumber || $0 == "-") } && !name.hasPrefix("-")
     }
 
     var body: some View {
         Form {
             TextField("Name", text: $name, prompt: Text("e.g. dev"))
             Picker("Distribution", selection: $distro) {
-                ForEach(distros, id: \.1) { Text($0.0).tag($0.1) }
+                // Isolated machines need systemd (berth reaches into them only through it).
+                ForEach(distros.filter { !isIsolated || $0.1 != "alpine" }, id: \.1) { Text($0.0).tag($0.1) }
             }
+            .onChange(of: isIsolated) { _, on in if on && distro == "alpine" { distro = "debian:trixie" } }
             Picker("Architecture", selection: $arch) {
                 Text("Apple silicon (arm64)").tag("arm64")
                 Text("Intel (amd64, with Rosetta)").tag("amd64")
@@ -230,36 +297,45 @@ struct CreateMachineSheet: View {
             LabeledContent("cloud-init") {
                 HStack {
                     Text(cloudInit?.lastPathComponent ?? "None").foregroundStyle(.secondary)
-                    if cloudInit != nil { Button("Clear") { cloudInit = nil; cloudInitError = nil } }
-                    Button("Choose…") { chooseCloudInit() }
+                    if cloudInit != nil { Button("Clear") { cloudInit = nil; cloudInitError = nil; userData = "" } }
+                    Button("Choose…") { pickingCloudInit = true }
+                }
+                // One importer per view: SwiftUI keeps only the last of several.
+                .fileImporter(isPresented: $pickingCloudInit, allowedContentTypes: [.item]) { result in
+                    if case let .success(url) = result { cloudInitChosen(url) }
                 }
             }
             if let cloudInitError { Text(cloudInitError).font(.caption).foregroundStyle(.red) }
-            Toggle("Isolated from the Mac", isOn: $isolated)
-                .help("No home folder, mac command or SSH agent; only the folders below.")
-            if isolated || isolateNetwork {
+            Toggle("Isolated from the Mac", isOn: Binding(get: { isIsolated }, set: { isolated = $0; if !$0 { isolateNetwork = false } }))
+                .help("No home folder, mac command or SSH agent; only the folders below. Needs a systemd distribution (not Alpine).")
+            if isIsolated {
                 LabeledContent("Shared folders") {
                     HStack {
                         Text(mounts.isEmpty ? "None" : mounts.map(\.lastPathComponent).joined(separator: ", ")).foregroundStyle(.secondary)
                         if !mounts.isEmpty { Button("Clear") { mounts = [] } }
-                        Button("Add…") { addMount() }
+                        Button("Add…") { pickingMounts = true }
                     }
                 }
             }
             Toggle("Isolate its network too", isOn: $isolateNetwork)
                 .help("DNS and the internet only: not the Mac, the LAN or other private networks.")
-            Text("Your user, sudo, and your Mac home folder are set up inside. Reachable at \(name.isEmpty ? "<name>" : name).berth.local; `ssh \(name.isEmpty ? "<name>" : name).berth` too.")
+            Text(isIsolated
+                ? "Your user and sudo are set up inside; only the folders above are shared. Reachable at \(name.isEmpty ? "<name>" : name).berth.local; `ssh \(name.isEmpty ? "<name>" : name).berth` too."
+                : "Your user, sudo, and your Mac home folder are set up inside. Reachable at \(name.isEmpty ? "<name>" : name).berth.local; `ssh \(name.isEmpty ? "<name>" : name).berth` too.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
+        .fileImporter(isPresented: $pickingMounts, allowedContentTypes: [.folder], allowsMultipleSelection: true) { result in
+            if case let .success(urls) = result { mounts += urls.map(vmPath) }
+        }
         .frame(width: 420)
         .safeAreaInset(edge: .bottom) {
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Create") {
-                    create(NewMachine(name: name, distro: distro, arch: arch, userData: userData ?? "",
-                                      isolated: isolated, isolateNetwork: isolateNetwork, mounts: mounts))
+                    create(NewMachine(name: name, distro: distro, arch: arch, userData: cloudInit == nil ? "" : userData,
+                                      isolated: isIsolated, isolateNetwork: isolateNetwork, mounts: isIsolated ? mounts : []))
                     dismiss()
                 }
                     .keyboardShortcut(.defaultAction).disabled(!validName || cloudInitError != nil)

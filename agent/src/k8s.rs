@@ -103,10 +103,14 @@ fn read_services() -> Vec<Service> {
 /// Services change without Docker events: ask for a domain sync when the
 /// list does.
 pub fn watch_services() {
+    // Every 5 s for a minute after a change, then every 15 s: each poll
+    // starts kubectl, a large Go binary.
+    let mut quiet = 0u32;
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(5));
+        std::thread::sleep(std::time::Duration::from_secs(if quiet < 12 { 5 } else { 15 }));
         let now = read_services();
         let changed = *SERVICES.lock().unwrap() != now;
+        quiet = if changed { 0 } else { quiet.saturating_add(1) };
         if changed {
             let ports_before = load_balancer_ports();
             *SERVICES.lock().unwrap() = now;

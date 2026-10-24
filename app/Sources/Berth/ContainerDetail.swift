@@ -37,7 +37,7 @@ struct ContainerDetail: View {
             Group {
                 switch tab {
                 case .info: ContainerInfo(container: container)
-                case .logs: LogsView(containerID: container.id)
+                case .logs: LogsView(containerID: container.id, running: container.isRunning)
                 case .terminal:
                     if container.isRunning {
                         VStack(alignment: .leading, spacing: 8) {
@@ -131,6 +131,7 @@ struct ContainerInfo: View {
 
 struct LogsView: View {
     let containerID: String
+    var running = true
     @State private var text = ""
     @State private var follow = true
     @State private var error: String?
@@ -160,18 +161,47 @@ struct LogsView: View {
             }
             .padding(8)
         }
-        .task(id: containerID) {
+        // Again when the container starts again (its log stream ended).
+        .task(id: "\(containerID)-\(running)") {
             text = ""
-            do {
-                for try await chunk in Docker.logs(containerID) {
-                    text += chunk
-                    if text.count > limit { text = String(text.suffix(limit / 2)) }
+            // Chunks are gathered and shown every 100 ms: a chatty container
+            // would otherwise re-render the whole text per line.
+            let buffer = LogBuffer()
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { @MainActor in
+                    do {
+                        for try await chunk in Docker.logs(containerID) { buffer.pending += chunk }
+                    } catch {
+                        self.error = error.localizedDescription
+                    }
+                    buffer.done = true
                 }
-            } catch {
-                self.error = error.localizedDescription
+                group.addTask { @MainActor in
+                    while !Task.isCancelled {
+                        flush(buffer)
+                        if buffer.done { break }
+                        try? await Task.sleep(for: .milliseconds(100))
+                    }
+                }
             }
         }
     }
+
+    /// Append, keeping the last `limit` bytes (utf8.count is constant-time;
+    /// count, in characters, walks the whole string).
+    private func flush(_ buffer: LogBuffer) {
+        guard !buffer.pending.isEmpty else { return }
+        text += buffer.pending
+        buffer.pending = ""
+        if text.utf8.count > limit { text = String(text.suffix(limit / 2)) }
+    }
+}
+
+/// Log text not shown yet (LogsView).
+@MainActor
+final class LogBuffer {
+    var pending = ""
+    var done = false
 }
 
 // MARK: Stats

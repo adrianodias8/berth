@@ -8,6 +8,22 @@ struct SettingsView: View {
     @State private var saved = BerthConfig.load()
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var showImport = false
+    /// "auto", "none" or "url"; the URL itself lives in `proxyURL` while
+    /// it's being typed.
+    @State private var proxyMode = { () -> String in
+        let p = BerthConfig.load().proxy ?? "auto"
+        return ["auto", "none"].contains(p) ? p : "url"
+    }()
+    @State private var proxyURL = { () -> String in
+        let p = BerthConfig.load().proxy ?? ""
+        return p.hasPrefix("http") ? p : ""
+    }()
+
+    /// http(s)://host[:port], as `berth config set proxy` accepts.
+    private var proxyURLValid: Bool {
+        guard let url = URL(string: proxyURL), let scheme = url.scheme, ["http", "https"].contains(scheme) else { return false }
+        return url.host?.isEmpty == false
+    }
     @AppStorage("autoStart") private var autoStart = true
     @State private var helperMessage: String?
     @State private var httpsTrusted = TLSTrust.cached
@@ -42,32 +58,39 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 VStack(alignment: .leading) {
-                    Picker("Proxy for Docker", selection: Binding(
-                        get: { ["auto", "none"].contains(config.proxy ?? "auto") ? (config.proxy ?? "auto") : "url" },
-                        set: { config.proxy = $0 == "auto" ? nil : ($0 == "url" ? (config.proxy?.hasPrefix("http") == true ? config.proxy : "http://") : $0) }
-                    )) {
+                    Picker("Proxy for Docker", selection: $proxyMode) {
                         Text("The Mac's settings").tag("auto")
                         Text("None").tag("none")
                         Text("URL").tag("url")
                     }
-                    if let proxy = config.proxy, proxy.hasPrefix("http") {
-                        TextField("http://host:port", text: Binding(get: { proxy }, set: { config.proxy = $0 }))
+                    .onChange(of: proxyMode) { _, _ in syncProxy() }
+                    if proxyMode == "url" {
+                        TextField("http://host:port", text: $proxyURL)
                             .textFieldStyle(.roundedBorder)
+                            .onChange(of: proxyURL) { _, _ in syncProxy() }
+                        if !proxyURL.isEmpty && !proxyURLValid {
+                            Text("An http:// or https:// URL with a host.").font(.caption).foregroundStyle(.red)
+                        }
                     }
                     Text("Used by Docker for pulls and pushes; applies when Berth next starts.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 VStack(alignment: .leading) {
+                    Toggle("Published ports only on this Mac", isOn: Binding(get: { config.ports == "localhost" }, set: { config.ports = $0 ? "localhost" : nil }))
+                    Text("`-p 8080:80` listens on 127.0.0.1, not on your network.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading) {
                     Toggle("Volumes and machines in Finder", isOn: Binding(get: { config.finder ?? true }, set: { config.finder = $0 ? nil : false }))
-                    Text("Mounted at ~/Berth while Berth runs (needs the IP route helper).")
+                    Text("Volumes, machines and running containers' files, at ~/Berth while Berth runs.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if config != saved {
                     HStack {
                         Text("Restart Berth to apply.").foregroundStyle(.secondary)
                         Spacer()
-                        Button("Save") { save(restart: false) }
-                        Button("Save & Restart") { save(restart: true) }.disabled(!engine.isRunning)
+                        Button("Save") { save(restart: false) }.disabled(proxyMode == "url" && !proxyURLValid)
+                        Button("Save & Restart") { save(restart: true) }.disabled(!engine.isRunning || (proxyMode == "url" && !proxyURLValid))
                     }
                 }
             }
@@ -208,6 +231,14 @@ struct SettingsView: View {
         Binding(get: { Double(memoryGiB) }, set: { config.memoryMib = Int($0) * 1024 })
     }
 
+    private func syncProxy() {
+        switch proxyMode {
+        case "auto": config.proxy = nil
+        case "none": config.proxy = "none"
+        default: config.proxy = proxyURL
+        }
+    }
+
     /// The suspend toggle applies at once and alone: other edits stay pending.
     private func setStop(_ value: String?) {
         var updated = saved
@@ -233,11 +264,13 @@ struct SettingsView: View {
 
     private func installHelper() {
         helperMessage = "Waiting for authorization…"
-        switch Setup.installPrivileged(force: true) {
-        case .done: helperMessage = "Installed."
-        case .skipped: helperMessage = nil
-        case let .failed(message): helperMessage = message
-        default: break
+        Task {
+            switch await Setup.installPrivileged(force: true) {
+            case .done: helperMessage = "Installed."
+            case .skipped: helperMessage = nil
+            case let .failed(message): helperMessage = message
+            default: break
+            }
         }
     }
 }

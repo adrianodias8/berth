@@ -94,11 +94,14 @@ pub fn configure_docker() -> io::Result<()> {
 
 pub fn run() {
     crate::tunnel::mount();
-    let listener = match TcpListener::bind(("0.0.0.0", REDIRECT_PORT)) {
-        Ok(l) => l,
-        Err(err) => {
-            eprintln!("berth-agent: hostnet: listen {REDIRECT_PORT}: {err}");
-            return;
+    // Retried: host.docker.internal is dead without it.
+    let listener = loop {
+        match TcpListener::bind(("0.0.0.0", REDIRECT_PORT)) {
+            Ok(l) => break l,
+            Err(err) => {
+                eprintln!("berth-agent: hostnet: listen {REDIRECT_PORT}: {err} (retrying)");
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
         }
     };
     for conn in listener.incoming() {

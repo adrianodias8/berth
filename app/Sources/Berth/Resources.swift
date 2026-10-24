@@ -187,6 +187,7 @@ struct ImagesView: View {
     }
 
     private func delete(_ ids: Set<DockerImage.ID>) {
+        guard !ids.isEmpty, confirmDelete(ids.count == 1 ? "this image" : "\(ids.count) images", detail: "Containers using them must be removed first.") else { return }
         engine.perform("Delete image") { for id in ids { try await Docker.removeImage(id) } }
         selection.removeAll()
     }
@@ -200,6 +201,9 @@ struct PullSheet: View {
     @State private var pulling = false
     @State private var done = false
     @State private var error: String?
+    /// The pull, cancelled with the sheet (its stream's connection closes,
+    /// which stops Docker's pull).
+    @State private var task: Task<Void, Never>?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -219,7 +223,11 @@ struct PullSheet: View {
             if let error { Text(error).font(.caption).foregroundStyle(.red) }
             HStack {
                 Spacer()
-                Button(done ? "Close" : "Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button(done ? "Close" : "Cancel") {
+                    task?.cancel()
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
                 Button("Pull", action: pull).keyboardShortcut(.defaultAction)
                     .disabled(reference.trimmingCharacters(in: .whitespaces).isEmpty || pulling)
             }
@@ -232,7 +240,7 @@ struct PullSheet: View {
         let ref = reference.trimmingCharacters(in: .whitespaces)
         guard !ref.isEmpty, !pulling else { return }
         pulling = true; done = false; error = nil; progress = PullProgress()
-        Task {
+        task = Task {
             do {
                 for try await event in Docker.pull(ref) {
                     let status = event["status"] as? String ?? ""
@@ -280,6 +288,11 @@ struct VolumesView: View {
         }
         .contextMenu(forSelectionType: Volume.ID.self) { ids in
             Button("Copy Name") { copy(ids.first ?? "") }
+            if let name = ids.first, ids.count == 1 {
+                Button("Open in Finder") {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Berth/volumes/\(name)/_data"))
+                }
+            }
             Button("Delete", role: .destructive) { delete(ids) }
         }
         .toolbar {
@@ -290,6 +303,7 @@ struct VolumesView: View {
     }
 
     private func delete(_ names: Set<Volume.ID>) {
+        guard !names.isEmpty, confirmDelete(names.count == 1 ? "volume \(names.first ?? "")" : "\(names.count) volumes", detail: "Its data is deleted.") else { return }
         engine.perform("Delete volume") { for name in names { try await Docker.removeVolume(name) } }
         selection.removeAll()
     }
@@ -332,6 +346,7 @@ struct NetworksView: View {
     }
 
     private func delete(_ ids: Set<DockerNetwork.ID>) {
+        guard !ids.isEmpty, confirmDelete(ids.count == 1 ? "this network" : "\(ids.count) networks", detail: "Containers must be disconnected first.") else { return }
         engine.perform("Delete network") { for id in ids { try await Docker.removeNetwork(id) } }
         selection.removeAll()
     }

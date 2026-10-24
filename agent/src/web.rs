@@ -103,10 +103,23 @@ pub fn web_port(service: &Service) -> Option<u16> {
     {
         return Some(port);
     }
-    let port = order(listening_ports_of(pid)).into_iter().find(|&p| speaks_http(service.ip, p))?;
+    // A container with no web server: don't probe its ports on every request.
+    if MISSES.lock().unwrap().get(&service.id).is_some_and(|&(p, at)| p == pid && at.elapsed() < MISS_TTL) {
+        return None;
+    }
+    let Some(port) = order(listening_ports_of(pid)).into_iter().find(|&p| speaks_http(service.ip, p)) else {
+        MISSES.lock().unwrap().insert(service.id.clone(), (pid, std::time::Instant::now()));
+        return None;
+    };
     CACHE.lock().unwrap().get_or_insert_with(HashMap::new).insert(service.id.clone(), (pid, port));
     Some(port)
 }
+
+/// Containers found without a web port, and when (re-probed after MISS_TTL:
+/// a server may still be starting).
+static MISSES: std::sync::LazyLock<Mutex<HashMap<String, (u32, std::time::Instant)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+const MISS_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn order(mut ports: Vec<u16>) -> Vec<u16> {
     ports.sort_by_key(|p| (PREFERRED.iter().position(|q| q == p).unwrap_or(usize::MAX), *p));

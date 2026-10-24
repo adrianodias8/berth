@@ -29,6 +29,14 @@ pub struct Container {
     pub labels: BTreeMap<String, String>,
     #[serde(rename = "NetworkSettings")]
     pub network: Option<NetworkSettings>,
+    #[serde(rename = "HostConfig")]
+    pub host_config: Option<HostConfigSummary>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct HostConfigSummary {
+    #[serde(rename = "NetworkMode", default)]
+    pub network_mode: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -110,12 +118,20 @@ pub fn get_from(socket: &str, path: &str) -> io::Result<BufReader<UnixStream>> {
     }
 }
 
+/// A one-shot request (not an event stream): bounded, so a hung engine
+/// (podman.service, say) can't stall the domain sync.
+fn get_bounded(socket: &str, path: &str) -> io::Result<BufReader<UnixStream>> {
+    let reader = get_from(socket, path)?;
+    reader.get_ref().set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    Ok(reader)
+}
+
 fn list<T: serde::de::DeserializeOwned>(path: &str) -> io::Result<Vec<T>> {
     let mut all = Vec::new();
     for (i, socket) in sockets().into_iter().enumerate() {
         let read = || -> io::Result<Vec<T>> {
             let mut body = String::new();
-            get_from(socket, path)?.read_to_string(&mut body)?;
+            get_bounded(socket, path)?.read_to_string(&mut body)?;
             serde_json::from_str(&body).map_err(io::Error::other)
         };
         match read() {
@@ -143,7 +159,7 @@ pub fn inspect(id: &str) -> io::Result<serde_json::Value> {
     let mut last = io::Error::other("no engine");
     for socket in sockets() {
         let mut body = String::new();
-        match get_from(socket, &format!("/containers/{id}/json")).and_then(|mut r| r.read_to_string(&mut body)) {
+        match get_bounded(socket, &format!("/containers/{id}/json")).and_then(|mut r| r.read_to_string(&mut body)) {
             Ok(_) => return serde_json::from_str(&body).map_err(io::Error::other),
             Err(err) => last = err,
         }

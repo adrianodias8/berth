@@ -149,7 +149,9 @@ struct HelperUpdateBanner: View {
                 Text(message ?? "Berth's networking helper needs an update.")
                 Spacer()
                 Button("Update") {
-                    if case let .failed(error) = Setup.installPrivileged(force: true) { message = error }
+                    Task {
+                        if case let .failed(error) = await Setup.installPrivileged(force: true) { message = error }
+                    }
                 }
             }
             .padding(10)
@@ -338,9 +340,29 @@ struct ContainerMenu: View {
         Button("Copy Domain") { copy(container.domain) }
         if let ip = container.ipAddresses.first { Button("Copy IP (\(ip))") { copy(ip) } }
         Button("Copy ID") { copy(container.id) }
+        if container.isRunning {
+            Button("Open Files in Finder") {
+                NSWorkspace.shared.open(URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Berth/containers/\(container.name)"))
+            }
+        }
         Divider()
-        Button("Delete", role: .destructive) { engine.perform("Delete") { try await Docker.remove(container.id) } }
+        Button("Delete…", role: .destructive) {
+            guard confirmDelete("container \(container.name)", detail: "It's removed with its writable layer; volumes stay.") else { return }
+            engine.perform("Delete") { try await Docker.remove(container.id) }
+        }
     }
+}
+
+/// Ask before deleting (a short modal: fine on the main thread).
+@MainActor
+func confirmDelete(_ what: String, detail: String) -> Bool {
+    let alert = NSAlert()
+    alert.messageText = "Delete \(what)?"
+    alert.informativeText = detail + " This can't be undone."
+    alert.alertStyle = .warning
+    alert.addButton(withTitle: "Delete").hasDestructiveAction = true
+    alert.addButton(withTitle: "Cancel")
+    return alert.runModal() == .alertFirstButtonReturn
 }
 
 func copy(_ text: String) {

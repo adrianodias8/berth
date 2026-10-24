@@ -297,9 +297,11 @@ enum Docker {
         }
     }
 
-    /// Any engine event; used to refresh lists.
+    /// Events that change the lists (not healthchecks, execs or attaches,
+    /// which a busy stack sends constantly).
     static func events() -> AsyncThrowingStream<Data, Error> {
-        UnixHTTP.stream(socket, "GET", "/events")
+        let filters = #"{"event":["create","start","die","destroy","pause","unpause","rename","update","pull","delete","tag","untag","import","load","connect","disconnect","prune"]}"#
+        return UnixHTTP.stream(socket, "GET", "/events?filters=" + (filters.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""))
     }
 
     static func decode<T: Decodable>(_ response: HTTPResponse) throws -> T {

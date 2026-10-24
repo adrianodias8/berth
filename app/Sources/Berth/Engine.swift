@@ -93,6 +93,8 @@ struct BerthConfig: Codable, Equatable {
     var finder: Bool?
     /// "auto" (the Mac's proxy settings; the default), "none" or a URL (src/proxy.rs).
     var proxy: String?
+    /// "localhost": published ports only on the Mac's loopback (src/ports.rs).
+    var ports: String?
 
     enum CodingKeys: String, CodingKey, CaseIterable {
         case cpus
@@ -102,6 +104,7 @@ struct BerthConfig: Codable, Equatable {
         case stop
         case finder
         case proxy
+        case ports
     }
 
     static func load() -> BerthConfig {
@@ -197,6 +200,8 @@ final class Engine: ObservableObject {
 
     /// `berth start` hasn't exited yet: until then no status just means booting.
     private var startInFlight = false
+    private var stopInFlight = false
+    private var stopFailed = false
 
     func start() {
         guard state != .starting, state != .running else { return }
@@ -220,28 +225,35 @@ final class Engine: ObservableObject {
     func stop(shutdown: Bool = false) {
         guard state == .running || state == .starting else { return }
         state = .stopping
+        stopInFlight = true
         Task.detached {
             let result = Self.run([BerthPaths.cli, "stop"] + (shutdown ? ["--shutdown"] : []))
+            await MainActor.run { self.stopInFlight = false }
             guard result.code != 0 else { return }
             await MainActor.run {
                 // Still up: leave "Stopping…" so the buttons work again.
                 self.lastError = result.output
+                self.stopFailed = true
                 self.state = self.status?.docker == true ? .running : .failed(result.output.trimmingCharacters(in: .whitespacesAndNewlines))
             }
         }
     }
 
+    /// `berth restart`: it shuts down (so settings apply) and starts, and
+    /// knows when each is done.
     func restart() {
         guard state == .running || state == .starting else { return }
-        Task {
-            stop(shutdown: true)
-            // Start again only once it's really down (a stop can fail).
-            for _ in 0..<120 {
-                if status == nil {
-                    start()
-                    return
+        state = .starting
+        lastError = nil
+        startInFlight = true
+        Task.detached {
+            let result = Self.run([BerthPaths.cli, "restart"])
+            await MainActor.run {
+                self.startInFlight = false
+                if result.code != 0 {
+                    self.state = .failed(result.output.trimmingCharacters(in: .whitespacesAndNewlines))
+                    self.lastError = result.output
                 }
-                try? await Task.sleep(for: .milliseconds(500))
             }
         }
     }
@@ -273,9 +285,11 @@ final class Engine: ObservableObject {
         case (nil, .starting) where !startInFlight:
             // `berth start` returned but the daemon is gone.
             state = .stopped
-        case (nil, .failed):
-            // A stop that timed out (a long suspend) finished after all.
+        case (nil, .failed) where stopFailed:
+            // A stop that timed out (a long suspend) finished after all; a
+            // failed start stays failed, so its message stays up.
             state = .stopped
+            stopFailed = false
         case (let s?, _) where s.docker:
             if state != .running && state != .stopping {
                 state = .running

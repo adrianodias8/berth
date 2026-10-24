@@ -151,7 +151,7 @@ pub async fn run() {
     // (the socket only answers while Podman is enabled).
     tokio::spawn(async {
         loop {
-            if let Ok(events) = docker_get_from(PODMAN_TARGET, "/events").await {
+            if let Ok(events) = docker_get_from(PODMAN_TARGET, EVENTS_PATH).await {
                 let mut lines = events.lines();
                 while let Ok(Some(_)) = lines.next_line().await {
                     let _ = sync().await;
@@ -361,14 +361,24 @@ fn bind_udp(addr: &str, port: u16) -> std::io::Result<std::net::UdpSocket> {
 }
 
 /// Map Docker's host IP for a binding to where we listen on the Mac.
-/// `[::]` is dual-stack on macOS, so it covers IPv4 and IPv6 clients.
+/// `[::]` is dual-stack on macOS, so it covers IPv4 and IPv6 clients. With
+/// `"ports": "localhost"` all-interface publishes stay on the Mac's loopback
+/// (off the LAN; `-p 127.0.0.1:...` is always that).
 fn bind_address(ip: &str) -> Option<&'static str> {
     match ip {
+        "" | "0.0.0.0" | "::" if localhost_only() => Some("127.0.0.1"),
         "" | "0.0.0.0" | "::" => Some("::"),
         "127.0.0.1" | "::1" => Some("127.0.0.1"),
         // Bound to a specific guest address; nothing sensible on the host.
         _ => None,
     }
+}
+
+fn localhost_only() -> bool {
+    std::fs::read(crate::paths::Paths::new().config())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|v| v["ports"] == "localhost")
 }
 
 /// UDP relay: one upstream socket per client address, connected to the

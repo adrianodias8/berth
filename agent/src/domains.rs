@@ -129,7 +129,8 @@ pub fn run(table: Shared) {
     // Podman's events don't reach the Docker stream we follow below.
     thread::spawn(|| loop {
         if crate::engines::podman_enabled()
-            && let Ok(mut events) = docker::get_from(crate::engines::PODMAN_SOCKET, "/events")
+            && let Ok(mut events) =
+                docker::get_from(crate::engines::PODMAN_SOCKET, &format!("/events?filters={}", percent_encode(EVENT_FILTERS)))
         {
             let mut line = String::new();
             while events.read_line(&mut line).is_ok_and(|n| n > 0) {
@@ -159,11 +160,12 @@ pub fn run(table: Shared) {
     }
 }
 
+/// Only events that change addresses: healthchecks and execs produce a
+/// stream of others (exec_start, health_status, ...).
+const EVENT_FILTERS: &str = r#"{"type":["container","network"],"event":["start","die","destroy","rename","connect","disconnect"]}"#;
+
 fn watch(table: &Shared, synced: &mut bool) -> io::Result<()> {
-    // Only events that change addresses: healthchecks and execs produce a
-    // stream of others (exec_start, health_status, ...).
-    let filters = r#"{"type":["container","network"],"event":["start","die","destroy","rename","connect","disconnect"]}"#;
-    let mut events = docker::get(&format!("/events?filters={}", percent_encode(filters)))?;
+    let mut events = docker::get(&format!("/events?filters={}", percent_encode(EVENT_FILTERS)))?;
     sync(table)?;
     *synced = true;
     let mut line = String::new();
@@ -278,6 +280,10 @@ fn sync_now(table: &Shared) -> io::Result<()> {
     let up = uplink()?;
     let pool = pool(&up);
     let containers = docker::containers()?;
+    crate::listeners::HOST_NETWORK.store(
+        containers.iter().any(|c| c.host_config.as_ref().is_some_and(|h| h.network_mode == "host")),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let mut subnets: Vec<String> =
         docker::networks()?.iter().flat_map(|n| n.ipv4_subnets().map(str::to_string)).collect();
     subnets.extend(crate::engines::nerdctl_subnets());

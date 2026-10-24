@@ -96,7 +96,7 @@ struct OnboardingView: View {
             let result: Step.State
             switch step.kind {
             case .engine: result = await startEngine()
-            case .privileged: result = Setup.installPrivileged(force: engine.status?.helperOutdated ?? false)
+            case .privileged: result = await Setup.installPrivileged(force: engine.status?.helperOutdated ?? false)
             case .https: result = await Setup.trustCertificate()
             }
             set(step.kind, result)
@@ -148,7 +148,10 @@ enum Setup {
     }
 
     @MainActor
-    static func installPrivileged(force: Bool = false) -> OnboardingView.Step.State {
+    /// Off the main thread: the password prompt can sit there a while, and
+    /// the app must not freeze behind it (osascript, not NSAppleScript, which
+    /// belongs on the main thread).
+    static func installPrivileged(force: Bool = false) async -> OnboardingView.Step.State {
         if !force && privilegedDone { return .done }
         let cli = shellQuote(BerthPaths.cli)
         var command = "SUDO_UID=\(getuid()) \(cli) helper install"
@@ -160,11 +163,10 @@ enum Setup {
         let escaped = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let script = "do shell script \"\(escaped)\" "
             + "with administrator privileges with prompt \"Berth needs to set up networking for containers.\""
-        var error: NSDictionary?
-        NSAppleScript(source: script)?.executeAndReturnError(&error)
-        if let error {
-            let code = error[NSAppleScript.errorNumber] as? Int
-            return code == -128 ? .skipped : .failed((error[NSAppleScript.errorMessage] as? String) ?? "Install failed")
+        let result = await Task.detached { Engine.run(["/usr/bin/osascript", "-e", script]) }.value
+        if result.code != 0 {
+            // -128: the user cancelled the prompt.
+            return result.output.contains("-128") ? .skipped : .failed(result.output.trimmingCharacters(in: .whitespacesAndNewlines))
         }
         return .done
     }

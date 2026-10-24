@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use crate::paths::Paths;
 
 /// Name, what it takes, and its default (as `berth config list` shows it).
-const KEYS: [(&str, &str, &str); 7] = [
+const KEYS: [(&str, &str, &str); 8] = [
     ("cpus", "a number of CPUs", "every core"),
     ("memory_mib", "MiB, at least 1024", "half the Mac's memory, 2-16 GiB"),
     ("file_sharing", "berth or apple", "berth (macOS 27)"),
@@ -15,6 +15,7 @@ const KEYS: [(&str, &str, &str); 7] = [
     ("stop", "shutdown or suspend", "shutdown"),
     ("finder", "true or false", "true"),
     ("proxy", "auto, none or a URL (http://host:port)", "auto"),
+    ("ports", "all or localhost (published ports only on the Mac's loopback)", "all"),
 ];
 
 fn parse(key: &str, value: &str) -> Result<Value> {
@@ -34,6 +35,7 @@ fn parse(key: &str, value: &str) -> Result<Value> {
         },
         "file_sharing" if matches!(value, "berth" | "apple") => Value::from(value),
         "stop" if matches!(value, "shutdown" | "suspend") => Value::from(value),
+        "ports" if matches!(value, "all" | "localhost") => Value::from(value),
         "proxy" if matches!(value, "auto" | "none") || value.starts_with("http://") || value.starts_with("https://") => {
             Value::from(value)
         }
@@ -92,7 +94,7 @@ pub fn set(paths: &Paths, key: &str, value: &str) -> Result<()> {
     let mut config = load(paths)?;
     config.insert(key.to_string(), parsed);
     save(paths, &config)?;
-    println!("{key} = {value}; applies on the next start (berth stop --shutdown && berth start)");
+    println!("{key} = {value}; applies on the next start (berth restart)");
     Ok(())
 }
 
@@ -100,7 +102,7 @@ pub fn unset(paths: &Paths, key: &str) -> Result<()> {
     let mut config = load(paths)?;
     if config.remove(key).is_some() {
         save(paths, &config)?;
-        println!("{key} is back to its default; applies on the next start");
+        println!("{key} is back to its default; applies on the next start (berth restart)");
     }
     Ok(())
 }

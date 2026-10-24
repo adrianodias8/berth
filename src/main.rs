@@ -64,7 +64,10 @@ enum Cmd {
     },
     /// Stop (shutting down, so settings apply) and start again
     Restart,
-    /// Show VM and Docker status
+    /// Open ~/Berth (volumes, machines, containers) in Finder, or one
+    /// container's, volume's or machine's files
+    Open { name: Option<String> },
+    /// Show VM and Docker status (exits 1 when stopped)
     Status,
     /// Versions, settings, paths and what's installed, for bug reports
     Info,
@@ -231,10 +234,17 @@ enum MachineCmd {
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
+    /// Start a stopped machine
     Start { name: String },
+    /// Stop a machine (it shuts down cleanly)
     Stop { name: String },
-    /// Delete a machine and its files
-    Delete { name: String },
+    /// Delete a machine and its files (asks first in a terminal)
+    Delete {
+        name: String,
+        /// Don't ask
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// SSH's ProxyCommand for `<machine>.berth` (see ~/.berth/ssh/config)
     #[command(hide = true)]
     Proxy { host: String },
@@ -327,6 +337,26 @@ fn main() -> Result<()> {
             stop_with(&paths, !suspend)
         }
         Cmd::Status => status(&paths),
+        Cmd::Open { name } => {
+            let root = files::dir(&paths);
+            let target = match name {
+                None => root,
+                Some(n) => ["containers", "machines"]
+                    .iter()
+                    .map(|kind| root.join(kind).join(&n))
+                    .chain(std::iter::once(root.join("volumes").join(&n).join("_data")))
+                    .find(|p| p.exists())
+                    .with_context(|| format!("no running container, machine or volume named {n} in {}", root.display()))?,
+            };
+            if !target.exists() {
+                bail!("{} isn't mounted (is berth running? `\"finder\": false`?)", target.display());
+            }
+            let status = Command::new("open").arg(&target).status()?;
+            if !status.success() {
+                bail!("open {} failed", target.display());
+            }
+            Ok(())
+        }
         Cmd::Restart => {
             stop(&paths)?;
             start(&paths)
@@ -394,7 +424,18 @@ fn main() -> Result<()> {
                 }
                 MachineCmd::Start { name } => machines::simple(&paths, "start", &name),
                 MachineCmd::Stop { name } => machines::simple(&paths, "stop", &name),
-                MachineCmd::Delete { name } => machines::simple(&paths, "delete", &name),
+                MachineCmd::Delete { name, yes } => {
+                    if !yes && std::io::stdin().is_terminal() {
+                        print!("Delete machine {name} and everything in it? [y/N] ");
+                        std::io::stdout().flush()?;
+                        let mut answer = String::new();
+                        std::io::stdin().read_line(&mut answer)?;
+                        if !answer.trim().eq_ignore_ascii_case("y") {
+                            bail!("not deleted");
+                        }
+                    }
+                    machines::simple(&paths, "delete", &name)
+                }
                 MachineCmd::Proxy { host } => machine_proxy(&paths, &host),
             }
         }
@@ -747,7 +788,11 @@ fn info(paths: &Paths) -> Result<()> {
 
 fn status(paths: &Paths) -> Result<()> {
     match current_status(paths) {
-        None => println!("berth is not running"),
+        None => {
+            println!("berth is not running");
+            // For scripts: `berth status >/dev/null || berth start`.
+            std::process::exit(1);
+        }
         Some(s) => {
             println!("VM:      {} (pid {}, {} CPUs, {} GiB max)", s.vm, s.pid, s.cpus, s.memory >> 30);
             println!("Docker:  {}", ready(s.docker));

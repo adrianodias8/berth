@@ -351,8 +351,10 @@ pub fn run(paths: Paths) -> Result<()> {
         res.memory >> 20
     );
     let (cpus, memory) = (res.cpus, res.memory);
-    // Read by the VM before Docker starts.
-    crate::cacerts::export(&paths);
+    // Read by the VM before Docker starts (a resumed VM's Docker is running).
+    if state.is_none() {
+        crate::cacerts::export(&paths);
+    }
     vm::create_and_start(&paths, &res, state.as_deref(), move |result| match result {
         Ok(true) => {
             eprintln!("VM {}", if consumed { "resumed where it was stopped" } else { "restored from snapshot" });

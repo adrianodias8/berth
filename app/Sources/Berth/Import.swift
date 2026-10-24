@@ -8,6 +8,7 @@ struct ImportSheet: View {
     @State private var output = ""
     @State private var running = false
     @State private var previewed = false
+    @State private var process: Process?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -33,6 +34,7 @@ struct ImportSheet: View {
             HStack {
                 if running { ProgressView().controlSize(.small) }
                 Spacer()
+                if running { Button("Stop") { process?.terminate() } }
                 Button("Close") { dismiss() }.keyboardShortcut(.cancelAction).disabled(running)
                 Button("Preview") { run(dryRun: true) }.disabled(running)
                 Button("Import") { run(dryRun: false) }.keyboardShortcut(.defaultAction).disabled(running || !previewed)
@@ -42,18 +44,41 @@ struct ImportSheet: View {
         .frame(width: 560)
     }
 
+    /// The CLI, its output shown as it comes (an import can take a while).
     private func run(dryRun: Bool) {
-        var args = [BerthPaths.cli, "import", source]
+        var args = ["import", source]
         let name = project.trimmingCharacters(in: .whitespaces)
         if !name.isEmpty { args += ["--project", name] }
         if dryRun { args.append("--dry-run") }
-        running = true
         output = dryRun ? "" : output + "\n— importing —\n"
-        Task {
-            let result = await Task.detached { Engine.run(args) }.value
-            output += result.output
-            if dryRun { previewed = result.code == 0 }
-            running = false
+        // Preview again before another import.
+        previewed = false
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: BerthPaths.cli)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let text = String(decoding: handle.availableData, as: UTF8.self)
+            if !text.isEmpty { Task { @MainActor in output += text } }
+        }
+        p.terminationHandler = { done in
+            let ok = done.terminationStatus == 0
+            Task { @MainActor in
+                pipe.fileHandleForReading.readabilityHandler = nil
+                if let rest = try? pipe.fileHandleForReading.readToEnd() { output += String(decoding: rest, as: UTF8.self) }
+                previewed = dryRun && ok
+                running = false
+                process = nil
+            }
+        }
+        do {
+            try p.run()
+            process = p
+            running = true
+        } catch {
+            output += "could not run berth: \(error.localizedDescription)\n"
         }
     }
 }

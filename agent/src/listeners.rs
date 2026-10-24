@@ -21,6 +21,10 @@ use serde::Serialize;
 /// Socket tables are a few KB; reading them every two seconds costs nothing
 /// measurable, and a new server is reachable from the Mac within that time.
 const POLL: Duration = Duration::from_secs(2);
+/// With no host-network container running (the domain sync says), poll
+/// rarely: Kubernetes' hostNetwork pods run as such containers too.
+const IDLE_POLL: Duration = Duration::from_secs(10);
+pub static HOST_NETWORK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -86,7 +90,7 @@ pub fn run() {
         if changed {
             crate::engines::notify_host_sync();
         }
-        std::thread::sleep(POLL);
+        std::thread::sleep(if HOST_NETWORK.load(std::sync::atomic::Ordering::Relaxed) { POLL } else { IDLE_POLL });
     }
 }
 

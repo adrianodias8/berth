@@ -142,8 +142,14 @@ struct SnapshotsView: View {
 struct CreateSnapshotSheet: View {
     var onCreate: (String, Bool) -> Void
     @Environment(\.dismiss) private var dismiss
-    @State private var name = "snapshot-" + Date().formatted(.iso8601.year().month().day().dateSeparator(.dash)) + "-" +
-        Date().formatted(.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits))
+    // A fixed format: the locale's time ("14:30", "2:30 PM") has characters
+    // a snapshot name can't.
+    @State private var name = { () -> String in
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd-HHmm"
+        return "snapshot-" + f.string(from: Date())
+    }()
     @State private var diskOnly = false
 
     private var valid: Bool {

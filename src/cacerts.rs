@@ -15,6 +15,19 @@ use crate::paths::Paths;
 
 pub fn export(paths: &Paths) {
     let keychains = [Path::new("/Library/Keychains/System.keychain").to_path_buf(), paths.home.join("Library/Keychains/login.keychain-db")];
+    // A process per certificate adds up: skip it all when neither keychain
+    // (nor its trust settings, which macOS keeps beside them) has changed.
+    let stamp = keychains
+        .iter()
+        .chain([Path::new("/Library/Trust Settings/Admin.plist").to_path_buf(), paths.home.join("Library/Trust Settings/User.plist")].iter())
+        .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).map_or(0, |t| t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())))
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let stamp_path = paths.guest().join("ca-certificates.stamp");
+    if paths.guest().join("ca-certificates.pem").exists() && std::fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str()) {
+        return;
+    }
     let mut bundle = String::new();
     let tmp = paths.guest().join("ca-check.pem");
     for keychain in keychains {
@@ -32,9 +45,13 @@ pub fn export(paths: &Paths) {
     if std::fs::read_to_string(&path).unwrap_or_default() != bundle {
         match std::fs::write(&path, &bundle) {
             Ok(()) => eprintln!("cacerts: {} CA certificates from the Mac's keychains for the VM", bundle.matches("BEGIN CERTIFICATE").count()),
-            Err(err) => eprintln!("cacerts: {}: {err}", path.display()),
+            Err(err) => {
+                eprintln!("cacerts: {}: {err}", path.display());
+                return;
+            }
         }
     }
+    let _ = std::fs::write(stamp_path, stamp);
 }
 
 /// The PEM blocks in `text`.
