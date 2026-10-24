@@ -46,6 +46,14 @@ guest app ─ syscall ─ Linux FUSE ─ virtio-fs driver ═ virtqueue ═ Virt
     values).
   - It runs in "no-open" mode: the guest kernel skips OPEN/RELEASE, and
     per-node open files are cached, up to 4096.
+  - Likewise "no-opendir": no OPENDIR/RELEASEDIR, and the guest kernel
+    keeps directory listings in its page cache until the directory's mtime
+    changes (FOPEN_CACHE_DIR, its default without OPENDIR). Drupal's
+    extension scan during `drush site:install` went from ~650k requests to
+    ~250k.
+  - The node table is in 64 shards by node ID: parallel requests (Composer
+    unzips in parallel) don't queue on one lock, and a directory rename's
+    walk over every node holds one shard at a time.
   - It replies ESTALE when the guest refers to something removed on the Mac,
     so the kernel looks it up again.
 - **`src/fuse/nofollow.rs`**: every call refuses symlinks in any path
@@ -136,6 +144,7 @@ to mount would leave a VM that never comes up:
 | `BERTH_FS_POLL_US` | 100 | host-side polling of idle queues |
 | `BERTH_FS_THREADS` | on with the polling driver | serve concurrent requests on GCD worker threads |
 | `BERTH_FS_QUEUES` | 1 | request queues (more didn't help) |
+| `BERTH_FS_NO_OPENDIR` | on | `0` keeps OPENDIR/RELEASEDIR (and uncached listings) |
 | `BERTH_FS_WRITEBACK` | off | FUSE write-back cache (adds requests) |
 | `BERTH_FS_STATS` | off | per-request timings and per-opcode counts in `daemon.log` |
 | `BERTH_FS_TRACE` | off | log every request (opcode, node, name) |
@@ -163,8 +172,8 @@ DDEV re-measured on 2026-10-24, `bench/results/2026-10-24-compare.md`):
 | delete 20k files | 2.7 | 2.7 | **1.4** | 1.5 |
 | read all 20k files (`compare.sh`) | 2.9 | – | 2.0 | 0.8 |
 | 4 parallel extracts | 20.4 | 12.8 | 7.7 | – |
-| DDEV `composer install` | fails* | 16 | 8.9–9.2 | 6.6 |
-| DDEV `drush site:install` | fails* | 67 | 39–46 | 37 |
+| DDEV `composer install` | fails* | 16 | 8.5–9.0 | 6.6 |
+| DDEV `drush site:install` | fails* | 67 | 35–36 (47 in its slow mode) | 37 |
 
 \* `create-project` aborts on Apple's share (ownership), so the later steps
 can't run.
@@ -173,10 +182,13 @@ can't run.
 
 - Reading many small files is ~2.4x slower than OrbStack: each file still
   costs a lookup, an attribute fetch and a read round trip.
-- Composer is still ~1.4x behind OrbStack. It sends ~10-12 requests per file
-  (the guest kernel and Composer decide that), its unzip runs in parallel,
-  and APFS serializes metadata changes. Creating a file on APFS costs ~53 µs
-  on its own.
+- Composer is still ~1.3x behind OrbStack. It sends ~10 requests per file
+  (the guest kernel and Composer decide that), among them a create and a
+  timestamp set that must reach APFS, which barely scales with threads:
+  creating a file costs ~55 µs on one thread and ~41 µs on eight
+  (2026-10-24), and ~99 µs under Composer's parallel writes.
+- `drush site:install` (on OrbStack too) takes either ~35 s or ~45 s from
+  run to run; compare like with like.
 - Cache coherency relies on FSEvents: a change on the Mac reaches the guest
   in ~0.6 s. Until then the guest may use cached names, for at most the
   entry timeout.

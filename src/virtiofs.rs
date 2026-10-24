@@ -262,6 +262,9 @@ type Finished = (Job, Option<Vec<u8>>, Duration);
 #[derive(Default)]
 struct Completions {
     list: Mutex<Vec<Finished>>,
+    /// Replies in `list`: the device queue's polling loop checks this
+    /// instead of taking the lock workers need on every spin.
+    pending: AtomicUsize,
     in_flight: AtomicUsize,
     /// The device queue is in its polling loop and will pick replies up;
     /// otherwise a worker schedules a flush.
@@ -269,9 +272,19 @@ struct Completions {
 }
 
 impl Completions {
+    /// A worker's reply, for the device queue to return.
+    fn push(&self, finished: Finished) {
+        self.list.lock().unwrap().push(finished);
+        self.pending.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Return finished requests to the guest. Device queue only.
     fn flush(&self) -> bool {
+        if self.pending.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
         let done = std::mem::take(&mut *self.list.lock().unwrap());
+        self.pending.fetch_sub(done.len(), Ordering::SeqCst);
         let any = !done.is_empty();
         for (job, reply, served) in done {
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -472,7 +485,7 @@ impl FsDevice {
                     ivars.done.in_flight.fetch_add(1, Ordering::SeqCst);
                     let (done, device_queue) = (ivars.done.clone(), ivars.device_queue.clone());
                     tunnel.handle(request, move |reply| {
-                        done.list.lock().unwrap().push((job, reply, Duration::ZERO));
+                        done.push((job, reply, Duration::ZERO));
                         if !done.polling.load(Ordering::SeqCst) {
                             device_queue.exec_async(move || {
                                 done.flush();
@@ -490,7 +503,7 @@ impl FsDevice {
                     workers.exec_async(move || {
                         let t = Instant::now();
                         let reply = server.handle(&request);
-                        done.list.lock().unwrap().push((job, reply, t.elapsed()));
+                        done.push((job, reply, t.elapsed()));
                         if !done.polling.load(Ordering::SeqCst) {
                             device_queue.exec_async(move || {
                                 done.flush();

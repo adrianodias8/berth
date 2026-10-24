@@ -12,6 +12,7 @@ so every request runs PHP. Warm page = median of 20 after 10 warm-up requests.
 | berth, own virtio-fs + polling guest driver (experimental, 2026-10-24) | 11.4–14.2 s | 14.6–15.5 s | 10.3 s | 44.0–44.2 s | 2.7–2.8 s | 18–21 ms | 23.6–24.1 s |
 | berth, own virtio-fs + polling driver, default (2026-10-24, later) | 11.3–12.9 s | 13.5–14.1 s | **8.9–9.2 s** | 38.9–40.7 s | 2.6–2.7 s | 21–29 ms | 26.9–28.0 s |
 | berth, polling driver, with Mac-side delete replay (2026-10-24, 3 runs) | 9.3–14.3 s | 14.0–17.0 s | **8.5–8.8 s** | 41.4–44.8 s | 2.4–2.5 s | 16–18 ms | 25.6–26.2 s |
+| berth, no-opendir listing cache, sharded node table (2026-10-24, 3 runs) | 9.8–14.0 s | **13.4–15.3 s** | **8.5–9.0 s** | **35.2–36.1 s** (46.7 slow mode) | 2.3–2.6 s | 16–18 ms | 24.5–28.6 s |
 | berth, Apple's virtiofs | 13.2 s | fails | – | – | – | – | – |
 
 - On Apple's share the project folder appears owned by root inside the
