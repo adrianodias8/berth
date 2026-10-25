@@ -751,6 +751,7 @@ fn device(root: &std::path::Path, tag: &'static str, poll_driver: bool) -> Retai
         attr: Duration::from_secs_f64(num("BERTH_FS_ATTR_TIMEOUT", 1.0)),
         negative: Duration::from_secs_f64(num("BERTH_FS_NEGATIVE_TIMEOUT", 1.0)),
         writeback: std::env::var_os("BERTH_FS_WRITEBACK").is_some(),
+        async_read: num("BERTH_FS_ASYNC_READ", if poll_driver { 0.0 } else { 1.0 }) != 0.0,
     };
     let request_queues = (num("BERTH_FS_QUEUES", DEFAULT_REQUEST_QUEUES as f64) as u16).clamp(1, 16);
     // With the polling guest driver the transport is cheap enough that our

@@ -137,7 +137,7 @@ berth config set memory_mib 8192        # settings (also in the app); berth rest
   by berth's own
   file sharing on macOS 27 (Apple's virtiofs before): 3x faster than Apple's on
   small files and close to OrbStack (20k files extracted in 2.4 s; OrbStack
-  2.3 s, Apple's 7.5 s; reading them back is still 2.4x slower), real file
+  2.3 s, Apple's 7.5 s; read back in 0.75 s, OrbStack 0.63 s), real file
   ownership in containers, and file change
   notifications forwarded so hot reload works (`docs/file-sharing.md`)
 - Kubernetes: `berth k8s enable` gives a single-node k3s using berth's Docker, so

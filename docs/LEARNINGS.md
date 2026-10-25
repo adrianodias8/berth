@@ -276,6 +276,16 @@ something here stops being true, fix it.
 - **The VM's Debian kernel** (6.12; berth's own is 7.2) builds FUSE and
   virtio-fs in (`=y`), exports the symbols a module needs, has no preempt count
   (`PREEMPT_VOLUNTARY`), and supports multiqueue virtio-fs (6.11+).
+- **Readahead and polling:** with `FUSE_ASYNC_READ` the kernel sends
+  readahead as background requests, and a polling driver that waits only
+  on synchronous ones leaves each read to an interrupt. Check
+  `poll_skipped`: it rose by exactly one per file read. Leaving the flag
+  out made cold small-file reads 2x faster, big reads no slower.
+- **Opening files on APFS** costs ~12 µs (lstat ~1 µs), and read-write
+  ~20-25 µs: open read-only until a write needs more. Opening relative to
+  the parent directory (`openat`) or without `O_NOFOLLOW_ANY` is no faster.
+- **Inode numbers are per device**: a share spanning mounts (`/Volumes`)
+  needs the device in its node IDs.
 - **Dead ends:**
   - an NFS server over the VM network (the nfsserve prototype spun the CPU
     and was slow);
@@ -325,6 +335,7 @@ something here stops being true, fix it.
 | idle CPU | ~1.4 % (3.0 % before the idle work) | 2.2 % |
 | localhost forward | ~20 Gbit/s | ~31 Gbit/s |
 | bind-mount extract (20k files) | 7.9 s (Apple's) / 2.4–2.7 s (own share + polling) | 2.3 s |
+| bind-mount read (20k files, in the container) | 0.75 s (1.6 s with async readahead) | 0.63 s |
 | DDEV composer install | 8.2–8.9 s (own share + polling) | 6.6 s |
 | DDEV drush site:install | 31.7–36.3 s | 36.7–37.4 s |
 

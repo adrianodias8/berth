@@ -12,6 +12,10 @@ are in the commit messages.
   failed; a new VM's first boot skips building the file driver that
   berth's kernel has built in; restoring a saved state clears all boot
   markers.
+- **Small-file reads 2x faster:** readahead is no longer sent as background
+  requests with the polling driver (each waited for an interrupt), and files
+  are opened read-only until written. 20k files read in 0.75 s instead of
+  1.6 s (OrbStack 0.63 s); cold Jest start 0.48 -> 0.43 s (OrbStack 0.36 s).
 - **Guest kernel:** berth boots its own kernel, Linux 7.2.12 with what the
   VM needs built in and no initrd (`guest/kernel`): kernel boot 0.24 s
   instead of Debian's 0.59 s, the polling file driver built in (no runtime

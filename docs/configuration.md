@@ -74,7 +74,7 @@ These are for testing and debugging; set them for `berth start`.
 | `BERTH_FS_POLL_DRIVER` | `1`/`0`: force the polling guest driver on or off (normally automatic) |
 | `BERTH_FS_ENTRY_TIMEOUT`, `BERTH_FS_ATTR_TIMEOUT`, `BERTH_FS_NEGATIVE_TIMEOUT` | seconds the guest may cache names, attributes and missing names (default 1) |
 | `BERTH_FS_POLL_US` | how long the host polls idle queues, in µs (default 100) |
-| `BERTH_FS_THREADS`, `BERTH_FS_QUEUES`, `BERTH_FS_WRITEBACK`, `BERTH_FS_NO_OPENDIR` | file server tuning, see `docs/file-sharing.md` |
+| `BERTH_FS_THREADS`, `BERTH_FS_QUEUES`, `BERTH_FS_WRITEBACK`, `BERTH_FS_NO_OPENDIR`, `BERTH_FS_ASYNC_READ` | file server tuning, see `docs/file-sharing.md` |
 | `BERTH_FS_STATS`, `BERTH_FS_TRACE` | `1`: per-request timings, or every request, in `daemon.log` |
 
 ## Files

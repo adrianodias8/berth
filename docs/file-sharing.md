@@ -152,6 +152,7 @@ to mount would leave a VM that never comes up:
 | `BERTH_FS_QUEUES` | 1 | request queues (more didn't help) |
 | `BERTH_FS_NO_OPENDIR` | on | `0` keeps OPENDIR/RELEASEDIR (and uncached listings) |
 | `BERTH_FS_WRITEBACK` | off | FUSE write-back cache (adds requests) |
+| `BERTH_FS_ASYNC_READ` | off with the polling driver | `1`: readahead as background requests |
 | `BERTH_FS_STATS` | off | per-request timings and per-opcode counts in `daemon.log` |
 | `BERTH_FS_TRACE` | off | log every request (opcode, node, name) |
 
@@ -166,6 +167,7 @@ bench/fs/make-tar.sh ~/.berth-fsbench                 # 20,000 x 1 KB files
 bench/fs/run.sh berth                                 # the default share
 bench/fs/run.sh apple BERTH_FILE_SHARING=apple
 berth shell -- python3 $PWD/bench/fs/latency.py ~/.berth-fsbench/small.tar   # with 0 timeouts, see the script
+bench/fs/in-container.sh [context]                    # extract, read, delete in a container
 bench/ddev-drupal.sh <label>                          # DDEV + Drupal CMS, see bench/results
 ```
 
@@ -177,6 +179,7 @@ DDEV re-measured on 2026-10-24, `bench/results/2026-10-24-compare.md`):
 | extract 20k files | 7.5 | 7.3 | **2.4** | 2.3 |
 | delete 20k files | 2.7 | 2.7 | **1.4** | 1.5 |
 | read all 20k files (`compare.sh`) | 2.9 | – | 2.0 | 0.8 |
+| the same, in the container (`in-container.sh`, 2026-10-25) | – | – | **0.75** (1.6 before) | 0.63 |
 | 4 parallel extracts | 20.4 | 12.8 | 7.7 | – |
 | DDEV `composer install` | fails* | 16 | 8.2–8.9 | 6.6 |
 | DDEV `drush site:install` | fails* | 67 | 31.7–36.3 (berth's 7.2 kernel) | 37 |
@@ -186,8 +189,14 @@ can't run.
 
 ### Known limits
 
-- Reading many small files is ~2.4x slower than OrbStack: each file still
-  costs a lookup, an attribute fetch and a read round trip.
+- Reading many small files is ~1.2x slower than OrbStack (0.75 s vs 0.63 s
+  for 20k): each file costs a lookup and a read round trip, and opening it
+  on the Mac (~12 µs on APFS, twice that read-write, so reads open
+  read-only) is most of the read's time.
+- Readahead is sent as ordinary requests with the polling driver (no
+  `FUSE_ASYNC_READ`): as background requests the driver doesn't wait on
+  them, and each waited for an interrupt (1.6 s for the 20k files instead
+  of 0.75). Big sequential reads were no slower.
 - Composer is still ~1.3x behind OrbStack. It sends ~10 requests per file
   (the guest kernel and Composer decide that), among them a create and a
   timestamp set that must reach APFS, which barely scales with threads:

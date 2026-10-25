@@ -30,6 +30,10 @@ fix one, remove it here in the same change.
   (macOS `renamex_np(RENAME_EXCL)` could do it); MKNOD is ENOSYS, so `bind()`
   of a Unix socket in a shared folder fails. No xattrs, no locks beyond what
   the guest kernel does locally.
+- **Seen once: `rm -rf` of a just-extracted tree failed** with "Directory
+  not empty" (one of ~25 `bench/fs/in-container.sh` runs, 2026-10-25),
+  right after a restart; not reproduced since. A listing missing names
+  points at the cached directory listings.
 - **Stale eviction queue.** Entries for forgotten nodes stay queued, so
   eviction can start early; and files removed while cached are dropped from
   the queue but keep their descriptor until forgotten, outside the 4096 cap.
