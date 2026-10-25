@@ -104,7 +104,11 @@ fn install_berth_modules() -> io::Result<()> {
     let Some(tar) = marker().map(|m| m.with_file_name("kernel-modules.tar")) else { return Ok(()) };
     let release = release();
     let stamp = format!("/lib/modules/{release}/.berth-modules");
-    let size = std::fs::metadata(&tar)?.len().to_string();
+    // The host copies the tar only when it changed, so size and mtime tell
+    // (a same-size rebuild, in 512-byte tar blocks, is likely).
+    let meta = std::fs::metadata(&tar)?;
+    let modified = meta.modified()?.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let size = format!("{} {modified}", meta.len());
     if std::fs::read_to_string(&stamp).is_ok_and(|s| s == size) {
         return Ok(());
     }

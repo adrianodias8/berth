@@ -465,7 +465,7 @@ pub fn create_and_start(
     match restore {
         None => unsafe { vm.startWithCompletionHandler(&boot) },
         Some(state) => {
-            let trying = paths.guest().join("boot/trying");
+            let boot_dir = paths.guest().join("boot");
             let vm2 = vm.clone();
             let restored = RcBlock::new(move |err: *mut NSError| {
                 if let Some(err) = unsafe { err.as_ref() } {
@@ -474,8 +474,11 @@ pub fn create_and_start(
                     return;
                 }
                 // The restored guest is long past booting: nothing will clear
-                // the direct-boot marker, and it would turn direct boot off.
-                let _ = fs::remove_file(&trying);
+                // the boot markers, and left set they would turn direct boot,
+                // berth's kernel and the polling driver off.
+                for marker in ["trying", "berth-trying", "kmod-trying"] {
+                    let _ = fs::remove_file(boot_dir.join(marker));
+                }
                 let on_started = on_started.clone();
                 let resumed = RcBlock::new(move |err: *mut NSError| {
                     on_started(match unsafe { err.as_ref() } {

@@ -5,7 +5,7 @@
   * virtio-fs: Virtio Filesystem
   * Copyright (C) 2018 Red Hat, Inc.
 + *
-+ * virtiofs_poll: berth's copy of Linux 6.12's fs/fuse/virtio_fs.c for its
++ * virtiofs_poll: berth's copy of Linux 7.2's fs/fuse/virtio_fs.c for its
 + * own file sharing device. The changes, marked "berth:", are
 + *  - it binds only berth's device ID (BERTH_FS_DEVICE_ID), registers the
 + *    filesystem "virtiofs_poll" and /sys/fs/virtiofs_poll, so it lives next
@@ -295,7 +295,7 @@
 +	 * background (those may come with fc->bg_lock held, from
 +	 * flush_bg_queue()) and expecting a reply (not notify replies). That
 +	 * caller holds a reference and sleeps right after, so it may spin.
-+	 * (preemptible() can't tell: Debian's kernel has no preempt count.)
++	 * (preemptible() isn't the guard: Debian's 6.12 has no preempt count.)
 +	 */
 +	if (READ_ONCE(poll_us) && !test_bit(FR_BACKGROUND, &req->flags) &&
 +	    test_bit(FR_ISREPLY, &req->flags))

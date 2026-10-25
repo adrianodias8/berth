@@ -5,6 +5,28 @@ are in the commit messages.
 
 ## Unreleased
 
+### 2026-10-25
+- **Guest kernel:** berth boots its own kernel, Linux 7.2.12 with what the
+  VM needs built in and no initrd (`guest/kernel`): kernel boot 0.24 s
+  instead of Debian's 0.59 s, the polling file driver built in (no runtime
+  build, no download). Falls back to Debian's kernel after two failed
+  starts; `berth config set kernel debian` opts out. Chosen over 6.12 and
+  6.18 by measurement (6.18 locked up under k3s).
+- **Memory and power tuning** (from OrbStack's running kernel): zram swap,
+  swappiness 20, huge pages on request, no guest disk scheduler,
+  `workqueue.power_efficient`, no per-container kernel-memory accounting.
+- **Idle power:** the VM no longer wakes for Podman's event stream or the
+  app's Docker pings; idle CPU 2.97 % -> ~1.4 %.
+- **File sharing:** directory listings cached in the guest and a sharded
+  node table (`drush site:install` requests 650k -> 250k, now on par with
+  OrbStack); watchers see files deleted on the Mac (IN_DELETE); `berth
+  status` and the app say when the share is on the slower built-in driver.
+- **Known-issue fixes:** helper routes only on VM bridges, pinned CLI
+  checksums, `::1` published ports, connection limits in the agent, atomic
+  DNAT updates, mDNS limits; in the app, PAX archives, a stream cancel race,
+  snapshot busy state, terminals that survive tab switches.
+- **README:** quick start and screenshots.
+
 ### 2026-10-24
 - **Kubernetes:** LoadBalancer services on the Mac's localhost.
 - **Machines:** isolated machines (`--isolated`, `--mount`,

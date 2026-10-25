@@ -50,6 +50,7 @@ next to OrbStack or Docker Desktop. Only one of them should own
 | `guest/berth-debug.sh`, `guest/berth-ca-sync.sh` | the debug shell; the Mac's CAs into the VM's trust store |
 | `.github/workflows/` | release builds |
 | `guest/kmod/virtiofs_poll/` | the polling virtio-fs guest driver (GPL-2.0) |
+| `guest/kernel/` | berth's guest kernel: build scripts, config, the driver's patch for 7.2 (GPL-2.0), `check.sh` |
 | `app/` | Berth.app (SwiftUI) |
 | `scripts/` | build and signing |
 | `bench/` | benchmarks against OrbStack; results in `bench/results/` |
@@ -84,6 +85,9 @@ The README's "How it works" section explains the data paths; read it, and
 cargo test --release -p berth          # host unit tests (FUSE server, helper rules, watcher, …)
 cargo clippy --release -p berth
 cargo build --release -p berth-agent --target aarch64-unknown-linux-musl
+# the agent's tests run in the VM:
+t=$(cd agent && cargo test --release --target aarch64-unknown-linux-musl --no-run 2>&1 | grep -o '/[^ )]*berth_agent-[0-9a-f]*')
+berth shell -- sudo "$t"
 ```
 
 Unit tests don't cover the VM. For anything that touches it, also run the
@@ -96,7 +100,9 @@ real thing and say in your pull request what you ran:
 - for file sharing: the `bench/fs` scripts (see `docs/file-sharing.md`) and,
   for real workloads, `bench/ddev-drupal.sh`;
 - for the app: launch it, check the screen you changed, and the first-run
-  flow if you touched setup.
+  flow if you touched setup;
+- for the guest kernel or anything the VM's kernel must support:
+  `KCHECK_K8S=1 guest/kernel/check.sh` (19 checks plus k3s).
 
 Logs are in `~/.berth/log/` (`daemon.log`, `console.log`); the helper's is
 `/var/log/dev.berth.helper.log`.
@@ -113,21 +119,22 @@ Measure first and keep the numbers.
 
 Record what didn't work too, in `docs/LEARNINGS.md`, so nobody repeats it.
 
-## The guest kernel module
+## The guest kernel and its driver
 
-`guest/kmod/virtiofs_poll` is a copy of the guest kernel's
-`fs/fuse/virtio_fs.c` (Linux 6.12) with changes marked `berth:`. It is built
-inside the VM against the running kernel:
+berth's kernel (`guest/kernel`, see its README) is Linux 7.2 with the
+polling driver built in; Debian's 6.12 kernel stays as the fallback and
+the opt-out. The driver is in two forms, which must change together:
 
-```sh
-berth shell -- sudo $PWD/bench/fs/guest-kbuild.sh $PWD/guest/kmod/virtiofs_poll
-```
+- `guest/kmod/virtiofs_poll`: a copy of 6.12's `fs/fuse/virtio_fs.c` with
+  changes marked `berth:`, built at runtime on Debian's kernel. To try a
+  change: `berth shell -- sudo $PWD/bench/fs/guest-kbuild.sh $PWD/guest/kmod/virtiofs_poll`.
+- `guest/kernel/virtiofs_poll-7.2.patch`: the same changes on 7.2's
+  `virtio_fs.c`, applied when the kernel is built.
 
-When Debian's kernel moves to a new major version, refresh the copy from
-that version's `fs/fuse/virtio_fs.c` and `fuse_i.h`, and reapply the
-`berth:` changes. A bug here can hang or crash the guest. Test unmounting
-and reloading the module, and keep the built-in driver's devices (Apple's
-shares) untouched.
+Moving to another kernel series means porting the patch to that series'
+FUSE internals. A bug here can hang or crash the guest: run
+`KCHECK_K8S=1 guest/kernel/check.sh`, a DDEV run, and test unmounting, and
+keep the built-in driver's devices (Apple's shares) untouched.
 
 ## Releasing
 
@@ -155,5 +162,5 @@ without them it publishes an ad-hoc prerelease.
 ## License
 
 By contributing you agree your work is released under the MIT license
-(`LICENSE`), except changes to `guest/kmod/`, which are GPL-2.0 like the
-Linux code they derive from.
+(`LICENSE`), except changes to `guest/kmod/` and the kernel patches in
+`guest/kernel/`, which are GPL-2.0 like the Linux code they derive from.

@@ -74,7 +74,7 @@ These are for testing and debugging; set them for `berth start`.
 | `BERTH_FS_POLL_DRIVER` | `1`/`0`: force the polling guest driver on or off (normally automatic) |
 | `BERTH_FS_ENTRY_TIMEOUT`, `BERTH_FS_ATTR_TIMEOUT`, `BERTH_FS_NEGATIVE_TIMEOUT` | seconds the guest may cache names, attributes and missing names (default 1) |
 | `BERTH_FS_POLL_US` | how long the host polls idle queues, in µs (default 100) |
-| `BERTH_FS_THREADS`, `BERTH_FS_QUEUES`, `BERTH_FS_WRITEBACK` | file server tuning, see `docs/file-sharing.md` |
+| `BERTH_FS_THREADS`, `BERTH_FS_QUEUES`, `BERTH_FS_WRITEBACK`, `BERTH_FS_NO_OPENDIR` | file server tuning, see `docs/file-sharing.md` |
 | `BERTH_FS_STATS`, `BERTH_FS_TRACE` | `1`: per-request timings, or every request, in `daemon.log` |
 
 ## Files
@@ -84,7 +84,7 @@ These are for testing and debugging; set them for `berth start`.
 | `~/.berth/config.json` | this file |
 | `~/.berth/data/` | the VM: disk image, EFI variables, machine identity, a suspended state |
 | `~/.berth/snapshots/` | snapshots (excluded from Time Machine) |
-| `~/.berth/guest/` | the guest agent, the exported kernel, boot markers, and `ca-certificates.pem`: the CA certificates the Mac trusts beyond Apple's roots, which the VM adds to its trust store before Docker starts (containers don't get them) |
+| `~/.berth/guest/` | the guest agent, the exported Debian kernel, berth's kernel's module data (`kernel-modules.tar`), boot markers, and `ca-certificates.pem`: the CA certificates the Mac trusts beyond Apple's roots, which the VM adds to its trust store before Docker starts (containers don't get them) |
 | `~/.berth/bin/` | the bundled `docker`, Compose, Buildx and `kubectl` |
 | `~/.berth/files-password` | the password of the VM's SMB share for `~/Berth` (only you can read it) |
 | `~/.berth/cache/` | the downloaded Debian image (kept by `berth delete`; excluded from Time Machine) |

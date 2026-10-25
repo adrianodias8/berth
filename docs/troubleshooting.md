@@ -24,6 +24,12 @@ and boot messages). `berth shell` opens a shell in the VM.
   `BERTH_FILE_SHARING=apple berth start`. If that works, try
   `BERTH_FS_POLL_DRIVER=0 berth start` (berth's share without the polling
   driver), and report what you see.
+- **"boot: berth's kernel … didn't come up; using the VM's Debian kernel"**
+  in `daemon.log`. berth's own kernel failed two starts in a row, so that
+  release is set aside (`~/.berth/guest/boot/berth-failed`) and the Debian
+  kernel boots until berth ships another one. Delete that file to try it
+  again, or keep Debian's for good with `berth config set kernel debian`.
+  `console.log` has the failed boot's kernel messages: please report them.
 - **"berth is starting or running".** Another `berth` holds the VM's lock
   (`~/.berth/run/`). Wait for it, or `berth stop`.
 
@@ -90,11 +96,21 @@ and boot messages). `berth shell` opens a shell in the VM.
   the container.
 
 - **A change on the Mac shows up late in a container.** Changes are
-  forwarded from FSEvents, which takes ~0.6 s. Deleting a file on the Mac
-  raises no IN_DELETE in containers, only an attribute event on its folder.
+  forwarded from FSEvents, which takes ~0.6 s. Deleting a folder on the Mac
+  raises IN_DELETE for the folder only, not for each file in it.
 - **"Operation not permitted" changing ownership** (`chown`, `rsync -g`)
   on Apple's share: files there show as root-owned. Use berth's share
   (the default on macOS 27).
+
+## Performance
+
+- **`Files:` in `berth status` says "built-in driver"** (or the app shows a
+  banner): the share runs without the polling driver, ~3x slower on small
+  files. The note says why; on Debian's kernel the driver is built after the
+  first boot and needs the internet.
+- **Idle CPU looks high right after heavy work.** For a few minutes the
+  balloon hands memory back to macOS and the VM keeps compacting it; it
+  settles to ~1.4 % (VM and daemon).
 
 ## Suspend and snapshots
 

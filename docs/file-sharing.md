@@ -76,8 +76,10 @@ guest app ─ syscall ─ Linux FUSE ─ virtio-fs driver ═ virtqueue ═ Virt
 ### The polling guest driver
 
 Most of a request's time was the framework delivering the reply interrupt
-back into the guest. `guest/kmod/virtiofs_poll/` is Linux 6.12's
-`fs/fuse/virtio_fs.c` with three changes (marked `berth:`):
+back into the guest. The polling driver is Linux's `fs/fuse/virtio_fs.c`
+with three changes (marked `berth:`): built into berth's kernel (7.2,
+`guest/kernel/virtiofs_poll-7.2.patch`), or as a module on Debian's 6.12
+(`guest/kmod/virtiofs_poll/`, a copy of 6.12's file):
 
 1. **Its own device ID.** It binds only device ID 62 and registers the
    filesystem `virtiofs_poll`, so the built-in driver keeps serving
@@ -87,7 +89,7 @@ back into the guest. `guest/kmod/virtiofs_poll/` is Linux 6.12's
    back to the interrupt.
    - Only requests sent by `__fuse_request_send()` poll: not background
      ones, which can be sent holding `fc->bg_lock`.
-   - The guest kernel has no preempt count, so `preemptible()` can't be used
+   - Debian's kernel has no preempt count, so `preemptible()` can't be used
      as the guard.
 
 3. **No-op chmods answered in the guest.** A `chmod` to the mode a file
@@ -99,6 +101,10 @@ back into the guest. `guest/kmod/virtiofs_poll/` is Linux 6.12's
 A round trip went from ~180 µs to ~18 µs (Apple's share: ~34 µs).
 
 ### How it's set up (nothing to do by hand)
+
+On berth's kernel (the default) the driver is built in: the host presents
+device ID 62 from the first start, and the steps below don't apply. The
+polling-driver marker (below) still guards each start. On Debian's kernel:
 
 1. **First boot on berth's share.** The host presents the device as plain
    virtio-fs (ID 26), and the guest's built-in driver mounts it from
@@ -131,7 +137,7 @@ to mount would leave a VM that never comes up:
   `virtiofs` and leaves the helper unused until a berth with a different
   helper arrives.
 - **Snapshots:** restoring a snapshot clears `kmod-ready`, since its disk
-  may predate the module.
+  may predate the module (on Debian's kernel only; berth's has it built in).
 
 ### Settings (environment of `berth start`)
 
@@ -172,8 +178,8 @@ DDEV re-measured on 2026-10-24, `bench/results/2026-10-24-compare.md`):
 | delete 20k files | 2.7 | 2.7 | **1.4** | 1.5 |
 | read all 20k files (`compare.sh`) | 2.9 | – | 2.0 | 0.8 |
 | 4 parallel extracts | 20.4 | 12.8 | 7.7 | – |
-| DDEV `composer install` | fails* | 16 | 8.5–9.0 | 6.6 |
-| DDEV `drush site:install` | fails* | 67 | 35–36 (47 in its slow mode) | 37 |
+| DDEV `composer install` | fails* | 16 | 8.2–8.9 | 6.6 |
+| DDEV `drush site:install` | fails* | 67 | 31.7–36.3 (berth's 7.2 kernel) | 37 |
 
 \* `create-project` aborts on Apple's share (ownership), so the later steps
 can't run.

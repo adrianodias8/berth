@@ -136,8 +136,8 @@ berth config set memory_mib 8192        # settings (also in the app); berth rest
   `$TMPDIR` (`/var/folders`, what testcontainers uses), at the same paths, served
   by berth's own
   file sharing on macOS 27 (Apple's virtiofs before): 3x faster than Apple's on
-  small files and close to OrbStack (20k files extracted in 2.4-2.7 s; OrbStack
-  2.3 s, Apple's 7.9 s; reading them back is still 2.4x slower), real file
+  small files and close to OrbStack (20k files extracted in 2.4 s; OrbStack
+  2.3 s, Apple's 7.5 s; reading them back is still 2.4x slower), real file
   ownership in containers, and file change
   notifications forwarded so hot reload works (`docs/file-sharing.md`)
 - Kubernetes: `berth k8s enable` gives a single-node k3s using berth's Docker, so
@@ -194,9 +194,9 @@ images, volumes, networks, Kubernetes, machines, terminals, logs, files and stat
 - Before macOS 27 (Apple's virtiofs), small-file I/O on bind mounts is ~3.5x
   slower than OrbStack, and DDEV's `composer create-project` fails (the project
   folder shows as root-owned in containers).
-- On berth's own share, Composer-heavy work is still ~1.4x slower than OrbStack
-  (DDEV Drupal CMS `composer install` ~9 s vs 6.6 s, `drush site:install` 40-46 s
-  vs 37 s); page loads are on par
+- On berth's own share, Composer is still ~1.3x slower than OrbStack (DDEV
+  Drupal CMS `composer install` 8.2–8.9 s vs 6.6 s); `drush site:install`
+  (31.7–36.3 s vs 36.7–37.4 s) and page loads are on par or faster
   (`bench/results/2026-10-23-ddev-drupal.md`).
 - Memory used by a workload isn't returned to macOS after it ends (OrbStack in the
   same test didn't return it within 2 minutes either).
@@ -431,7 +431,8 @@ refuses any other name, so trusting it cannot be abused for real sites.
 - `src/routes.rs`, `src/helper.rs`: container subnet routes and the root helper
 - `src/virtiofs.rs`, `src/fuse.rs` (+ `fuse/nofollow.rs`): berth's file sharing
   device and FUSE server; `guest/kmod/virtiofs_poll`: its polling guest driver,
-  built in the VM by `agent/src/kmod.rs`
+  built into berth's kernel, or in the VM by `agent/src/kmod.rs` on Debian's
+- `guest/kernel/`: berth's guest kernel (build, config, checklist; its README)
 - `src/fuse/tunnel.rs` (agent: `tunnel.rs`): the `host.docker.internal` tunnel device
 - `src/watch.rs`: FSEvents → inotify forwarding for bind mounts
 - `src/memory.rs`: balloon controller
@@ -463,7 +464,8 @@ refuses any other name, so trusting it cannot be abused for real sites.
 - `src/context.rs`: the `berth` docker context
 - agent: `boot.rs` (direct boot, kernel export), `docker.rs` (Docker API client),
   `engine.rs` (docker-ce install), `memory.rs` (balloon, memory pressure),
-  `kmod.rs` (the polling driver's build), `tunnel.rs`, `mac.rs`, `files.rs`
+  `kmod.rs` (the polling driver's build on Debian's kernel, berth's kernel's
+  module data), `tunnel.rs`, `mac.rs`, `files.rs`
 - `src/tls.rs`: the local CA, per-name certificates, keychain trust
 - `src/provision.rs`: image download and checksum, disk clone, SSH key, cloud-init seed
 - `guest/user-data.yaml`: guest provisioning (Docker, mounts, Rosetta binfmt, agent unit)
@@ -479,7 +481,7 @@ discussions) and the limits above:
 
 - **File sharing**: close the remaining Composer gap (fewer round trips per
   file); push invalidations to the guest instead of relying on FSEvents
-  touches; prebuilt guest modules, so the polling driver needs no download
+  touches
 - **Machines**: custom images; per-machine and per-volume snapshots
   next to the whole-VM ones
 - **Linux GUI apps**: first a console window (virtio-gpu 2D, clipboard via
@@ -504,14 +506,17 @@ discussions) and the limits above:
 - `docs/file-sharing.md`: berth's own file sharing and its polling guest driver
 - `docs/LEARNINGS.md`: platform quirks, measurements and dead ends found so far
 - `docs/KNOWN_ISSUES.md`: open review findings
+- `guest/kernel/README.md`: berth's guest kernel: what's in it, building, updating
 - `CONTRIBUTING.md`: setting up, the clean-room rule, layout, testing
 - `CHANGELOG.md`: what changed
 - `bench/results/`: benchmark runs against OrbStack
 
 ## License
 
-MIT (`LICENSE`), except the guest kernel module in `guest/kmod/`, which is
-derived from Linux and is GPL-2.0.
+MIT (`LICENSE`), except the guest kernel module in `guest/kmod/` and the
+kernel patches in `guest/kernel/`, which are derived from Linux and are
+GPL-2.0. The kernel shipped in Berth.app is Linux (GPL-2.0), built
+from kernel.org's source by `guest/kernel/build.sh`.
 
 ## Compatibility notes
 

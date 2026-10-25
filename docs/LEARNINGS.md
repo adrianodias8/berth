@@ -320,14 +320,17 @@ something here stops being true, fix it.
 
 | | berth | OrbStack |
 |---|---|---|
-| startup | 3.3–3.6 s | 2.6–4.4 s |
+| startup | 2.6–2.7 s (berth's 7.2 kernel; 3.3–3.6 s on Debian's) | 2.6–4.4 s |
 | idle memory (system-wide) | +1.37 GB (+1.9 with Podman and nerdctl on) | +1.28 GB |
-| idle CPU | 3.0 % | 2.2 % |
+| idle CPU | ~1.4 % (3.0 % before the idle work) | 2.2 % |
 | localhost forward | ~20 Gbit/s | ~31 Gbit/s |
 | bind-mount extract (20k files) | 7.9 s (Apple's) / 2.4–2.7 s (own share + polling) | 2.3 s |
-| DDEV composer install | 9.0–9.2 s (own share + polling) | 6.6 s |
+| DDEV composer install | 8.2–8.9 s (own share + polling) | 6.6 s |
+| DDEV drush site:install | 31.7–36.3 s | 36.7–37.4 s |
 
-(`bench/results/2026-10-24-compare.md`.)
+(`bench/results/2026-10-24-compare.md`; startup, idle CPU and DDEV
+re-measured on 2026-10-25, `bench/results/2026-10-23-ddev-drupal.md`.
+OrbStack's figures are from 2026-10-24.)
 
 Neither returns workload memory to macOS within 2 minutes. Docker volumes are
 ~15x faster than any bind mount (they live on the VM's own disk).

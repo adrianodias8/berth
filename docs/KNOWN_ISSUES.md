@@ -1,20 +1,28 @@
 # Known issues
 
-Open findings from the code review of 2026-10-24, most important first
+Open findings from the code reviews of 2026-10-24 and 2026-10-25 (each
+entry re-checked against the code on 2026-10-25), most important first
 within each area. Fixed findings aren't listed (see the git log). When you
 fix one, remove it here in the same change.
 
 ## File sharing (berth's share, `src/fuse.rs`)
 
+- **Disks under `/Volumes` can collide.** Node IDs are inode numbers without
+  the device (`entry_with`), and the `/Volumes` share spans every mounted
+  disk: two APFS disks both have a root inode 2, so a lookup under one can
+  land on the other's files. Fix: fold `st_dev` into the node ID (a map from
+  (dev, ino) to IDs).
 - **A removed file may lose its data.** A file removed while open in the
   guest stays readable only if berth already had it open (its cached file),
   which is usual but not guaranteed (eviction past 4096 cached files is
   skipped only for removed nodes). Reopening by name is refused rather than
   getting the wrong file.
 - **`/tmp` and `/var/folders` bind sources are mapped only in container
-  creates** (Docker's API and Podman's libpod one): machines don't get the
-  mapping (use `/private/tmp/...`). Integrated machines see only home;
-  isolated ones only their `--mount` folders.
+  creates** (Docker's API and Podman's libpod one), and only in bodies that
+  aren't chunked and are under 8 MiB (`src/dockerapi.rs`); other creates get
+  the VM's own `/tmp`. Machines' `--mount`, `push` and `pull` resolve them.
+  Integrated machines see only home; isolated ones only their `--mount`
+  folders.
 - **The extra shares are read-write**: the VM can write to `/Volumes`
   (external and network disks), `/private/tmp` and `/private/var/folders`
   (`$TMPDIR`, caches), as it can to home.
@@ -23,25 +31,50 @@ fix one, remove it here in the same change.
   of a Unix socket in a shared folder fails. No xattrs, no locks beyond what
   the guest kernel does locally.
 - **Stale eviction queue.** Entries for forgotten nodes stay queued, so
-  eviction can start early.
+  eviction can start early; and files removed while cached are dropped from
+  the queue but keep their descriptor until forgotten, outside the 4096 cap.
 - **On the Debian kernel, the polling driver is built at runtime** (needs
   the network and ~200 MB of headers and gcc; slower share until then).
-  berth's own kernel, the default when shipped, has it built in
-  (`guest/kernel/README.md`). `berth status` and the app say when the share
-  is on the slower driver, and why.
-- **berth's kernel needs updates shipped with berth:** Debian's security
-  fixes for 6.12 reach it only when it's rebuilt and released.
+  berth's own kernel has it built in (`guest/kernel/README.md`). The very
+  first start of a new VM is always Debian's (berth's kernel needs the root
+  partition's command line, exported by that boot), so it runs the build
+  anyway, needlessly, and retries every 30 min offline. `berth status` and
+  the app say when the share is on the slower driver, and why.
 - **Safe mode needs direct boot.** If the guest kernel was never exported
   (EFI boot only), a broken mount setup can't be rescued automatically.
 - **A snapshot restore takes ~16 s**, mostly stopping the current VM. A
   restore could reuse the running VM's process instead.
-- **Polling driver: device hot-unplug.** If the device disappeared while a
+- **Polling driver: device hot-unplug** (both the 6.12 module and the 7.2
+  patch; Virtualization.framework doesn't hot-unplug, so unreachable today). If the device disappeared while a
   task was polling, the poller could touch a freed queue (unmount and `rmmod`
   can't trigger it). Fix: count pollers and wait for them in
   `virtio_fs_drain_queue`.
-- **Polling driver: completions in the sender's context.** Completions of
+- **Polling driver: completions in the sender's context** (both forms). Completions of
   other requests can now run in the sending task, which may hold
   `i_rwsem`/folio locks. No callback is known to take those.
+
+## Guest kernel (`guest/kernel`)
+
+- **7.2 isn't a long-term release.** Its fixes come from 7.2.y stable
+  releases, which reach users only when berth is rebuilt and released, and
+  berth must move to the next series (porting the polling driver) before
+  7.2's support ends.
+- **6.18 locked up under k3s** (a CPU stuck with interrupts off while k3s
+  tore down pod veths, twice, no backtrace). Not understood: it may be
+  6.18's, or the polling driver's 6.18 port. Check before ever using 6.18.
+- **A kernel is known by its release string** (`7.2.12-berth`). A rebuild
+  with a fix keeps the same one, so a release set aside after two failed
+  starts (`berth-failed`) stays set aside. Fix: add a build ID to it.
+- **Two interrupted starts set berth's kernel aside for good** (until
+  another release ships): an unfinished attempt can also be a stop during
+  boot, and a safe boot doesn't reset the count. Delete
+  `~/.berth/guest/boot/berth-failed` to try it again.
+- **The kernel source's checksum comes from the same place as the source**
+  (kernel.org's `sha256sums.asc`, its signature not checked).
+- **Containers can swap** (zram, up to their memory limit, as Docker allows
+  when the host has swap): a container over its limit slows down before
+  it's OOM-killed. Kernel and socket memory isn't counted against container
+  limits (`cgroup.memory=nokmem,nosocket`).
 
 ## Guest agent (`agent/`)
 
@@ -74,7 +107,9 @@ fix one, remove it here in the same change.
   127.0.0.1 or ::1, and UDP ones bound to the wildcard addresses only**, always
   on the Mac's loopback. A host-network server bound to one specific guest
   address isn't forwarded; UDP on loopback or on an ephemeral-range port
-  isn't either. New servers appear on the Mac within the 2 s poll.
+  isn't either. New servers appear on the Mac within the poll: 2 s while a
+  host-network container runs, 10 s otherwise (so the first one can take up
+  to 10 s).
 - **Host-network containers can't reach Mac servers on `localhost`** (they
   can through `host.docker.internal`); see LEARNINGS.
 - **IPv6 isn't routed from the Mac to containers.** Container IPv6 addresses
@@ -95,7 +130,7 @@ fix one, remove it here in the same change.
 
 - **A direct boot that fails costs one more failed start** before EFI takes
   over: an unfinished attempt can also be a stop during boot, so it takes
-  two in a row.
+  two in a row (berth's kernel: see Guest kernel).
 
 - **`~/Berth` (SMB) gives root in the VM** to whoever has the share's
   password (`~/.berth/files-password`, readable only by the Mac user). Links
@@ -109,7 +144,7 @@ fix one, remove it here in the same change.
   controls. Fine on a single-user Mac; consider root-owned copies.
 - **Downloads:** the VM's base image and machine images are checked against
   checksum files from the same origin (the CLIs and podman-remote have
-  pinned SHA-256s).
+  pinned SHA-256s; for the kernel source see Guest kernel).
 
 ## App (`app/`)
 
@@ -123,5 +158,6 @@ fix one, remove it here in the same change.
   - logs re-attach when a container's running state changes, which a very
     quick restart can slip between;
   - the Kubernetes screen shows pods, not services;
-  - the CLI's `machine push/pull`, `config unset`, `delete` and import's
-    `--images/--volumes/--containers` aren't in the app.
+  - the CLI's `machine push/pull`, `config unset`, `delete`, the `kernel`
+    setting and import's `--images/--volumes/--containers` aren't in the
+    app.
