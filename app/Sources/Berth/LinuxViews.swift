@@ -17,7 +17,7 @@ enum Machines {
     struct Reply: Decodable { let output: String }
 
     static func call(_ action: String, _ args: [String] = []) async throws -> String {
-        let reply: Reply = try await Task.detached {
+        let reply: Reply = try await offPool {
             let sock = try UnixSocket(path: BerthPaths.controlSocket)
             var tv = timeval(tv_sec: 900, tv_usec: 0)
             setsockopt(sock.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
@@ -26,7 +26,7 @@ enum Machines {
             var data = Data()
             while !data.contains(0x0a), let chunk = try sock.read() { data.append(chunk) }
             return try JSONDecoder().decode(Reply.self, from: data)
-        }.value
+        }
         if reply.output.hasPrefix("error: ") { throw SocketError.message(String(reply.output.dropFirst(7))) }
         return reply.output
     }
@@ -202,7 +202,7 @@ struct MachinesView: View {
     /// The CLI's own rendering, so the app shows what `berth machine` prints.
     private func showReport(_ name: String, _ args: [String], title: String) {
         Task {
-            let result = await Task.detached { Engine.run([BerthPaths.cli, "machine"] + args) }.value
+            let result = await offPool { Engine.run([BerthPaths.cli, "machine"] + args) }
             report = MachineReport(title: title, text: result.output.isEmpty ? "(nothing)" : result.output)
         }
     }
@@ -408,12 +408,12 @@ struct KubernetesView: View {
     }
 
     private func refresh() async {
-        let s = await Task.detached { Engine.run([BerthPaths.cli, "k8s", "status"]).output }.value
+        let s = await offPool { Engine.run([BerthPaths.cli, "k8s", "status"]).output }
         status = s.replacingOccurrences(of: "Kubernetes: ", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard status == "running" else { pods = []; return }
-        let json = await Task.detached { [kubectl] in
+        let json = await offPool { [kubectl] in
             Engine.run([kubectl, "--context", "berth", "get", "pods", "-A", "-o", "json"]).output
-        }.value
+        }
         let items = ((try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any])?["items"] as? [[String: Any]] ?? []
         pods = items.map { item in
             let meta = item["metadata"] as? [String: Any] ?? [:]
@@ -427,7 +427,7 @@ struct KubernetesView: View {
         working = true
         let action = status == "running" ? "disable" : "enable"
         Task {
-            let result = await Task.detached { Engine.run([BerthPaths.cli, "k8s", action]) }.value
+            let result = await offPool { Engine.run([BerthPaths.cli, "k8s", action]) }
             if result.code != 0 { engine.lastError = "Kubernetes: \(result.output.trimmingCharacters(in: .whitespacesAndNewlines))" }
             working = false
             await refresh()

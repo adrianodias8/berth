@@ -183,7 +183,7 @@ struct SettingsView: View {
     }
 
     private func loadEngines() async {
-        let out = await Task.detached { Engine.run([BerthPaths.cli, "engine", "status"]).output }.value
+        let out = await offPool { Engine.run([BerthPaths.cli, "engine", "status"]).output }
         var states: [String: Bool] = [:]
         for line in out.split(separator: "\n") {
             let parts = line.split(separator: " ", maxSplits: 1)
@@ -197,7 +197,7 @@ struct SettingsView: View {
             engines[name] = on
             engineMessage = on ? "Setting up \(name)… (the first time installs it in the VM)" : nil
             Task {
-                let result = await Task.detached { Engine.run([BerthPaths.cli, "engine", on ? "enable" : "disable", name]) }.value
+                let result = await offPool { Engine.run([BerthPaths.cli, "engine", on ? "enable" : "disable", name]) }
                 engineMessage = result.code == 0 ? nil : result.output.trimmingCharacters(in: .whitespacesAndNewlines)
                 await loadEngines()
             }
@@ -208,8 +208,7 @@ struct SettingsView: View {
     private func runTLS(_ action: String) {
         httpsMessage = action == "trust" ? "Waiting for authorization…" : nil
         Task.detached {
-            let result = Engine.run([BerthPaths.cli, "tls", action])
-            let trusted = TLSTrust.check()
+            let (result, trusted) = await offPool { (Engine.run([BerthPaths.cli, "tls", action]), TLSTrust.check()) }
             await MainActor.run {
                 httpsTrusted = trusted
                 httpsMessage = result.code == 0 ? nil : result.output.trimmingCharacters(in: .whitespacesAndNewlines)

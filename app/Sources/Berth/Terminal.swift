@@ -118,9 +118,9 @@ final class ExecSession: NSObject, TerminalViewDelegate, @unchecked Sendable {
                 )
                 guard let execID = (try JSONSerialization.jsonObject(with: created.body) as? [String: Any])?["Id"] as? String
                 else { throw SocketError.message("exec create returned no id") }
-                let (sock, initial) = try UnixHTTP.upgrade(
-                    Docker.socket, "/exec/\(execID)/start", json: ["Detach": false, "Tty": true]
-                )
+                let (sock, initial) = try await offPool {
+                    try UnixHTTP.upgrade(Docker.socket, "/exec/\(execID)/start", json: ["Detach": false, "Tty": true])
+                }
                 guard let self else {
                     sock.shutdownBoth()
                     return

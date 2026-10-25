@@ -18,6 +18,10 @@ are in the commit messages.
   0.93 s, OrbStack 0.75 s) and answers ioctls itself (musl's `fopen()`
   asked each file it wrote whether it was a terminal); the host closes
   files on a thread of its own.
+- **App:** process runs, control-socket and Docker requests no longer
+  block Swift's shared thread pool (one thread per core), so a long
+  `berth start`, machine action or engine install can't hold up the rest
+  of the app.
 - **Small-file reads 2x faster:** readahead is no longer sent as background
   requests with the polling driver (each waited for an interrupt), and files
   are opened read-only until written. 20k files read in 0.75 s instead of

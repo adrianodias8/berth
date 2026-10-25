@@ -99,7 +99,7 @@ enum UnixHTTP {
     static func request(
         _ socketPath: String, _ method: String, _ path: String, json: Any? = nil
     ) async throws -> HTTPResponse {
-        try await Task.detached(priority: .userInitiated) {
+        try await offPool {
             let sock = try UnixSocket(path: socketPath)
             try sock.write(requestData(method, path, json: json))
             var data = Data()
@@ -109,7 +109,7 @@ enum UnixHTTP {
                 throw HTTPError(status: response.status, message: dockerMessage(response.body))
             }
             return response
-        }.value
+        }
     }
 
     /// Body chunks until the server closes or the consumer stops listening.

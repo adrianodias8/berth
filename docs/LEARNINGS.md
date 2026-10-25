@@ -322,6 +322,11 @@ something here stops being true, fix it.
 
 ## The app (SwiftUI)
 
+- **Blocking in a task holds one of a handful of threads:** Swift's shared
+  pool has one per core (40 tasks that each block 2 s took 8 s on 12
+  cores). Processes, socket reads and keychain checks go through
+  `offPool` (`app/Sources/Berth/OffPool.swift`): a thread of their own,
+  resumed through a continuation.
 - **Lazy statics:** one that evaluates itself recursively (TLS trust check)
   deadlocks or crashes. Use a plain function.
 - **Certificate trust:** `security verify-cert` reports a correctly trusted

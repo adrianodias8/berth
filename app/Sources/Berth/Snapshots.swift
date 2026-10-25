@@ -29,7 +29,7 @@ enum Snapshots {
 
     /// Run `berth snapshot …` off the main thread; the error output if it failed.
     static func run(_ args: [String]) async -> String? {
-        let result = await Task.detached { Engine.run([BerthPaths.cli, "snapshot"] + args) }.value
+        let result = await offPool { Engine.run([BerthPaths.cli, "snapshot"] + args) }
         return result.code == 0 ? nil : result.output.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

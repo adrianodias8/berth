@@ -150,10 +150,6 @@ fix one, remove it here in the same change.
 
 ## App (`app/`)
 
-- **Blocking work fills Swift's shared thread pool.** Process runs and socket
-  reads happen inside `Task.detached` (start, machine actions, settings,
-  stats), and that pool has a thread per core. Run blocking work on threads
-  or dispatch queues and resume through continuations, as `stream()` does.
 - **Terminal sessions** are kept for the 8 terminals shown most recently;
   older ones are closed.
 - **UI:**

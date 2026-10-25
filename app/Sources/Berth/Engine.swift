@@ -71,7 +71,7 @@ struct BerthDomain: Decodable, Hashable, Identifiable {
 enum Control {
     /// One JSON request line, one JSON reply line.
     static func request<T: Decodable>(_ cmd: String) async throws -> T {
-        try await Task.detached {
+        try await offPool {
             let sock = try UnixSocket(path: BerthPaths.controlSocket)
             var tv = timeval(tv_sec: 10, tv_usec: 0)
             setsockopt(sock.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
@@ -79,7 +79,7 @@ enum Control {
             var data = Data()
             while !data.contains(0x0a), let chunk = try sock.read() { data.append(chunk) }
             return try JSONDecoder().decode(T.self, from: data)
-        }.value
+        }
     }
 }
 
@@ -218,7 +218,7 @@ final class Engine: ObservableObject {
         lastError = nil
         startInFlight = true
         Task.detached {
-            let result = Self.run([BerthPaths.cli, "start"])
+            let result = await offPool { Engine.run([BerthPaths.cli, "start"]) }
             await MainActor.run {
                 self.startInFlight = false
                 if result.code != 0 {
@@ -236,7 +236,7 @@ final class Engine: ObservableObject {
         state = .stopping
         stopInFlight = true
         Task.detached {
-            let result = Self.run([BerthPaths.cli, "stop"] + (shutdown ? ["--shutdown"] : []))
+            let result = await offPool { Engine.run([BerthPaths.cli, "stop"] + (shutdown ? ["--shutdown"] : [])) }
             await MainActor.run { self.stopInFlight = false }
             guard result.code != 0 else { return }
             await MainActor.run {
@@ -256,7 +256,7 @@ final class Engine: ObservableObject {
         lastError = nil
         startInFlight = true
         Task.detached {
-            let result = Self.run([BerthPaths.cli, "restart"])
+            let result = await offPool { Engine.run([BerthPaths.cli, "restart"]) }
             await MainActor.run {
                 self.startInFlight = false
                 if result.code != 0 {

@@ -163,7 +163,7 @@ enum Setup {
         let escaped = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let script = "do shell script \"\(escaped)\" "
             + "with administrator privileges with prompt \"Berth needs to set up networking for containers.\""
-        let result = await Task.detached { Engine.run(["/usr/bin/osascript", "-e", script]) }.value
+        let result = await offPool { Engine.run(["/usr/bin/osascript", "-e", script]) }
         if result.code != 0 {
             // -128: the user cancelled the prompt.
             return result.output.contains("-128") ? .skipped : .failed(result.output.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -173,9 +173,9 @@ enum Setup {
 
     /// `berth tls trust`; macOS shows its own password prompt for trust changes.
     static func trustCertificate() async -> OnboardingView.Step.State {
-        if TLSTrust.check() { return .done }
-        let result = await Task.detached { Engine.run([BerthPaths.cli, "tls", "trust"]) }.value
-        if TLSTrust.check() { return .done }
+        if await offPool({ TLSTrust.check() }) { return .done }
+        let result = await offPool { Engine.run([BerthPaths.cli, "tls", "trust"]) }
+        if await offPool({ TLSTrust.check() }) { return .done }
         return result.code == 0 ? .skipped : .failed(result.output.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
