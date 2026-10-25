@@ -214,10 +214,16 @@ fn berth_kernel_boot(paths: &Paths, cmdline: &str) -> Option<Retained<VZBootLoad
     eprintln!("boot: berth's kernel {release}");
     unsafe {
         let boot = VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &file_url(&kernel.join("Image")));
-        boot.setCommandLine(&NSString::from_str(cmdline.trim()));
+        boot.setCommandLine(&NSString::from_str(&format!("{} {BERTH_KERNEL_ARGS}", cmdline.trim())));
         Some(Retained::into_super(boot))
     }
 }
+
+/// Added to berth's kernel's command line. Kernel work queued without a CPU
+/// runs where a CPU is already awake instead of waking an idle one; cgroups
+/// don't account kernel and socket memory per container (bookkeeping on
+/// every allocation, for limits that matter on shared servers, not a dev VM).
+const BERTH_KERNEL_ARGS: &str = "workqueue.power_efficient=1 cgroup.memory=nokmem,nosocket";
 
 /// Boot the guest's own kernel directly when the agent has exported it (see
 /// agent/src/boot.rs), skipping EFI firmware and GRUB. A "trying" marker is

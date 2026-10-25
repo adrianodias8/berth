@@ -1,4 +1,5 @@
-//! Boot-time tuning, applied once and effective from the next boot.
+//! Boot-time tuning: mostly applied once and effective from the next boot;
+//! the disk scheduler is set on every boot.
 //!
 //! Measured on Debian 13 (systemd-analyze): Docker's start was gated behind
 //! systemd-networkd-wait-online (~1.2 s waiting for DHCP) via cloud-init's
@@ -107,6 +108,13 @@ pub fn export_kernel() {
 
 pub fn tune() {
     lazy_efi_mount();
+    // The host already orders and merges the VM's disk I/O; a second
+    // scheduler in the guest only adds latency (and timers).
+    for disk in std::fs::read_dir("/sys/block").into_iter().flatten().flatten() {
+        if disk.file_name().to_string_lossy().starts_with("vd") {
+            let _ = std::fs::write(disk.path().join("queue/scheduler"), "none");
+        }
+    }
     // Docker doesn't need DHCP to have finished; container networking comes
     // up a moment later on its own.
     let _ = Command::new("systemctl").args(["mask", "--quiet", "systemd-networkd-wait-online.service"]).status();

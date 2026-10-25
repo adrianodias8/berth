@@ -89,6 +89,45 @@ pub fn ensure_kernel_args() {
     eprintln!("berth-agent: set init_on_alloc=0 for the next boot ({})", if ok { "ok" } else { "failed" });
 }
 
+/// Memory settings for a VM that shares the Mac's memory, applied on every
+/// boot (none of them persist):
+/// - compressed swap in RAM (zram, as big as the VM's memory): pages nobody
+///   touches are kept at a fraction of their size instead of holding memory
+///   the balloon could give back to macOS;
+/// - swappiness 20: reclaim prefers page cache, and swaps only cold pages;
+/// - huge pages only where programs ask (madvise): with `always`, a few
+///   touched bytes can pin 2 MiB the balloon can't take back.
+pub fn tune() {
+    let _ = std::fs::write("/proc/sys/vm/swappiness", "20");
+    let _ = std::fs::write("/sys/kernel/mm/transparent_hugepage/enabled", "madvise");
+    if let Err(err) = zram_swap() {
+        eprintln!("berth-agent: zram swap: {err}");
+    }
+}
+
+fn zram_swap() -> io::Result<()> {
+    if std::fs::read_to_string("/proc/swaps")?.contains("/dev/zram") {
+        return Ok(());
+    }
+    // Built into berth's kernel; a module in Debian's.
+    let _ = std::process::Command::new("modprobe").arg("zram").status();
+    let dev = std::path::Path::new("/sys/block/zram0");
+    if std::fs::read_to_string(dev.join("disksize"))?.trim() != "0" {
+        return Ok(()); // set up by someone else
+    }
+    // lz4 where the kernel has it (berth's does), its default otherwise.
+    let _ = std::fs::write(dev.join("comp_algorithm"), "lz4");
+    let total = parse_meminfo(&std::fs::read_to_string("/proc/meminfo")?).total;
+    std::fs::write(dev.join("disksize"), total.to_string())?;
+    for (cmd, args) in [("mkswap", &["-q", "/dev/zram0"][..]), ("swapon", &["-p", "100", "/dev/zram0"][..])] {
+        let out = std::process::Command::new(cmd).args(args).output()?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!("{cmd}: {}", String::from_utf8_lossy(&out.stderr).trim())));
+        }
+    }
+    Ok(())
+}
+
 /// Block on the PSI trigger forever, notifying the host on each event.
 pub fn watch_pressure() {
     loop {

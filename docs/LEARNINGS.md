@@ -63,6 +63,20 @@ something here stops being true, fix it.
   Guest: 118 -> 56 runs/s; VM + daemon idle CPU 2.97 % -> 1.37 %. The rest is
   mostly Docker's own containerd and dockerd.
 
+- **Kernel choice (2026-10-25):** 7.2.12 over 6.12 (same config): kernel
+  boot 0.24 s vs 0.31 s, drush site:install ~10 % faster, idle the same.
+  6.18.58 locked up a CPU when k3s tore down pod veths (twice, no backtrace).
+  Porting the polling driver across series: 6.17+ gate legacy iptables behind
+  `NETFILTER_XTABLES_LEGACY`, and 7.2 drops `req->fm` (use the connection's
+  `mounts` list) and checks replies with `virtio_fs_verify_response`.
+- **From OrbStack's running kernel** (its `/proc/cmdline` and sysfs; its
+  `/proc/config.gz` is a curated extract without core options): 7.2.12 with
+  full preemption, zram swap the size of RAM, swappiness 20, THP `madvise`,
+  no disk scheduler, `workqueue.power_efficient=1`,
+  `cgroup.memory=nokmem,nosocket`. berth does all of these. Not copied:
+  `id_aa64mmfr0.ecv=1` (forces a timer feature the hypervisor hides; unknown
+  on M1) and `isolcpus=11` (purpose unknown).
+
 ## Snapshots
 
 - **What works:** `VZVirtualMachineConfiguration.validateSaveRestoreSupport`
@@ -259,8 +273,8 @@ something here stops being true, fix it.
   finish before saving.
 - **Ownership:** guest root extracting tarballs, or Linux group IDs, makes
   `chown` fail on the Mac. Ignore EPERM like Apple's share does.
-- **The guest kernel** (Debian 6.12) builds FUSE and virtio-fs in (`=y`),
-  exports the symbols a module needs, has no preempt count
+- **The VM's Debian kernel** (6.12; berth's own is 7.2) builds FUSE and
+  virtio-fs in (`=y`), exports the symbols a module needs, has no preempt count
   (`PREEMPT_VOLUNTARY`), and supports multiqueue virtio-fs (6.11+).
 - **Dead ends:**
   - an NFS server over the VM network (the nfsserve prototype spun the CPU

@@ -97,6 +97,7 @@ fn main() {
     web::run(table.clone());
     thread::spawn(memory::watch_pressure);
     thread::spawn(memory::ensure_kernel_args);
+    thread::spawn(memory::tune);
     thread::spawn(boot::tune);
     thread::spawn(boot::export_kernel);
     thread::spawn(kmod::run);

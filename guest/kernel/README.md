@@ -4,8 +4,8 @@ The VM boots this kernel by default when the app (or a development build)
 ships one; otherwise, or with `berth config set kernel debian`, it boots the
 VM's own Debian kernel as before.
 
-It is Debian's 6.12 source and arm64 config, the same version the VM's Debian
-kernel is, with:
+It is Linux 7.2.12 from kernel.org (checksum checked) on Debian's 6.12
+arm64 config, with:
 
 - **The modules the VM uses built in** (`modules.txt`, collected with Docker,
   k3s, Podman, nerdctl, IPv6 and machines in use), plus ones containers
@@ -19,17 +19,26 @@ kernel is, with:
   drivers Debian builds in for them.
 - **Only the security modules the VM's userland uses** (AppArmor for
   Docker's profiles, landlock, yama, lockdown, integrity, BPF).
+- **Boot options** (`src/vm.rs`): `workqueue.power_efficient=1` (queued
+  kernel work runs on a CPU that's already awake) and
+  `cgroup.memory=nokmem,nosocket` (no per-container accounting of kernel
+  and socket memory). The agent adds zram swap the size of RAM (lz4),
+  swappiness 20, huge pages on request only, and no disk scheduler.
 
-Measured on an M2 Max (2026-10-24): the kernel boots in 0.31 s instead of
-0.59 s, the whole boot in 2.3 s instead of 3.1 s. Workloads run the same
-(DDEV Drupal CMS, idle CPU 1.38 % vs 1.37 %): the gains are boot time, no
-runtime driver build, and the polling driver staying in use after a
-snapshot restore.
+Measured on an M2 Max: the kernel boots in 0.24 s instead of Debian's
+0.59 s, the whole boot in ~2.3 s instead of 3.1 s, with no runtime driver
+build, and the polling driver stays in use after a snapshot restore. 7.2
+against the same build of 6.12 (2026-10-25,
+bench/results/2026-10-23-ddev-drupal.md): DDEV's drush site:install
+31.7–36.3 s vs 35.9–44.5 s, idle CPU the same (~1.4 %); 6.18.58 locked up
+under k3s and was dropped.
 
 ## Building
 
 ```sh
 guest/kernel/build.sh        # ~4 min on berth itself; output in target/kernel
+                             # KERNEL_VERSION=7.2.13 (or debian, for 6.12):
+                             # target/kernel-$KERNEL_VERSION
 ./scripts/build-app.sh       # bundles target/kernel into Berth.app
 berth restart
 guest/kernel/check.sh        # what the kernel must support; KCHECK_K8S=1 adds k3s
@@ -48,7 +57,9 @@ again.
 
 ## Updating
 
-Debian ships security fixes for 6.12 as new `linux-source-6.12` packages:
-rebuild and release. A newer upstream kernel (7.x) needs the polling driver
-ported to its FUSE internals (`fuse_i.h`); `inside.sh` warns when the
-driver's copy of that header differs from the tree's.
+A new 7.2.y stable release: change the default version in `inside.sh`,
+rebuild, run `KCHECK_K8S=1 check.sh`, release. Another series needs the
+polling driver ported: it is berth's changes as a patch on that series'
+`fs/fuse/virtio_fs.c` (`virtiofs_poll-<series>.patch`); 6.12 uses the
+driver's own source (guest/kmod/virtiofs_poll). 7.2 isn't a long-term
+release: move to the next one before its support ends.

@@ -72,8 +72,9 @@ berth config set memory_mib 8192        # settings (also in the app); berth rest
 
 **Engine**
 - Debian 13 VM on Virtualization.framework, booted straight into berth's own
-  tuned kernel (Debian's 6.12 with what the VM needs built in, no initrd;
-  `guest/kernel`), or the VM's Debian kernel: the whole boot takes ~2.3 s
+  tuned kernel (Linux 7.2 with what the VM needs built in, no initrd, and
+  compressed swap in RAM; `guest/kernel`), or the VM's Debian kernel: the
+  whole boot takes ~2.3 s
 - Optionally (Settings, or `"stop": "suspend"` in `~/.berth/config.json`, or
   `berth stop --suspend`) `berth stop` saves the VM's state (while the Mac is
   unlocked) and the next `berth start` resumes it in ~2.7 s with every
