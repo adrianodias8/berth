@@ -50,6 +50,11 @@ and boot messages). `berth shell` opens a shell in the VM.
   with multicast DNS; `berth domains` lists the names. Some VPN clients block
   multicast.
 - **HTTPS warnings on `.berth.local`.** Run `berth tls trust` once.
+- **Docker commands reach the other engine** (OrbStack or Docker Desktop).
+  `docker` follows its current context: `docker context use berth` (or
+  `orbstack`). Tools that use `/var/run/docker.sock` directly follow the
+  engine started last: berth points it at itself once when it starts, and
+  OrbStack's app does the same when it opens.
 
 ## Importing
 

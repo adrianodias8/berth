@@ -67,12 +67,15 @@ async fn sync_with(force: bool) {
     }
     let result = tokio::task::spawn_blocking({
         let wanted = wanted.clone();
-        // Also (re)point /var/run/docker.sock at us, once per change, as OrbStack
-        // does for its socket.
+        // Also point /var/run/docker.sock at us, once when berth starts, as
+        // OrbStack does for its socket: the engine started last wins. Not on
+        // later syncs, or berth would take the socket back every 15 s from an
+        // engine started after it.
         let paths = crate::paths::Paths::new();
-        let socket = paths.docker_socket().to_string_lossy().into_owned();
+        let first = STATE.lock().unwrap().is_none();
+        let socket = first.then(|| paths.docker_socket().to_string_lossy().into_owned());
         let cli = crate::cli_tools::bin_dir(&paths).to_string_lossy().into_owned();
-        move || helper::set_routes(wanted, Some(socket), Some(cli))
+        move || helper::set_routes(wanted, socket, Some(cli))
     })
     .await;
     let state = match result {

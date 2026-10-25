@@ -6,6 +6,9 @@ are in the commit messages.
 ## Unreleased
 
 ### 2026-10-25
+- **Fixed:** berth took `/var/run/docker.sock` back every 15 s from an
+  engine started after it (OrbStack's app); it now points the socket at
+  itself once, when it starts.
 - **`docker build` ~1.4 s faster, now on par with OrbStack** (no-cache
   build 3.8–4.1 -> 2.2–2.8 s, OrbStack 2.6–3.2 s): Docker keeps images in
   its classic overlay2 store, like OrbStack, instead of Docker 29's
