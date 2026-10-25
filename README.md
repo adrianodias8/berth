@@ -594,7 +594,8 @@ discussions) and the limits above:
 MIT (`LICENSE`), except the guest kernel module in `guest/kmod/` and the
 kernel patches in `guest/kernel/`, which are derived from Linux and are
 GPL-2.0 (`guest/LICENSE-GPL-2.0`). The kernel shipped in Berth.app is Linux (GPL-2.0), built
-from kernel.org's source by `guest/kernel/build.sh`.
+from kernel.org's source by `guest/kernel/build.sh`; each release attaches its
+exact source as `berth-kernel-<release>-source.tar`.
 
 ## Compatibility notes
 

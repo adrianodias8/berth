@@ -49,6 +49,12 @@ guest/kernel/check.sh        # what the kernel must support; KCHECK_K8S=1 adds k
 The build runs in a Debian container on the current Docker context, which
 must be arm64. The tree is kept in the `berth-kernel-build` volume.
 
+`KERNEL_SOURCE=1 guest/kernel/build.sh` also writes
+`target/kernel/source.tar` (~160 MB): the verified upstream tarball, the
+driver patch, the final config and these scripts, with a `SOURCE.md` on
+rebuilding. GPL-2.0 asks for the source to go with the binary, so every
+release attaches it (the release workflow does this).
+
 ## Safety net
 
 The host counts starts on berth's kernel that didn't come up

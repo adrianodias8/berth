@@ -11,6 +11,8 @@
 #   modules.tar    /lib/modules/<release> metadata for modprobe (everything
 #                  the VM needs is built in), installed by the agent
 #   config         the final .config
+#   source.tar     with KERNEL_SOURCE=1: the kernel's exact source, as
+#                  releases attach it (GPL-2.0)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 out=$PWD/target/kernel${KERNEL_VERSION:+-$KERNEL_VERSION}
@@ -21,5 +23,6 @@ docker run --rm \
     -v "$PWD/guest:/guest:ro" \
     -v "$out:/out" \
     -e KERNEL_VERSION="${KERNEL_VERSION:-}" \
+    -e KERNEL_SOURCE="${KERNEL_SOURCE:-}" \
     debian:trixie bash /guest/kernel/inside.sh
 echo "built $(cat "$out/release"): $out/Image ($(du -h "$out/Image" | cut -f1))"

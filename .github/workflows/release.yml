@@ -10,6 +10,8 @@
 #                              for notarytool (an app-specific password)
 #
 # Without them the build is ad-hoc signed and the release marked a prerelease.
+# Each release also carries the guest kernel's exact source (GPL-2.0):
+# berth-kernel-<release>-source.tar, from guest/kernel/inside.sh.
 name: release
 
 on:
@@ -30,7 +32,7 @@ jobs:
         run: |
           mkdir -p target/kernel
           docker run --rm -v "$PWD/guest:/guest:ro" -v "$PWD/target/kernel:/out" \
-            -v berth-kernel-build:/build debian:trixie bash /guest/kernel/inside.sh
+            -v berth-kernel-build:/build -e KERNEL_SOURCE=1 debian:trixie bash /guest/kernel/inside.sh
       - uses: actions/upload-artifact@v4
         with:
           name: kernel
@@ -90,5 +92,7 @@ jobs:
         run: |
           flags=""
           [ -n "${BERTH_NOTARY_PROFILE:-}" ] || flags="--prerelease"
-          gh release create "$GITHUB_REF_NAME" target/dist/Berth-*.zip target/dist/Berth-*.zip.sha256 \
+          source="target/dist/berth-kernel-$(cat target/kernel/release)-source.tar"
+          cp target/kernel/source.tar "$source"
+          gh release create "$GITHUB_REF_NAME" target/dist/Berth-*.zip target/dist/Berth-*.zip.sha256 "$source" \
             --title "berth ${GITHUB_REF_NAME#v}" --generate-notes $flags

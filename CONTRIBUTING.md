@@ -150,7 +150,11 @@ that built it.
 Pushing a tag such as `v0.2.0` runs the same script in GitHub Actions
 (`.github/workflows/release.yml`) and attaches the zip to a release. The
 workflow's header lists the secrets it needs for signing and notarization;
-without them it publishes an ad-hoc prerelease.
+without them it publishes an ad-hoc prerelease. It also attaches the guest
+kernel's source (`berth-kernel-<release>-source.tar`), which GPL-2.0 asks to
+go with the kernel binary in the app. A release made by hand needs it too:
+build the kernel with `KERNEL_SOURCE=1 guest/kernel/build.sh` and attach
+`target/kernel/source.tar` under that name.
 
 ## Commits and pull requests
 

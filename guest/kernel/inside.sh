@@ -4,6 +4,11 @@
 # 6.12 kernel source. Either way Debian's 6.12 arm64 config is the start: the
 # modules the VM uses built in (modules.txt), everything else that only real
 # hardware needs left out, then config.fragment on top.
+#
+# KERNEL_SOURCE=1 also writes /out/source.tar: the exact source of the built
+# kernel (the verified upstream tarball, berth's patch, config and these
+# scripts), which GPL-2.0 asks to be offered with the binary. Releases
+# attach it (.github/workflows/release.yml).
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -13,16 +18,18 @@ apt-get install -y -qq linux-source-6.12 linux-config-6.12 build-essential bc bi
 if [ "${KERNEL_VERSION:-7.2.12}" = debian ]; then
     version=$(dpkg-query -W -f '${Version}' linux-source-6.12)
     tree=/build/linux-$version
+    tarball=/usr/src/linux-source-6.12.tar.xz
     if [ ! -d "$tree" ]; then
         mkdir -p "$tree"
-        tar -xf /usr/src/linux-source-6.12.tar.xz -C "$tree" --strip-components=1
+        tar -xf "$tarball" -C "$tree" --strip-components=1
     fi
 else
     version=${KERNEL_VERSION:-7.2.12}
     tree=/build/linux-$version
-    if [ ! -d "$tree" ]; then
+    tarball=/build/linux-$version.tar.xz
+    # The tarball is checked whenever it's used: to unpack, or to ship.
+    if [ ! -d "$tree" ] || [ -n "${KERNEL_SOURCE:-}" ]; then
         base=https://cdn.kernel.org/pub/linux/kernel/v${version%%.*}.x
-        tarball=/build/linux-$version.tar.xz
         [ -f "$tarball" ] || curl -fsSL -o "$tarball" "$base/linux-$version.tar.xz"
         # The checksums are signed by kernel.org's checksum autosigner, whose
         # key is pinned in guest/kernel (fingerprint checked below). Only the
@@ -38,6 +45,8 @@ else
         want=$(awk -v f="linux-$version.tar.xz" '$2 == f { print $1 }' /tmp/sha256sums)
         [ -n "$want" ] || { echo "no signed checksum for linux-$version.tar.xz" >&2; exit 1; }
         echo "$want  $tarball" | sha256sum -c - >/dev/null || { rm -f "$tarball"; exit 1; }
+    fi
+    if [ ! -d "$tree" ]; then
         mkdir -p "$tree"
         tar -xf "$tarball" -C "$tree" --strip-components=1
     fi
@@ -84,3 +93,32 @@ cp arch/arm64/boot/Image /out/Image
 cp .config /out/config
 echo "$release" > /out/release
 tar -C /tmp/mods -cf /out/modules.tar lib/modules
+
+if [ -n "${KERNEL_SOURCE:-}" ]; then
+    src=/tmp/source/berth-kernel-$release-source
+    rm -rf /tmp/source; mkdir -p "$src/guest"
+    cp "$tarball" "$src/"
+    cp -R /guest/kernel /guest/kmod /guest/LICENSE-GPL-2.0 "$src/guest/"
+    cp .config "$src/config"
+    xzcat /usr/src/linux-config-6.12/config.arm64_none_arm64.xz > "$src/debian-6.12-arm64.config"
+    cat > "$src/SOURCE.md" <<SOURCE
+# Source of berth's guest kernel $release
+
+The kernel shipped in Berth.app (Contents/Resources/kernel/Image) is built
+from these files, under GPL-2.0 (guest/LICENSE-GPL-2.0):
+
+- $(basename "$tarball"): the unmodified upstream source
+- guest/kernel/: berth's build scripts (inside.sh does the build),
+  config.fragment, modules.txt, and the polling virtio-fs driver's patch
+- guest/kmod/virtiofs_poll/: the same driver for Linux 6.12
+- config: the final .config the kernel was built with
+- debian-6.12-arm64.config: Debian's config that inside.sh starts from
+  (from Debian's linux-config-6.12 package)
+
+To rebuild, run guest/kernel/build.sh from a berth checkout (it runs
+inside.sh in a debian:trixie container), or follow inside.sh by hand: unpack
+the tarball, apply the driver patch, start from Debian's config, then
+modules.txt and config.fragment, and build Image and modules.
+SOURCE
+    tar -C /tmp/source -cf /out/source.tar "$(basename "$src")"
+fi

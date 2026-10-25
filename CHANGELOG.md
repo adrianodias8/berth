@@ -6,6 +6,9 @@ are in the commit messages.
 ## Unreleased
 
 ### 2026-10-25
+- **Releases** attach the guest kernel's exact source
+  (`berth-kernel-<release>-source.tar`: kernel.org's tarball, berth's patch,
+  config and build scripts), as GPL-2.0 asks.
 - **README:** a Performance section from a fresh run against OrbStack
   (`bench/results/2026-10-25-showcase.md`), a DDEV + Drupal CMS example,
   screenshots retaken with the example.
