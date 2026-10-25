@@ -27,16 +27,10 @@
 //! which is what makes this faster than Apple's share. The second half is
 //! inside the framework; nothing in the API controls it.
 //!
-//! Threads don't help: APFS serializes metadata changes (serving goes from
-//! 15 to 19 µs per request under concurrency) and the hand-off costs more
-//! than it overlaps, so 4 parallel extractions get ~10% slower. Same for
-//! extra request queues.
-//!
-//! Results (M2 Max, 20k x 1 KB files as guest root, 10 s caching), seconds,
-//! Apple's share vs this one: extract 7.8 / 7.3, cold read 4.1 / 2.3, delete
-//! 2.6 / 2.7; 4 in parallel: extract 19.1 / 12.8, read 8.6 / 3.7, delete
-//! 6.6 / 5.6. 2 GiB file: write 1.6 / 2.1 GB/s, read 2.9 / 3.5 GB/s.
-//! OrbStack's bind mounts extract the same files in ~2.3 s.
+//! With the polling driver, concurrent requests are served on GCD worker
+//! threads (BERTH_FS_THREADS): APFS creates scale only ~2x, but that's what
+//! Composer's parallel unzips need. Extra request queues don't help.
+//! Current numbers against Apple's share and OrbStack: docs/file-sharing.md.
 //!
 //! Requests per file are set by the guest kernel and the tool: tar costs 5
 //! (LOOKUP, CREATE, WRITE, SETATTR, GETATTR of the directory), Composer ~12

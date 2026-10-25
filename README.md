@@ -95,8 +95,7 @@ berth config set memory_mib 8192        # settings (also in the app); berth rest
   already-used pages back to macOS; see "Limits".)
 - ASIF disk image on macOS 26+: deleting images and containers frees disk space
   on the Mac. VM data is excluded from Time Machine.
-
-- **Alternative engines** next to Docker: `berth engine enable podman` (Debian's
+- Alternative engines next to Docker: `berth engine enable podman` (Debian's
   Podman 5, API at `~/.berth/run/podman.sock`, the macOS `podman` client with a
   default `berth` connection) and `berth engine enable nerdctl` (nerdctl + BuildKit
   on the containerd Docker already runs, in its own namespace; `nerdctl` on the Mac
@@ -104,8 +103,9 @@ berth config set memory_mib 8192        # settings (also in the app); berth rest
   published ports, domains, container IPs and `host.docker.internal`.
 
 **Networking**
-- Published ports (`-p 8080:80`, TCP and UDP) on the Mac, IPv4 and IPv6, following
-  Docker's bind address
+- Published ports (`-p 8080:80`, TCP and UDP) on the Mac, IPv4 and IPv6. They
+  follow Docker's bind address (`-p 8080:80` is on the LAN, as with Docker);
+  `"ports": "localhost"` keeps them on the Mac
 - Host networking: servers in `--net host` containers are on the Mac's
   `localhost` at the port they open, no `-p` needed (loopback-only servers stay
   loopback-only on the Mac)
@@ -113,8 +113,6 @@ berth config set memory_mib 8192        # settings (also in the app); berth rest
   Settings): Docker networks get IPv6 subnets, NAT'd out of the VM. Reaching the
   internet over IPv6 needs IPv6 on the Mac; without it, IPv6 works between
   containers, the VM and the Mac
-- Published ports follow Docker's bind address (`-p 8080:80` is on the LAN, as with
-  Docker); `"ports": "localhost"` keeps them on the Mac
 - Docker pulls and pushes trust the CA certificates the Mac trusts (a company
   root, a TLS-inspecting proxy, a private registry), and use the Mac's proxy settings (`"proxy"`: auto, none or a URL;
   a change applies at the next start)
@@ -519,13 +517,14 @@ discussions) and the limits above:
 
 MIT (`LICENSE`), except the guest kernel module in `guest/kmod/` and the
 kernel patches in `guest/kernel/`, which are derived from Linux and are
-GPL-2.0. The kernel shipped in Berth.app is Linux (GPL-2.0), built
+GPL-2.0 (`guest/LICENSE-GPL-2.0`). The kernel shipped in Berth.app is Linux (GPL-2.0), built
 from kernel.org's source by `guest/kernel/build.sh`.
 
 ## Compatibility notes
 
-berth matches OrbStack's documented and externally observable behavior. It
-contains no OrbStack code: it was written from OrbStack's public documentation and
-by observing a running install from the outside (names it answers, addresses,
-routes). Where OrbStack relies on a macOS entitlement Apple grants only to approved
+berth matches OrbStack's documented and observable behavior. It contains no
+OrbStack code: it was written from OrbStack's public documentation and by
+observing a running install (names it answers, addresses, routes, timings, and
+the settings its running Linux kernel reports, such as its boot options). No
+OrbStack binary was decompiled, disassembled or translated. Where OrbStack relies on a macOS entitlement Apple grants only to approved
 developers (its per-network vmnet interfaces), berth uses a root route helper instead. OrbStack is a trademark of its owner; berth is not affiliated with it.

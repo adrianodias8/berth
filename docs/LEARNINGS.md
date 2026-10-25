@@ -7,11 +7,12 @@ something here stops being true, fix it.
 ## Ground rules
 
 - berth is a clean-room project. It's built from OrbStack's public
-  documentation and by observing a running OrbStack from the outside (names it
-  answers, routes, mounts, timings). Never copy, decompile or translate
-  OrbStack code or binaries.
-- Measure before optimizing. Several "obvious" wins (threads, more queues,
-  write-back caching, bigger poll windows) measured as neutral or worse.
+  documentation and by observing a running OrbStack (names it answers,
+  routes, mounts, timings, what its running kernel reports in `/proc`).
+  Never copy, decompile or translate OrbStack code or binaries.
+- Measure before optimizing. Several "obvious" wins (more queues, write-back
+  caching, bigger poll windows) measured as neutral or worse, and threads
+  only paid off once the guest driver stopped polling from every CPU.
 
 ## Virtualization.framework
 
@@ -247,9 +248,9 @@ something here stops being true, fix it.
   - working through open file descriptors rather than paths;
   - negative-entry caching;
   - not echoing the guest's own writes back to it.
-- **APFS:** creating a file costs ~53 µs however you call it (path lookup is
-  ~4.5 µs of that). Concurrent metadata changes don't scale: serving goes from
-  ~13 to ~18 µs per request with 4 threads, so threads barely help.
+- **APFS:** creating a file costs ~42-53 µs however you call it (path lookup
+  is ~4.5 µs of that). Concurrent creates scale only ~2x: natively, 8 threads
+  create 16k files in 0.64 s, one thread 2k in ~0.13 s.
 - **FUSE flag traps:**
   - `FUSE_ATOMIC_O_TRUNC` plus no-open mode loses truncation: a rewritten,
     shorter file keeps its old tail. That corrupted `composer.json`.
@@ -375,10 +376,11 @@ something here stops being true, fix it.
 | DDEV drush site:install | 31.7–36.3 s | 36.7–37.4 s |
 
 (`bench/results/2026-10-24-compare.md`; startup, idle CPU and DDEV
-re-measured on 2026-10-25, `bench/results/2026-10-23-ddev-drupal.md`.
-OrbStack's figures are from 2026-10-24.)
+re-measured on 2026-10-25, `bench/results/2026-10-23-ddev-drupal.md`;
+Composer and memory in `bench/results/2026-10-25-*.md`, both engines
+measured the same day.)
 
-Neither returns workload memory to macOS within 2 minutes. Docker volumes are
+Neither returns workload memory to macOS within 3 minutes. Docker volumes are
 ~15x faster than any bind mount (they live on the VM's own disk).
 
 ## Testing pitfalls we hit

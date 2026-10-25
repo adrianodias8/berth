@@ -7,8 +7,9 @@ up, the layout, the rules, and how changes get tested.
 ## The one hard rule: clean room
 
 berth must not contain OrbStack code. Work only from OrbStack's public
-documentation and from observing a running install from the outside (what
-it answers on the network, what it mounts, how long things take). Don't
+documentation and from observing a running install (what it answers on the
+network, what it mounts, how long things take, what its running Linux kernel
+reports in `/proc` and `/sys`). Don't
 decompile, disassemble or translate its binaries, and don't paste code from
 it. If you're unsure whether something crosses the line, ask in your pull
 request before writing it.
@@ -163,4 +164,5 @@ without them it publishes an ad-hoc prerelease.
 
 By contributing you agree your work is released under the MIT license
 (`LICENSE`), except changes to `guest/kmod/` and the kernel patches in
-`guest/kernel/`, which are GPL-2.0 like the Linux code they derive from.
+`guest/kernel/`, which are GPL-2.0 (`guest/LICENSE-GPL-2.0`) like the Linux
+code they derive from.

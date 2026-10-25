@@ -43,7 +43,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading) {
                     LabeledContent("Memory limit", value: "\(memoryGiB) GiB")
                     Slider(value: memoryBinding, in: 2...Double(max(hostMemoryGiB - 2, 4)), step: 1)
-                    Text("A ceiling, not a reservation: the VM returns memory it isn't using.")
+                    Text("A ceiling, not a reservation: the VM only takes what it uses. What it has used stays with it until it restarts.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27 {
