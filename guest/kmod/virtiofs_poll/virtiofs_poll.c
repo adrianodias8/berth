@@ -14,7 +14,9 @@
  *    into the guest costs more than most replies take to produce;
  *  - a chmod to the mode a file already has, while its cached attributes
  *    are still valid, is answered here without a round trip (tools like
- *    Composer chmod every file they write two or three times).
+ *    Composer chmod every file they write two or three times);
+ *  - ioctls are answered here too: berth's host implements none (see
+ *    local_ioctls).
  */
 
 #include <linux/fs.h>
@@ -71,6 +73,7 @@ struct virtio_fs_vq {
 	struct completion in_flight_zero; /* No inflight requests */
 	struct kobject *kobj;
 	char name[VQ_NAME_LEN];
+	atomic_t polling;	/* berth: a CPU is polling (virtio_fs_send_req) */
 } ____cacheline_aligned_in_smp;
 
 /* A virtio-fs device instance */
@@ -1499,10 +1502,11 @@ module_param(poll_us, uint, 0644);
 MODULE_PARM_DESC(poll_us, "Microseconds to poll for a reply before waiting for the interrupt (0: never poll)");
 
 /* berth: how polling went, for tuning (read-only parameters). */
-static unsigned long poll_hits, poll_misses, poll_skipped, poll_hit_ns;
+static unsigned long poll_hits, poll_misses, poll_skipped, poll_hit_ns, poll_shared;
 module_param(poll_hits, ulong, 0444);
 module_param(poll_misses, ulong, 0444);
 module_param(poll_skipped, ulong, 0444);
+module_param(poll_shared, ulong, 0444);
 module_param(poll_hit_ns, ulong, 0444);
 
 /*
@@ -1550,12 +1554,20 @@ static void virtio_fs_poll_reply(struct virtio_fs_vq *fsvq, struct fuse_req *req
 	virtio_fs_requests_done_work(&fsvq->done_work);
 }
 
-/* berth: answer no-op chmods locally (see the top of the file). */
+/* berth: answer no-op chmods and ioctls locally (see the top of the file). */
 static unsigned int skip_noop_chmod = 1;
 module_param(skip_noop_chmod, uint, 0644);
 MODULE_PARM_DESC(skip_noop_chmod, "Answer chmods that change nothing without asking the host (0: off)");
 static unsigned long noop_chmods;
 module_param(noop_chmods, ulong, 0444);
+/*
+ * berth: the host answers every ioctl with ENOSYS (src/fuse.rs), which
+ * fuse_send_ioctl() turns into ENOTTY, so ask it nothing. musl's fopen()
+ * asks each file it opens for writing for its terminal size: one round trip
+ * per file unzip writes in an Alpine container.
+ */
+static unsigned long local_ioctls;
+module_param(local_ioctls, ulong, 0444);
 
 static int virtio_fs_inode_is(struct inode *inode, void *nodeid)
 {
@@ -1582,6 +1594,15 @@ static bool virtio_fs_answer_locally(struct fuse_req *req)
 	u32 left_nsec;
 	bool same, stale;
 
+	if (req->in.h.opcode == FUSE_IOCTL && !test_bit(FR_BACKGROUND, &req->flags) &&
+	    test_bit(FR_ISREPLY, &req->flags)) {
+		req->out.h.error = -ENOTTY;
+		req->out.h.unique = req->in.h.unique;
+		req->out.h.len = sizeof(req->out.h);
+		WRITE_ONCE(local_ioctls, local_ioctls + 1);
+		fuse_request_end(req);
+		return true;
+	}
 	if (!READ_ONCE(skip_noop_chmod) || req->in.h.opcode != FUSE_SETATTR ||
 	    test_bit(FR_BACKGROUND, &req->flags) || !test_bit(FR_ISREPLY, &req->flags) ||
 	    args->in_numargs != 1 || args->in_args[0].size != sizeof(*in) ||
@@ -1702,12 +1723,21 @@ static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 	 * flush_bg_queue()) and expecting a reply (not notify replies). That
 	 * caller holds a reference and sleeps right after, so it may spin.
 	 * (preemptible() can't tell: Debian's kernel has no preempt count.)
+	 *
+	 * One CPU polls a queue at a time. It ends every reply that comes in
+	 * meanwhile, so the others sleep and are woken by it; eight polling
+	 * together kept taking fsvq->lock from those sending, and served eight
+	 * threads' file creates at half the rate of no polling at all.
 	 */
-	if (READ_ONCE(poll_us) && !test_bit(FR_BACKGROUND, &req->flags) &&
-	    test_bit(FR_ISREPLY, &req->flags))
-		virtio_fs_poll_reply(fsvq, req);
-	else
+	if (!READ_ONCE(poll_us) || test_bit(FR_BACKGROUND, &req->flags) ||
+	    !test_bit(FR_ISREPLY, &req->flags))
 		WRITE_ONCE(poll_skipped, poll_skipped + 1);
+	else if (atomic_xchg(&fsvq->polling, 1))
+		WRITE_ONCE(poll_shared, poll_shared + 1);
+	else {
+		virtio_fs_poll_reply(fsvq, req);
+		atomic_set(&fsvq->polling, 0);
+	}
 }
 
 static const struct fuse_iqueue_ops virtio_fs_fiq_ops = {

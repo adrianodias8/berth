@@ -12,6 +12,12 @@ are in the commit messages.
   failed; a new VM's first boot skips building the file driver that
   berth's kernel has built in; restoring a saved state clears all boot
   markers.
+- **Composer ~10 % faster, now ~1.1x OrbStack** (Drupal CMS `composer
+  install` 8.5–9.0 -> 7.2–7.7 s, OrbStack 6.5–7.0 s). The polling driver
+  lets one CPU poll a queue at a time (eight threads creating files: 1.98 ->
+  0.93 s, OrbStack 0.75 s) and answers ioctls itself (musl's `fopen()`
+  asked each file it wrote whether it was a terminal); the host closes
+  files on a thread of its own.
 - **Small-file reads 2x faster:** readahead is no longer sent as background
   requests with the polling driver (each waited for an interrupt), and files
   are opened read-only until written. 20k files read in 0.75 s instead of

@@ -194,8 +194,9 @@ images, volumes, networks, Kubernetes, machines, terminals, logs, files and stat
 - Before macOS 27 (Apple's virtiofs), small-file I/O on bind mounts is ~3.5x
   slower than OrbStack, and DDEV's `composer create-project` fails (the project
   folder shows as root-owned in containers).
-- On berth's own share, Composer is still ~1.3x slower than OrbStack (DDEV
-  Drupal CMS `composer install` 8.2–8.9 s vs 6.6 s); `drush site:install`
+- On berth's own share, Composer is still ~1.1x slower than OrbStack (Drupal
+  CMS `composer install` 7.2–7.7 s vs 6.5–7.0 s, in DDEV 7.3–7.6 s vs 6.6 s);
+  `drush site:install`
   (31.7–36.3 s vs 36.7–37.4 s) and page loads are on par or faster
   (`bench/results/2026-10-23-ddev-drupal.md`).
 - Memory used by a workload isn't returned to macOS after it ends (OrbStack in the

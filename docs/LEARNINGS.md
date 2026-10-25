@@ -286,6 +286,18 @@ something here stops being true, fix it.
   the parent directory (`openat`) or without `O_NOFOLLOW_ANY` is no faster.
 - **Inode numbers are per device**: a share spanning mounts (`/Volumes`)
   needs the device in its node IDs.
+- **musl asks every file it opens for writing whether it's a terminal**
+  (`TIOCGWINSZ`, to pick line buffering). On FUSE every ioctl is a round
+  trip, even when the server answers none: `unzip` in Alpine images made
+  one per file. Answer them in the guest driver.
+- **Several CPUs polling one virtqueue** fight over its lock with the CPUs
+  submitting: eight threads creating files went at half the rate of no
+  polling. One poller per queue, ending everyone's replies, fixed it.
+  Find this kind of thing with a per-operation test from 1 and 8 threads
+  against OrbStack (`bench/fs/parallel-creates.sh`): single-threaded they
+  were equal, which hid it.
+- **Closing a file on APFS costs ~6 µs** (more under load): do it on a
+  thread of its own when nothing waits for it.
 - **Dead ends:**
   - an NFS server over the VM network (the nfsserve prototype spun the CPU
     and was slow);
@@ -336,7 +348,8 @@ something here stops being true, fix it.
 | localhost forward | ~20 Gbit/s | ~31 Gbit/s |
 | bind-mount extract (20k files) | 7.9 s (Apple's) / 2.4–2.7 s (own share + polling) | 2.3 s |
 | bind-mount read (20k files, in the container) | 0.75 s (1.6 s with async readahead) | 0.63 s |
-| DDEV composer install | 8.2–8.9 s (own share + polling) | 6.6 s |
+| composer install, Drupal CMS (`bench/fs/composer.sh`) | 7.2–7.7 s | 6.5–7.0 s |
+| DDEV composer install | 7.3–7.6 s (own share + polling) | 6.6 s |
 | DDEV drush site:install | 31.7–36.3 s | 36.7–37.4 s |
 
 (`bench/results/2026-10-24-compare.md`; startup, idle CPU and DDEV
@@ -364,6 +377,10 @@ Neither returns workload memory to macOS within 2 minutes. Docker volumes are
 - **busybox tar creates files with O_CREAT|O_EXCL|O_NOFOLLOW**, and macOS
   rejects O_NOFOLLOW together with O_NOFOLLOW_ANY (EINVAL). A benchmark that
   doesn't check a step's status times its failure.
+- **The Mac's own load moves results by 10-20 %:** OrbStack's Composer
+  install measured 6.7 s and 7.9 s an hour apart. Alternate the engines
+  run by run, and keep benchmark folders out of Spotlight (a name ending in
+  `.noindex`): it indexed the 31k files of each run.
 - **Never `rm` a script while it runs,** or a cleanup path inside your own
   benchmark folder.
 - **Timing:** `bash`'s `time` on a subshell with `exec 2>/dev/null` prints

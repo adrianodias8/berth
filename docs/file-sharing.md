@@ -77,7 +77,7 @@ guest app ─ syscall ─ Linux FUSE ─ virtio-fs driver ═ virtqueue ═ Virt
 
 Most of a request's time was the framework delivering the reply interrupt
 back into the guest. The polling driver is Linux's `fs/fuse/virtio_fs.c`
-with three changes (marked `berth:`): built into berth's kernel (7.2,
+with these changes (marked `berth:`): built into berth's kernel (7.2,
 `guest/kernel/virtiofs_poll-7.2.patch`), or as a module on Debian's 6.12
 (`guest/kmod/virtiofs_poll/`, a copy of 6.12's file):
 
@@ -89,6 +89,11 @@ with three changes (marked `berth:`): built into berth's kernel (7.2,
    back to the interrupt.
    - Only requests sent by `__fuse_request_send()` poll: not background
      ones, which can be sent holding `fc->bg_lock`.
+   - One CPU polls a queue at a time and ends every reply that comes in
+     meanwhile; the others sleep until it wakes them (counter
+     `poll_shared`). With eight polling at once, the queue's lock was so
+     contended that eight threads creating files went at half the rate of
+     no polling at all (1.98 s against 0.93 s now, OrbStack 0.75 s).
    - Debian's kernel has no preempt count, so `preemptible()` can't be used
      as the guard.
 
@@ -97,6 +102,11 @@ with three changes (marked `berth:`): built into berth's kernel (7.2,
    not changing), is answered from the inode without a round trip
    (`skip_noop_chmod`, counter `noop_chmods`). Composer chmods every file it
    writes two or three times.
+4. **ioctls answered in the guest** with ENOTTY (counter `local_ioctls`).
+   The host implements none: its ENOSYS became ENOTTY in the kernel anyway.
+   musl's `fopen()` asks every file it opens for writing for its terminal
+   size, so `unzip` in an Alpine container made one round trip per file
+   for it.
 
 A round trip went from ~180 µs to ~18 µs (Apple's share: ~34 µs).
 
@@ -157,8 +167,8 @@ to mount would leave a VM that never comes up:
 | `BERTH_FS_TRACE` | off | log every request (opcode, node, name) |
 
 Guest side: `/sys/module/virtiofs_poll/parameters/poll_us` (writable), and
-the counters `poll_hits`, `poll_misses`, `poll_skipped` and `poll_hit_ns`
-(`bench/fs/poll-stats.sh`).
+the counters `poll_hits`, `poll_misses`, `poll_skipped`, `poll_shared`,
+`poll_hit_ns`, `local_ioctls` and `noop_chmods` (`bench/fs/poll-stats.sh`).
 
 ### Measuring
 
@@ -168,6 +178,8 @@ bench/fs/run.sh berth                                 # the default share
 bench/fs/run.sh apple BERTH_FILE_SHARING=apple
 berth shell -- python3 $PWD/bench/fs/latency.py ~/.berth-fsbench/small.tar   # with 0 timeouts, see the script
 bench/fs/in-container.sh [context]                    # extract, read, delete in a container
+bench/fs/composer.sh [context] [runs]                 # composer install, Drupal CMS, warm cache
+bench/fs/parallel-creates.sh [context]                # per-operation times, 1 and 8 threads
 bench/ddev-drupal.sh <label>                          # DDEV + Drupal CMS, see bench/results
 ```
 
@@ -181,7 +193,9 @@ DDEV re-measured on 2026-10-24, `bench/results/2026-10-24-compare.md`):
 | read all 20k files (`compare.sh`) | 2.9 | – | 2.0 | 0.8 |
 | the same, in the container (`in-container.sh`, 2026-10-25) | – | – | **0.75** (1.6 before) | 0.63 |
 | 4 parallel extracts | 20.4 | 12.8 | 7.7 | – |
-| DDEV `composer install` | fails* | 16 | 8.2–8.9 | 6.6 |
+| `composer install`, Drupal CMS, 31k files (`composer.sh`, 2026-10-25) | – | – | **7.2–7.7** (8.5–9.0 before) | 6.5–7.0 |
+| 8 threads creating 2,000 files each (`parallel-creates.sh`) | – | – | **0.9** (2.0 before) | 0.75 |
+| DDEV `composer install` | fails* | 16 | 7.3–7.6 (8.2–8.9 before) | 6.6 |
 | DDEV `drush site:install` | fails* | 67 | 31.7–36.3 (berth's 7.2 kernel) | 37 |
 
 \* `create-project` aborts on Apple's share (ownership), so the later steps
@@ -197,11 +211,12 @@ can't run.
   `FUSE_ASYNC_READ`): as background requests the driver doesn't wait on
   them, and each waited for an interrupt (1.6 s for the 20k files instead
   of 0.75). Big sequential reads were no slower.
-- Composer is still ~1.3x behind OrbStack. It sends ~10 requests per file
-  (the guest kernel and Composer decide that), among them a create and a
-  timestamp set that must reach APFS, which barely scales with threads:
-  creating a file costs ~55 µs on one thread and ~41 µs on eight
-  (2026-10-24), and ~99 µs under Composer's parallel writes.
+- Composer is ~1.1x behind OrbStack (7.2–7.7 s against 6.5–7.0 s, runs
+  alternated). It sends ~9 requests per file (the guest kernel and Composer
+  decide that), one at a time for the most part, among them a create that
+  must reach APFS: ~42 µs natively, ~63 µs in berth under Composer's load
+  (the Mac's cores are busy with the VM's). Closing files is done on a
+  thread of its own, off the requests.
 - `drush site:install` (on OrbStack too) takes either ~35 s or ~45 s from
   run to run; compare like with like.
 - Cache coherency relies on FSEvents: a change on the Mac reaches the guest

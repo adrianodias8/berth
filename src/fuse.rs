@@ -87,6 +87,21 @@ const MAX_WRITE: u32 = 1 << 20;
 /// Files kept open for no-open reads and writes; past this the oldest are
 /// closed (the kernel never says when it's done with them).
 const MAX_CACHED_FILES: usize = 4096;
+
+/// Close `file` on a thread of its own: nothing waits for a close, and on
+/// APFS one costs as much as a small write. Composer's creates evict cached
+/// files from the 4096th on, and it forgets the nodes it's done with.
+fn close_later(file: Option<Arc<fs::File>>) {
+    static CLOSER: std::sync::OnceLock<std::sync::mpsc::Sender<Arc<fs::File>>> = std::sync::OnceLock::new();
+    let Some(file) = file else { return };
+    let closer = CLOSER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Arc<fs::File>>();
+        std::thread::Builder::new().name("fuse-close".into()).spawn(move || rx.into_iter().for_each(drop)).expect("closer thread");
+        tx
+    });
+    // If the thread is gone, the file closes here as it's handed back.
+    let _ = closer.send(file);
+}
 /// Async requests (readahead, writeback) the kernel may have in flight.
 const MAX_BACKGROUND: u16 = 64;
 
@@ -638,6 +653,7 @@ impl Server {
                 self.readdir(nodeid, fh, offset, size, true)
             }
             op::ACCESS => self.path(nodeid).map(|_| Vec::new()),
+            // IOCTL among them: the polling driver answers those itself (local_ioctls).
             _ => Err(lerr::ENOSYS),
         };
         // The guest caches names and attributes, so it may refer to a file
@@ -787,7 +803,7 @@ impl Server {
             if node.lookups == 0 {
                 let node = nodes.remove(&nodeid);
                 drop(nodes);
-                drop(node);
+                close_later(node.and_then(|n| n.file));
             }
         }
     }
@@ -842,7 +858,7 @@ impl Server {
             node.lookups += 1;
             stale
         };
-        drop(stale);
+        close_later(stale);
         let p = self.policy;
         let mut out = Out::default();
         out.u64(nodeid)
@@ -1154,8 +1170,6 @@ impl Server {
         Ok(body)
     }
 
-    /// The file for a read or write: the open handle, or with no-open the
-    /// node's own file, opened read-write (read-only if that's all we may).
     /// The open file for a request: its handle's, else the node's, opened
     /// read-write only for a write (on macOS that costs twice a read-only
     /// open, and most files are only read; `write` reopens one that was).
@@ -1179,8 +1193,7 @@ impl Server {
     fn reopen_writable(&self, nodeid: u64) -> Result<Arc<fs::File>, i32> {
         let path = self.path(nodeid)?;
         let file = Arc::new(Self::open_file(&path, 2, 0)?);
-        let old = self.nodes.shard(nodeid).get_mut(&nodeid).and_then(|n| n.file.replace(file.clone()));
-        drop(old);
+        close_later(self.nodes.shard(nodeid).get_mut(&nodeid).and_then(|n| n.file.replace(file.clone())));
         Ok(file)
     }
 
@@ -1201,15 +1214,11 @@ impl Server {
             let over = cached.len().saturating_sub(MAX_CACHED_FILES);
             cached.drain(..over).collect()
         };
-        // Taken one shard at a time, closed with no lock held.
-        let evicted: Vec<_> = oldest
-            .into_iter()
-            .filter_map(|old| {
-                // A nameless node's file can't be reopened: keep it.
-                self.nodes.shard(old).get_mut(&old).filter(|n| !n.path.as_os_str().is_empty()).and_then(|n| n.file.take())
-            })
-            .collect();
-        drop(evicted);
+        // Taken one shard at a time.
+        for old in oldest {
+            // A nameless node's file can't be reopened: keep it.
+            close_later(self.nodes.shard(old).get_mut(&old).filter(|n| !n.path.as_os_str().is_empty()).and_then(|n| n.file.take()));
+        }
         file
     }
 
