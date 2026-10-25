@@ -5,8 +5,9 @@ spirit of OrbStack. Written in Rust on top of Apple's Virtualization.framework.
 
 ## Why
 
-berth is highly inspired by DHH's talk about rewriting any app with AI and Rust.
-OrbStack is a great piece of software, but it's closed source, so I wanted to see
+berth is inspired by DHH's Rails World 2026 keynote, where he described
+37signals rebuilding HEY on a Rust backend, with AI agents writing the code
+and people specifying and reviewing it. OrbStack is a great piece of software, but it's closed source, so I wanted to see
 how far an open-source take on the same idea could go: built with AI assistance,
 written in Rust, and matching OrbStack's behavior from the outside rather than
 from its code.
@@ -67,6 +68,81 @@ berth import orbstack                   # or docker-desktop: images, volumes, ne
 berth snapshot create before-upgrade    # the whole VM, instantly; berth snapshot restore before-upgrade
 berth config set memory_mib 8192        # settings (also in the app); berth restart applies them
 ```
+
+### Example: Drupal CMS with DDEV
+
+DDEV works as it does on OrbStack, with the project folder bind-mounted from
+the Mac. berth's file sharing is fast enough that DDEV doesn't need Mutagen:
+
+```sh
+mkdir drupal-cms && cd drupal-cms
+ddev config --project-type=drupal11 --docroot=web
+printf 'performance_mode: none\n' > .ddev/config.local.yaml   # survives Drupal CMS's own config
+ddev start
+ddev composer create-project drupal/cms
+ddev drush site:install --yes
+open http://drupal-cms.ddev.site
+```
+
+![Drupal CMS served by DDEV on berth](docs/images/drupal-site.png)
+
+The project's containers show up in the app, grouped by project (see
+[In pictures](#in-pictures)). How fast this runs next to OrbStack is under
+[Performance](#performance).
+
+## Performance
+
+berth against OrbStack 2.2.5 on the same Mac (M2 Max, 32 GiB, macOS 27),
+each engine running alone, measured on 2026-10-25. Ranges are over several
+runs; **bold** marks a clear win.
+
+**Engine**
+
+| | berth | OrbStack |
+|---|---|---|
+| Start, stopped → Docker ready | **2.9–3.2 s** | 2.2–6.4 s |
+| Idle CPU (VM, 60 s average) | **1.9 %** | 2.3 % |
+| Mac memory after a 4 GiB container workload | **+2.2 GB** | +3.8 GB |
+| `docker run` overhead (mean of 10) | 0.34 s | **0.25 s** |
+| DNS lookup from a container | **0.75 ms** | 0.95 ms |
+
+**DDEV + Drupal CMS** (39k files on a bind mount, no Mutagen)
+
+| | berth | OrbStack |
+|---|---|---|
+| `ddev composer create-project` | 12.2–12.8 s | 11.1–11.5 s |
+| `ddev composer install` | 7.3–7.5 s | 6.5–7.4 s |
+| `ddev drush site:install` | 36.4–43.1 s | 36.2–45.4 s |
+| First page after restart | 1.9–2.4 s | 1.9–2.1 s |
+| Page, warm | 16–18 ms | 13–15 ms |
+
+**File sharing** (bind mount from the Mac, 20,000 × 1 KB files)
+
+| | berth | OrbStack | Apple's virtiofs |
+|---|---|---|---|
+| Extract | 2.3–2.6 s | 2.1–2.3 s | 7.5–7.9 s |
+| Read all | 0.6–1.0 s | 0.6–0.8 s | |
+| Delete | 1.4–1.8 s | 1.2–1.4 s | |
+
+**Network**
+
+| | berth | OrbStack |
+|---|---|---|
+| Download via a container's domain | **44.7 Gbit/s** | 30.0 Gbit/s |
+| Download via a published localhost port | 24.1 Gbit/s | **29.4 Gbit/s** |
+| Mac → container (`host.docker.internal`) | 25.8 Gbit/s | **30.1 Gbit/s** |
+| `docker build`, 5k-file context | 3.8 s | **2.6 s** |
+
+In short: berth starts faster, idles lighter and keeps less memory after a
+heavy workload. Real projects such as DDEV and Drupal run at about the same
+speed on both. OrbStack is still ahead on raw file I/O (1.2–1.6x), on
+`docker build` context uploads and on starting a container. Apple's own
+file sharing, which berth uses before macOS 27, is ~3x slower than both.
+
+Every number comes from scripts in `bench/` and is recorded in
+`bench/results/` (this run: `2026-10-25-1741.md` and
+`2026-10-25-showcase.md`), with the dead ends in `docs/LEARNINGS.md`.
+Memory figures are system-wide and move by a few hundred MB with other apps.
 
 ## Features
 
@@ -267,8 +343,8 @@ its own. Closing the window keeps it in the menu bar.
 
 ### In pictures
 
-Containers are grouped by Compose project. Each one shows its domains, IP and
-ports. The ports and domains are links.
+Containers are grouped by Compose project, here the DDEV example above. Each
+one shows its domains, IPs and ports. The ports and domains are links.
 
 ![Container info](docs/images/container-info.png)
 

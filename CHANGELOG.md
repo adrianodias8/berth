@@ -6,6 +6,9 @@ are in the commit messages.
 ## Unreleased
 
 ### 2026-10-25
+- **README:** a Performance section from a fresh run against OrbStack
+  (`bench/results/2026-10-25-showcase.md`), a DDEV + Drupal CMS example,
+  screenshots retaken with the example.
 - **Fixes:** disks under `/Volumes` no longer share file IDs (two disks'
   root folders were both inode 2); a stop during boot no longer counts as a
   failed kernel start; a rebuilt kernel is tried again after an earlier one
