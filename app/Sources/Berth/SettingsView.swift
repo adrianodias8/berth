@@ -58,6 +58,14 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 VStack(alignment: .leading) {
+                    Picker("Image store", selection: Binding(get: { config.imageStore ?? "classic" }, set: { config.imageStore = $0 == "classic" ? nil : $0 })) {
+                        Text("Docker's (faster builds)").tag("classic")
+                        Text("containerd").tag("containerd")
+                    }
+                    Text("containerd's store holds multi-platform images. Each store lists only its own images.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading) {
                     Picker("Proxy for Docker", selection: $proxyMode) {
                         Text("The Mac's settings").tag("auto")
                         Text("None").tag("none")

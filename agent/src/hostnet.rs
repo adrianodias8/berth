@@ -64,6 +64,8 @@ pub fn setup() {
 ///   refuses to start on unknown keys.
 /// - IPv6 for containers when the `ipv6` setting is on (ipv6.rs), docker-ce
 ///   only as well.
+/// - Where images are kept: the `image_store` setting (imagestore.rs),
+///   docker-ce only.
 pub fn configure_docker() -> io::Result<()> {
     let mut config: serde_json::Map<String, serde_json::Value> = match std::fs::read(DOCKER_CONFIG) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other)?,
@@ -76,6 +78,7 @@ pub fn configure_docker() -> io::Result<()> {
         config.insert("allow-direct-routing".into(), serde_json::Value::Bool(true));
         let ipv6 = crate::ipv6::enabled();
         crate::ipv6::apply(&mut config, ipv6);
+        crate::imagestore::apply(&mut config, crate::imagestore::containerd());
         if let Err(err) = crate::ipv6::configure_network(ipv6) {
             eprintln!("berth-agent: ipv6: {err}");
         }

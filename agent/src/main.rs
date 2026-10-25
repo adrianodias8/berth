@@ -41,6 +41,7 @@ mod engine;
 mod engines;
 mod files;
 mod hostnet;
+mod imagestore;
 mod inroot;
 mod ipv6;
 mod k8s;
@@ -141,6 +142,14 @@ fn main() {
 ///   bound in) is mounted;
 /// - before Docker starts, the CA certificates the Mac trusts (src/cacerts.rs,
 ///   next to this binary on the home share) go into Debian's trust store.
+/// A setting from berth's config.json, which sits next to the guest folder
+/// the agent runs from (~/.berth/guest/berth-agent).
+pub(crate) fn setting(key: &str) -> Option<serde_json::Value> {
+    let exe = std::env::current_exe().ok()?;
+    let bytes = std::fs::read(exe.parent()?.parent()?.join("config.json")).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes).ok()?.get(key).cloned()
+}
+
 fn install_guest_files() {
     // Our own path goes into root's scripts and units: only plain characters.
     let agent = std::env::current_exe().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();

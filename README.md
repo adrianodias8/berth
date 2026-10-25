@@ -104,6 +104,7 @@ runs; **bold** marks a clear win.
 | Idle CPU (VM, 60 s average) | **1.9 %** | 2.3 % |
 | Mac memory after a 4 GiB container workload | **+2.2 GB** | +3.8 GB |
 | `docker run` overhead (mean of 10) | 0.34 s | **0.25 s** |
+| `docker build`, no cache, 5k-file context | 2.2–2.8 s | 2.6–3.2 s |
 | DNS lookup from a container | **0.75 ms** | 0.95 ms |
 
 **DDEV + Drupal CMS** (39k files on a bind mount, no Mutagen)
@@ -131,12 +132,11 @@ runs; **bold** marks a clear win.
 | Download via a container's domain | **44.7 Gbit/s** | 30.0 Gbit/s |
 | Download via a published localhost port | 24.1 Gbit/s | **29.4 Gbit/s** |
 | Mac → container (`host.docker.internal`) | 25.8 Gbit/s | **30.1 Gbit/s** |
-| `docker build`, 5k-file context | 3.8 s | **2.6 s** |
 
 In short: berth starts faster, idles lighter and keeps less memory after a
 heavy workload. Real projects such as DDEV and Drupal run at about the same
-speed on both. OrbStack is still ahead on raw file I/O (1.2–1.6x), on
-`docker build` context uploads and on starting a container. Apple's own
+speed on both, and so do builds. OrbStack is still ahead on raw file I/O
+(1.2–1.6x) and on starting a container. Apple's own
 file sharing, which berth uses before macOS 27, is ~3x slower than both.
 
 Every number comes from scripts in `bench/` and is recorded in
@@ -334,7 +334,7 @@ its own. Closing the window keeps it in the menu bar.
   stop, restart, rename, delete, info, logs and Open in Finder; a terminal in each,
   and a shell in the VM
 - **Snapshots**: create, restore and delete
-- **Settings**: CPUs, memory, file sharing, IPv6 for containers, Docker's proxy,
+- **Settings**: CPUs, memory, file sharing, IPv6 for containers, the image store, Docker's proxy,
   volumes and machines in Finder, Podman and nerdctl, and whether stopping keeps
   containers running (suspend), merged into `~/.berth/config.json` and applied on
   restart (`docs/configuration.md`); start on app launch, open at login, install the

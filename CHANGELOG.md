@@ -6,6 +6,13 @@ are in the commit messages.
 ## Unreleased
 
 ### 2026-10-25
+- **`docker build` ~1.4 s faster, now on par with OrbStack** (no-cache
+  build 3.8–4.1 -> 2.2–2.8 s, OrbStack 2.6–3.2 s): Docker keeps images in
+  its classic overlay2 store, like OrbStack, instead of Docker 29's
+  containerd store, which compresses and unpacks every layer of each build.
+  `berth config set image_store containerd` (or Settings) keeps containerd's
+  store, for multi-platform images. Each store lists only its own images, so
+  images pulled before this update need pulling again.
 - **Releases** attach the guest kernel's exact source
   (`berth-kernel-<release>-source.tar`: kernel.org's tarball, berth's patch,
   config and build scripts), as GPL-2.0 asks.

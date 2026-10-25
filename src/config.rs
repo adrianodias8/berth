@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use crate::paths::Paths;
 
 /// Name, what it takes, and its default (as `berth config list` shows it).
-const KEYS: [(&str, &str, &str); 9] = [
+const KEYS: [(&str, &str, &str); 10] = [
     ("cpus", "a number of CPUs", "every core"),
     ("memory_mib", "MiB, at least 1024", "half the Mac's memory, 2-16 GiB"),
     ("file_sharing", "berth or apple", "berth (macOS 27)"),
@@ -17,6 +17,7 @@ const KEYS: [(&str, &str, &str); 9] = [
     ("proxy", "auto, none or a URL (http://host:port)", "auto"),
     ("ports", "all or localhost (published ports only on the Mac's loopback)", "all"),
     ("kernel", "berth or debian (the VM's own kernel)", "berth"),
+    ("image_store", "classic or containerd (multi-platform images, slower builds)", "classic"),
 ];
 
 fn parse(key: &str, value: &str) -> Result<Value> {
@@ -38,6 +39,7 @@ fn parse(key: &str, value: &str) -> Result<Value> {
         "stop" if matches!(value, "shutdown" | "suspend") => Value::from(value),
         "ports" if matches!(value, "all" | "localhost") => Value::from(value),
         "kernel" if matches!(value, "berth" | "debian") => Value::from(value),
+        "image_store" if matches!(value, "classic" | "containerd") => Value::from(value),
         "proxy" if matches!(value, "auto" | "none") || value.starts_with("http://") || value.starts_with("https://") => {
             Value::from(value)
         }

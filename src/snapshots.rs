@@ -346,15 +346,24 @@ struct Pending {
     /// The IPv6 setting it was saved with (the agent applies it at boot).
     #[serde(default)]
     ipv6: Option<bool>,
+    /// The image store setting it was saved with (applied at boot too).
+    #[serde(default)]
+    image_store: Option<String>,
+}
+
+fn setting(paths: &Paths, key: &str) -> Option<serde_json::Value> {
+    let bytes = std::fs::read(paths.config()).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes).ok()?.get(key).cloned()
 }
 
 /// The `ipv6` setting in config.json (agent/src/ipv6.rs reads it at boot).
 pub fn ipv6_setting(paths: &Paths) -> bool {
-    std::fs::read(paths.config())
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|v| v["ipv6"].as_bool())
-        .unwrap_or(false)
+    setting(paths, "ipv6").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// The `image_store` setting (agent/src/imagestore.rs reads it at boot).
+pub fn image_store_setting(paths: &Paths) -> String {
+    setting(paths, "image_store").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "classic".into())
 }
 
 /// Put the snapshot's files in place of the VM's (which must be stopped) and,
@@ -392,6 +401,7 @@ pub fn prepare_restore(paths: &Paths, name: &str) -> Result<Meta> {
         share: meta.share.clone(),
         consumed: false,
         ipv6: None,
+        image_store: None,
     };
     write_durably(&restore_marker(paths), &serde_json::to_vec(&pending)?)?;
     Ok(meta)
@@ -411,6 +421,8 @@ pub struct Restore {
     pub consumed: bool,
     /// The IPv6 setting a suspended VM had.
     pub ipv6: Option<bool>,
+    /// The image store setting a suspended VM had.
+    pub image_store: Option<String>,
 }
 
 /// Take the pending restore, if any.
@@ -424,7 +436,15 @@ pub fn take_restore(paths: &Paths) -> Option<Restore> {
         Resources::load(paths)
     };
     let share = pending.state.as_ref().and(pending.share.as_deref()).and_then(crate::virtiofs::HomeShare::parse);
-    Some(Restore { state: pending.state, resources, start: pending.start, share, consumed: pending.consumed, ipv6: pending.ipv6 })
+    Some(Restore {
+        state: pending.state,
+        resources,
+        start: pending.start,
+        share,
+        consumed: pending.consumed,
+        ipv6: pending.ipv6,
+        image_store: pending.image_store,
+    })
 }
 
 /// Where `berth stop` keeps the VM's state for the next start.
@@ -455,6 +475,7 @@ pub async fn suspend(paths: &Paths, res: &Resources) -> Result<()> {
         share: crate::virtiofs::CURRENT.get().map(|s| s.as_str().to_string()),
         consumed: true,
         ipv6: Some(ipv6_setting(paths)),
+        image_store: Some(image_store_setting(paths)),
     };
     write_durably(&restore_marker(paths), &serde_json::to_vec(&pending)?)?;
     Ok(())

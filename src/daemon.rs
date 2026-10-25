@@ -319,7 +319,8 @@ pub fn run(paths: Paths) -> Result<()> {
 
     let mut restore = crate::snapshots::take_restore(&paths);
     // A suspended VM resumes with the settings it had: if they've changed
-    // since (CPUs, memory, file sharing, IPv6), boot instead so they apply.
+    // since (CPUs, memory, file sharing, IPv6, image store), boot instead so
+    // they apply.
     // Its disk then boots as after a crash, and its containers are started.
     if let Some(r) = &mut restore
         && r.consumed
@@ -330,7 +331,8 @@ pub fn run(paths: Paths) -> Result<()> {
             (saved == crate::virtiofs::HomeShare::Apple) != (crate::virtiofs::configured_share(&paths) == "apple")
         });
         let ipv6_changed = r.ipv6.is_some_and(|saved| saved != crate::snapshots::ipv6_setting(&paths));
-        if now.cpus != r.resources.cpus || now.memory != r.resources.memory || share_changed || ipv6_changed {
+        let store_changed = r.image_store.as_ref().is_some_and(|saved| *saved != crate::snapshots::image_store_setting(&paths));
+        if now.cpus != r.resources.cpus || now.memory != r.resources.memory || share_changed || ipv6_changed || store_changed {
             eprintln!("settings changed since the VM was suspended; booting it instead of resuming");
             r.state = None;
             r.share = None;

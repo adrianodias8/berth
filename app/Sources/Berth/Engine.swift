@@ -99,6 +99,8 @@ struct BerthConfig: Codable, Equatable {
     var proxy: String?
     /// "localhost": published ports only on the Mac's loopback (src/ports.rs).
     var ports: String?
+    /// "classic" (default) or "containerd": where Docker keeps images (agent/src/imagestore.rs).
+    var imageStore: String?
 
     enum CodingKeys: String, CodingKey, CaseIterable {
         case cpus
@@ -109,6 +111,7 @@ struct BerthConfig: Codable, Equatable {
         case finder
         case proxy
         case ports
+        case imageStore = "image_store"
     }
 
     static func load() -> BerthConfig {

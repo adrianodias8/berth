@@ -37,6 +37,7 @@ means the default. Changes apply on the next start (`berth restart`, or Restart 
 | `proxy` | `"auto"` | the HTTP(S) proxy Docker uses for pulls and pushes (and apt in the VM): `"auto"` follows the Mac's settings (System Settings › Network › Proxies, checked every 15 s), `"none"`, or an `http://` or `https://` URL. A proxy on the Mac's own `localhost` works. PAC files aren't followed. Containers don't get it: pass `HTTP_PROXY` yourself |
 | `kernel` | `"berth"` | `"debian"`: boot the VM's own Debian kernel instead of berth's tuned one (`guest/kernel/README.md`); applies on the next start |
 | `ports` | `"all"` | `"localhost"`: published ports listen only on the Mac's loopback (`-p 8080:80` stays off the LAN); applies to new forwards right away |
+| `image_store` | `"classic"` | where Docker keeps images. `"classic"` is Docker's overlay2 store (as OrbStack uses); `"containerd"` is containerd's image store, Docker 29's own default, which holds multi-platform images and build attestations but makes each `docker build` ~1.2 s slower (it compresses and unpacks every layer). Each store lists only its own images: after a switch, pull or build them again (the other store's stay on disk until switched back). Changing it restarts dockerd at the next start |
 | `finder` | `true` | Docker volumes, machines' files and running containers' root filesystems in Finder at `~/Berth`, over SMB from the VM, while berth runs |
 
 ## Suspend instead of shutdown

@@ -225,6 +225,15 @@ something here stops being true, fix it.
 - **CLI downloads:** pin versions and verify SHA-256 against the GitHub
   release asset digest.
 - **Docker 29 rejects one-character container names.**
+- **Docker 29's containerd image store made builds ~1.2 s slower:** after
+  each build it compresses every layer, writes attestations, then unpacks
+  the image to run it (`exporting layers` 1.0 s + `unpacking` 0.4 s, against
+  0.2 s on the classic overlay2 store, which OrbStack uses). berth now sets
+  `features.containerd-snapshotter: false` (`image_store`, default
+  `classic`); no-cache build 3.8–4.1 -> 2.2–2.8 s (OrbStack 2.6–3.2 s). Write
+  the key either way: without it Docker 29 uses containerd's store only on a
+  new install and otherwise keeps the store it has data in. The context
+  upload was never the cost (0.3 s, 0.1 s once BuildKit has it).
 - `alpine:latest` can get retagged to amd64 when pulled for another platform.
 - `/usr/local/bin` links: create them only where the tool is missing or the
   link dangles. Don't replace another app's working links.
@@ -374,6 +383,7 @@ something here stops being true, fix it.
 | composer install, Drupal CMS (`bench/fs/composer.sh`) | 7.2–7.7 s | 6.5–7.0 s |
 | DDEV composer install | 7.3–7.6 s (own share + polling) | 6.6 s |
 | DDEV drush site:install | 31.7–36.3 s | 36.7–37.4 s |
+| docker build, no cache (classic image store) | 2.2–2.8 s (3.8–4.1 s on containerd's store) | 2.6–3.2 s |
 
 (`bench/results/2026-10-24-compare.md`; startup, idle CPU and DDEV
 re-measured on 2026-10-25, `bench/results/2026-10-23-ddev-drupal.md`;

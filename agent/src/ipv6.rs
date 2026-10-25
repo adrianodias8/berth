@@ -31,17 +31,9 @@ pub const DOCKER_SUBNET: &str = "fd62:6572:7468:1::/64";
 const ENABLE_OPT: &str = "com.docker.network.enable_ipv6";
 const DROPIN: &str = "berth-ipv6.conf";
 
-/// The `ipv6` setting in berth's config.json, which sits next to the guest
-/// folder the agent runs from (~/.berth/guest/berth-agent).
+/// The `ipv6` setting in berth's config.json.
 pub fn enabled() -> bool {
-    let Some(config) = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.parent()?.join("config.json"))) else {
-        return false;
-    };
-    std::fs::read(config)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|v| v["ipv6"].as_bool())
-        .unwrap_or(false)
+    crate::setting("ipv6").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
 /// Our IPv6 keys in daemon.json. Turning the setting off removes only what we
