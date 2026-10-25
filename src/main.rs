@@ -798,7 +798,7 @@ fn status(paths: &Paths) -> Result<()> {
             println!("Docker:  {}", ready(s.docker));
             if s.memory_allowed > 0 {
                 println!(
-                    "Memory:  {:.1} GiB in use, VM holding up to {:.1} GiB (rest returned to macOS)",
+                    "Memory:  {:.1} GiB in use, VM limited to {:.1} GiB for now (raised on demand)",
                     s.memory_used as f64 / (1u64 << 30) as f64,
                     s.memory_allowed as f64 / (1u64 << 30) as f64
                 );

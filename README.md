@@ -199,8 +199,10 @@ images, volumes, networks, Kubernetes, machines, terminals, logs, files and stat
   `drush site:install`
   (31.7–36.3 s vs 36.7–37.4 s) and page loads are on par or faster
   (`bench/results/2026-10-23-ddev-drupal.md`).
-- Memory used by a workload isn't returned to macOS after it ends (OrbStack in the
-  same test didn't return it within 2 minutes either).
+- Memory used by a workload isn't returned to macOS after it ends:
+  Virtualization.framework keeps whatever the guest touched (OrbStack in the
+  same test didn't return it within 3 minutes either). The balloon keeps the
+  guest from spreading further, and `berth restart` gives it all back.
 - Deleting a folder on the Mac raises IN_DELETE in containers for the folder
   only, not for each file in it (on Linux every file gets one). Files deleted
   or renamed on the Mac do raise IN_DELETE (berth's own share).

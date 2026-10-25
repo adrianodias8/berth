@@ -18,6 +18,12 @@ are in the commit messages.
   0.93 s, OrbStack 0.75 s) and answers ioctls itself (musl's `fopen()`
   asked each file it wrote whether it was a terminal); the host closes
   files on a thread of its own.
+- **Idle memory ~0.5 GB lower:** macOS indexed `~/Berth` each time it was
+  mounted, walking every Docker volume over SMB and leaving the VM's Samba
+  with a 600 MB heap; the share now opts out of indexing. `berth status`
+  no longer claims memory was "returned to macOS": Virtualization.framework
+  keeps what the guest touched (see KNOWN_ISSUES), the balloon only limits
+  it. The memory benchmark's workload was fixed (it stopped at 2 GiB).
 - **App:** process runs, control-socket and Docker requests no longer
   block Swift's shared thread pool (one thread per core), so a long
   `berth start`, machine action or engine install can't hold up the rest

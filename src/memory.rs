@@ -1,5 +1,9 @@
-//! Memory reclaiming: steer the VM's balloon so the guest only holds what it
-//! actually uses plus headroom, and memory it frees goes back to macOS.
+//! Memory limiting: steer the VM's balloon so the guest only uses what it
+//! needs plus headroom, which keeps it from spreading over memory it never
+//! touched. It doesn't give memory back: Virtualization.framework's balloon
+//! leaves pages the guest already touched with the VM process (free page
+//! reporting, which would, isn't supported), so what the guest touches once
+//! stays on the Mac until the VM stops.
 //!
 //! Every couple of seconds we read the guest's MemTotal/MemAvailable via the
 //! agent. MemAvailable counts reclaimable page cache, so shrinking towards

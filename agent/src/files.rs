@@ -81,6 +81,10 @@ pub fn ensure(password: &str) -> io::Result<()> {
         }
     }
     std::fs::create_dir_all(format!("{ROOT}/containers"))?;
+    // Keeps macOS from indexing the share when it's mounted: that walked
+    // every volume (a kernel source tree is millions of files), held ~16k
+    // directories open and left smbd with a 600 MB heap at each start.
+    std::fs::write(format!("{ROOT}/.metadata_never_index"), "")?;
 
     // The Mac is the VM's default gateway on the NAT network; listen only
     // on the address it reaches us at.

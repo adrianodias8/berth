@@ -109,8 +109,12 @@ and boot messages). `berth shell` opens a shell in the VM.
   files. The note says why; on Debian's kernel the driver is built after the
   first boot and needs the internet.
 - **Idle CPU looks high right after heavy work.** For a few minutes the
-  balloon hands memory back to macOS and the VM keeps compacting it; it
-  settles to ~1.4 % (VM and daemon).
+  balloon shrinks the guest back towards what it uses and the VM keeps
+  compacting memory; it settles to ~1.4 % (VM and daemon).
+- **The VM process keeps the memory a workload used** after it ends:
+  Virtualization.framework doesn't take back memory the guest has touched.
+  The guest reuses it, so it doesn't keep growing; `berth restart` (a full
+  shutdown and start) gives it back.
 
 ## Suspend and snapshots
 

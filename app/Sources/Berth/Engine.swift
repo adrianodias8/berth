@@ -29,8 +29,9 @@ struct BerthStatus: Decodable, Equatable {
     let memory: UInt64
     let ports: [String]?
     let containerIps: String?
-    /// Guest memory in use and what the VM currently holds; the rest of
-    /// `memory` has been returned to macOS.
+    /// Guest memory in use, and how much of `memory` the balloon lets the
+    /// guest use for now (raised on demand). Memory the guest has touched
+    /// stays with the VM process on the Mac either way (src/memory.rs).
     let memoryUsed: UInt64?
     let memoryAllowed: UInt64?
     /// Why file sharing is slower than it could be, if it is.

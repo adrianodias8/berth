@@ -29,6 +29,22 @@ something here stops being true, fix it.
   VM process. Debian's `init_on_alloc=1` zeroes every page the guest
   allocates and inflates host usage, so berth boots with `init_on_alloc=0`.
   Real reclaiming needs free-page reporting, which VZ doesn't do.
+  Re-checked 2026-10-25: a 14 GiB balloon left the footprint unchanged,
+  and macOS didn't take those pages under memory pressure either (they're
+  not marked free on the Mac side). OrbStack's kernel uses page reporting
+  instead (`page_reporting` loaded, `balloon_inflate 0`).
+- **`footprint` counts compressed pages at full size**, so it never shows
+  compression; system-wide `vm_stat` (bench/sysmem.sh) does.
+- **Anything the guest touches once costs the Mac for good**, so transient
+  guest allocations matter as much as steady ones. One that hid for weeks:
+  macOS indexes an SMB volume when it's mounted, which walked every Docker
+  volume in `~/Berth`, held ~16k directories open in smbd and left it a
+  600 MB heap. A `.metadata_never_index` file at the share's root stops it
+  (idle VM footprint 2.2 -> 1.8 GB). Find such things with each guest
+  process's `Anonymous` in `/proc/<pid>/smaps_rollup`, right after boot.
+- **busybox `tail` stops at 2 GiB** ("out of memory", no syscall fails):
+  the memory benchmark's workload used it and silently allocated half of
+  what it claimed, on both engines.
 - **The balloon counts as "used" inside the guest** (deflate-on-OOM).
   Subtract the balloon pages from `/proc/vmstat` before computing usage.
 - **ASIF disks** (macOS 26+): `diskutil image create … --format ASIF`, then
@@ -348,7 +364,8 @@ something here stops being true, fix it.
 | | berth | OrbStack |
 |---|---|---|
 | startup | 2.6–2.7 s (berth's 7.2 kernel; 3.3–3.6 s on Debian's) | 2.6–4.4 s |
-| idle memory (system-wide) | +1.37 GB (+1.9 with Podman and nerdctl on) | +1.28 GB |
+| idle memory (system-wide) | +1.37 GB (+1.9 with Podman and nerdctl on, 2026-10-25) | +1.28–1.67 GB |
+| after a 4 GiB workload, 3 min (`bench/sysmem.sh`) | +3.14 GB (not returned) | +4.99 GB (not returned) |
 | idle CPU | ~1.4 % (3.0 % before the idle work) | 2.2 % |
 | localhost forward | ~20 Gbit/s | ~31 Gbit/s |
 | bind-mount extract (20k files) | 7.9 s (Apple's) / 2.4–2.7 s (own share + polling) | 2.3 s |

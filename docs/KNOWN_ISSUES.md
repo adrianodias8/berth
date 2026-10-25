@@ -73,6 +73,14 @@ fix one, remove it here in the same change.
   to try it again.
 - **The kernel source's checksum comes from the same place as the source**
   (kernel.org's `sha256sums.asc`, its signature not checked).
+- **Memory a workload used stays with the VM process** until the VM
+  restarts. Virtualization.framework's balloon doesn't take back pages the
+  guest touched, and it has no free page reporting (what OrbStack's own
+  hypervisor uses); the custom Virtio device API can't discard guest
+  memory either. The balloon only limits how much more the guest touches.
+  Making freed pages cheap for macOS to compress (zeroing them on free)
+  would need a kernel change: `init_on_free` also zeroes all memory at boot
+  and every page the balloon gives back.
 - **Containers can swap** (zram, up to their memory limit, as Docker allows
   when the host has swap): a container over its limit slows down before
   it's OOM-killed. Kernel and socket memory isn't counted against container
