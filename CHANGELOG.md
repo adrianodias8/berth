@@ -6,6 +6,12 @@ are in the commit messages.
 ## Unreleased
 
 ### 2026-10-25
+- **Fixes:** disks under `/Volumes` no longer share file IDs (two disks'
+  root folders were both inode 2); a stop during boot no longer counts as a
+  failed kernel start; a rebuilt kernel is tried again after an earlier one
+  failed; a new VM's first boot skips building the file driver that
+  berth's kernel has built in; restoring a saved state clears all boot
+  markers.
 - **Guest kernel:** berth boots its own kernel, Linux 7.2.12 with what the
   VM needs built in and no initrd (`guest/kernel`): kernel boot 0.24 s
   instead of Debian's 0.59 s, the polling file driver built in (no runtime

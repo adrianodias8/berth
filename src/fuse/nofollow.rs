@@ -34,6 +34,9 @@ fn check(rc: libc::c_int) -> io::Result<()> {
 pub struct Stat(libc::stat);
 
 impl Stat {
+    pub fn dev(&self) -> u64 {
+        u64::from(self.0.st_dev as u32)
+    }
     pub fn ino(&self) -> u64 {
         self.0.st_ino
     }

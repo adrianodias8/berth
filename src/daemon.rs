@@ -707,6 +707,7 @@ async fn shutdown() {
         return;
     }
     eprintln!("stopping VM");
+    vm::boot_interrupted(&Paths::new());
     let _ = tokio::task::spawn_blocking(|| crate::files::unmount_for_stop(&Paths::new())).await;
     if let Err(err) = vm::request_stop().await {
         eprintln!("stop request failed: {err:#}");

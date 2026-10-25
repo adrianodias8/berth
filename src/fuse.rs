@@ -274,6 +274,9 @@ struct SavedState {
     no_open: bool,
     #[serde(default)]
     no_opendir: bool,
+    /// `Server::devices`, so node IDs mean the same disks after a restore.
+    #[serde(default)]
+    devices: Vec<u64>,
 }
 
 /// The path an open file has now (F_GETPATH).
@@ -299,8 +302,13 @@ enum Handle {
 pub struct Server {
     root: PathBuf,
     policy: CachePolicy,
-    /// nodeid → node. nodeid is the file's inode number (root is 1).
+    /// nodeid → node. nodeid is the file's inode number (root is 1), with
+    /// its device folded in (`node_id`).
     nodes: Nodes,
+    /// The root's device: its files' node IDs are their inode numbers.
+    root_dev: u64,
+    /// Every device seen, by index (the root's is 0).
+    devices: Mutex<Vec<u64>>,
     /// Nodes holding a cached file, oldest first.
     cached: Mutex<std::collections::VecDeque<u64>>,
     handles: Mutex<HashMap<u64, Handle>>,
@@ -388,12 +396,15 @@ impl Server {
         // No path below the root may contain a symlink (nofollow.rs), so the
         // root itself must have none either.
         let root = fs::canonicalize(&root).unwrap_or(root);
+        let root_dev = nofollow::lstat(&root).map_or(0, |m| m.dev());
         let mut nodes = HashMap::new();
         nodes.insert(FUSE_ROOT_ID, Node { path: root.clone(), lookups: 1, kind: 0, file: None });
         Self {
             root,
             policy,
             nodes: Nodes::new(nodes),
+            root_dev,
+            devices: Mutex::new(vec![root_dev]),
             cached: Mutex::new(std::collections::VecDeque::new()),
             handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
@@ -436,6 +447,7 @@ impl Server {
             next_fh: self.next_fh.load(Ordering::Relaxed),
             no_open: self.no_open.load(Ordering::Relaxed),
             no_opendir: self.no_opendir.load(Ordering::Relaxed),
+            devices: self.devices.lock().unwrap().clone(),
         };
         serde_json::to_vec(&state).unwrap_or_default()
     }
@@ -448,13 +460,22 @@ impl Server {
             nodes.insert(n.id, Node { path: n.path, lookups: n.lookups, kind: 0, file: None });
         }
         nodes.entry(FUSE_ROOT_ID).or_insert(Node { path: self.root.clone(), lookups: 1, kind: 0, file: None });
+        {
+            // The root's device may have a new number since (a reboot).
+            let mut devices = self.devices.lock().unwrap();
+            *devices = state.devices;
+            match devices.first_mut() {
+                Some(first) => *first = self.root_dev,
+                None => devices.push(self.root_dev),
+            }
+        }
         let mut handles = HashMap::new();
         for (fh, h) in state.handles {
             // A handle whose file is gone now just fails like a stale one.
             let reopened = match h {
                 SavedHandle::Dir(path) => {
                     let mut entries = vec![(b".".to_vec(), 0, libc::DT_DIR as u32), (b"..".to_vec(), 0, libc::DT_DIR as u32)];
-                    entries.extend(nofollow::read_dir(&path).unwrap_or_default());
+                    entries.extend(self.dir_entries(&path).unwrap_or_default());
                     Some(Handle::Dir(Arc::new(Dir { path, entries })))
                 }
                 SavedHandle::File(path) => Self::open_file(&path, 2, 0)
@@ -676,6 +697,43 @@ impl Server {
         Ok(out.0)
     }
 
+    /// The node ID for a file: its inode number, XORed with its device's
+    /// index in the top byte. Inode numbers are only unique per device, and
+    /// a share can span several (`/Volumes`: every APFS disk's root is inode
+    /// 2). The root's device is index 0, so its files keep their numbers.
+    fn node_id(&self, dev: u64, ino: u64) -> u64 {
+        if dev == self.root_dev {
+            return ino;
+        }
+        let mut devices = self.devices.lock().unwrap();
+        let index = match devices.iter().position(|&d| d == dev) {
+            Some(i) => i,
+            // Past 255 disks they share the last index.
+            None if devices.len() < 256 => {
+                devices.push(dev);
+                devices.len() - 1
+            }
+            None => 255,
+        };
+        ino ^ ((index as u64) << 56)
+    }
+
+    fn node_of(&self, m: &Stat) -> u64 {
+        self.node_id(m.dev(), m.ino())
+    }
+
+    /// A directory's entries (without "." and ".."), with node IDs.
+    fn dir_entries(&self, path: &Path) -> std::io::Result<Vec<(Vec<u8>, u64, u32)>> {
+        let mut entries = nofollow::read_dir(path)?;
+        let dev = nofollow::lstat(path)?.dev();
+        if dev != self.root_dev {
+            for e in &mut entries {
+                e.1 = self.node_id(dev, e.1);
+            }
+        }
+        Ok(entries)
+    }
+
     fn path(&self, nodeid: u64) -> Result<PathBuf, i32> {
         self.nodes.shard(nodeid).get(&nodeid).map(|n| n.path.clone()).ok_or(lerr::ENOENT)
     }
@@ -766,7 +824,7 @@ impl Server {
     }
 
     fn entry_with(&self, path: PathBuf, m: &Stat) -> Reply {
-        let nodeid = if path == self.root { FUSE_ROOT_ID } else { m.ino() };
+        let nodeid = if path == self.root { FUSE_ROOT_ID } else { self.node_of(m) };
         let stale = {
             let mut nodes = self.nodes.shard(nodeid);
             let node = nodes.entry(nodeid).or_insert(Node { path: path.clone(), lookups: 0, kind: 0, file: None });
@@ -965,7 +1023,7 @@ impl Server {
 
     fn remove(&self, parent: u64, name: &[u8], dir: bool, pid: u32) -> Reply {
         let path = self.child(parent, name)?;
-        let ino = nofollow::lstat(&path).map(|m| m.ino()).ok();
+        let ino = nofollow::lstat(&path).map(|m| self.node_of(&m)).ok();
         // The agent replaying a removal on the Mac so the guest's watchers
         // get IN_DELETE (watch.rs): agree if it's still gone, and never
         // remove anything, as the name may be back already (an editor's
@@ -991,7 +1049,7 @@ impl Server {
 
     fn rename(&self, olddir: u64, old: &[u8], newdir: u64, new: &[u8]) -> Reply {
         let (from, to) = (self.child(olddir, old)?, self.child(newdir, new)?);
-        let replaced = nofollow::lstat(&to).map(|m| m.ino()).ok();
+        let replaced = nofollow::lstat(&to).map(|m| self.node_of(&m)).ok();
         nofollow::rename(&from, &to).map_err(|e| io_errno(&e))?;
         crate::watch::guest_removed(&from);
         if let Ok(m) = nofollow::lstat(&to) {
@@ -1006,7 +1064,8 @@ impl Server {
         // others under it, and its node is its inode, which a rename keeps.
         match nofollow::lstat(&to) {
             Ok(m) if !m.is_dir() => {
-                if let Some(node) = self.nodes.shard(m.ino()).get_mut(&m.ino())
+                let id = self.node_of(&m);
+                if let Some(node) = self.nodes.shard(id).get_mut(&id)
                     && node.path == from
                 {
                     node.path = to;
@@ -1208,7 +1267,7 @@ impl Server {
         let path = self.path(nodeid)?;
         let mut entries = vec![(b".".to_vec(), nodeid, libc::DT_DIR as u32), (b"..".to_vec(), 0, libc::DT_DIR as u32)];
         // DT_* values are the same on macOS and Linux.
-        entries.extend(nofollow::read_dir(&path).map_err(|e| io_errno(&e))?);
+        entries.extend(self.dir_entries(&path).map_err(|e| io_errno(&e))?);
         Ok(Dir { path, entries })
     }
 
@@ -1316,6 +1375,22 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn node_ids_differ_across_devices() {
+        let dir = tempdir("devices");
+        let s = Server::new(dir.clone(), CachePolicy::default());
+        let root_dev = fs::metadata(&dir).unwrap().dev() as u32 as u64;
+        assert_eq!(s.node_id(root_dev, 2), 2, "the root's disk keeps inode numbers");
+        let (a, b) = (s.node_id(root_dev + 1, 2), s.node_id(root_dev + 2, 2));
+        assert!(a != 2 && b != 2 && a != b, "two disks' root inodes");
+        assert_eq!(s.node_id(root_dev + 1, 2), a, "stable");
+
+        // The same IDs after a restore.
+        let restored = Server::new(dir.clone(), CachePolicy::default());
+        assert!(restored.restore_state(&s.save_state()));
+        assert_eq!(restored.node_id(root_dev + 2, 2), b);
     }
 
     #[test]

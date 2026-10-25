@@ -7,11 +7,11 @@ fix one, remove it here in the same change.
 
 ## File sharing (berth's share, `src/fuse.rs`)
 
-- **Disks under `/Volumes` can collide.** Node IDs are inode numbers without
-  the device (`entry_with`), and the `/Volumes` share spans every mounted
-  disk: two APFS disks both have a root inode 2, so a lookup under one can
-  land on the other's files. Fix: fold `st_dev` into the node ID (a map from
-  (dev, ino) to IDs).
+- **Past 255 disks, node IDs can collide.** A node ID is the inode number
+  with its disk's index folded into the top byte (`node_id`), so the
+  `/Volumes` share's disks don't share IDs; from the 256th disk on, they
+  share the last index. An inode number using the top byte (not seen on
+  APFS) could also collide.
 - **A removed file may lose its data.** A file removed while open in the
   guest stays readable only if berth already had it open (its cached file),
   which is usual but not guaranteed (eviction past 4096 cached files is
@@ -37,9 +37,9 @@ fix one, remove it here in the same change.
   the network and ~200 MB of headers and gcc; slower share until then).
   berth's own kernel has it built in (`guest/kernel/README.md`). The very
   first start of a new VM is always Debian's (berth's kernel needs the root
-  partition's command line, exported by that boot), so it runs the build
-  anyway, needlessly, and retries every 30 min offline. `berth status` and
-  the app say when the share is on the slower driver, and why.
+  partition's command line, exported by that boot), so it's on the slower
+  driver until berth restarts. `berth status` and the app say when the
+  share is on the slower driver, and why.
 - **Safe mode needs direct boot.** If the guest kernel was never exported
   (EFI boot only), a broken mount setup can't be rescued automatically.
 - **A snapshot restore takes ~16 s**, mostly stopping the current VM. A
@@ -62,13 +62,11 @@ fix one, remove it here in the same change.
 - **6.18 locked up under k3s** (a CPU stuck with interrupts off while k3s
   tore down pod veths, twice, no backtrace). Not understood: it may be
   6.18's, or the polling driver's 6.18 port. Check before ever using 6.18.
-- **A kernel is known by its release string** (`7.2.12-berth`). A rebuild
-  with a fix keeps the same one, so a release set aside after two failed
-  starts (`berth-failed`) stays set aside. Fix: add a build ID to it.
-- **Two interrupted starts set berth's kernel aside for good** (until
-  another release ships): an unfinished attempt can also be a stop during
-  boot, and a safe boot doesn't reset the count. Delete
-  `~/.berth/guest/boot/berth-failed` to try it again.
+- **Two failed starts set berth's kernel aside** until a different kernel
+  ships (known by its release and its Image's size and time). A stop within
+  20 s of starting isn't counted, but one later while boot hangs is, and a
+  safe boot doesn't reset the count. Delete `~/.berth/guest/boot/berth-failed`
+  to try it again.
 - **The kernel source's checksum comes from the same place as the source**
   (kernel.org's `sha256sums.asc`, its signature not checked).
 - **Containers can swap** (zram, up to their memory limit, as Docker allows

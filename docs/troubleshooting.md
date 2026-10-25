@@ -26,7 +26,7 @@ and boot messages). `berth shell` opens a shell in the VM.
   driver), and report what you see.
 - **"boot: berth's kernel … didn't come up; using the VM's Debian kernel"**
   in `daemon.log`. berth's own kernel failed two starts in a row, so that
-  release is set aside (`~/.berth/guest/boot/berth-failed`) and the Debian
+  kernel is set aside (`~/.berth/guest/boot/berth-failed`) and the Debian
   kernel boots until berth ships another one. Delete that file to try it
   again, or keep Debian's for good with `berth config set kernel debian`.
   `console.log` has the failed boot's kernel messages: please report them.

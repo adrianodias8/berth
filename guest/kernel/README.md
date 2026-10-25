@@ -51,9 +51,10 @@ must be arm64. The tree is kept in the `berth-kernel-build` volume.
 
 The host counts starts on berth's kernel that didn't come up
 (`~/.berth/guest/boot/berth-trying`, cleared by the agent once it's up).
-After two in a row it writes that release to `berth-failed` and boots the
-Debian kernel until a different release ships. Delete `berth-failed` to try
-again.
+A stop asked for within 20 s of starting isn't counted. After two in a row
+it writes that kernel (its release and its Image's size and time) to
+`berth-failed` and boots the Debian kernel until a different kernel ships,
+a rebuild included. Delete `berth-failed` to try again.
 
 ## Updating
 

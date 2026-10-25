@@ -231,6 +231,12 @@ pub fn run() {
         report(None);
         return;
     }
+    // The host boots berth's kernel from the next start (vm.rs): this is a
+    // new VM's first boot, on Debian's kernel to export its command line.
+    if marker().is_some_and(|m| m.with_file_name("berth-kernel").exists()) {
+        report(Some("built into berth's kernel, used from the next start: restart berth"));
+        return;
+    }
     let release = release();
     for attempt in 0.. {
         match build(&release) {

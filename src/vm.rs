@@ -182,27 +182,39 @@ fn debian_kernel_chosen(paths: &Paths) -> bool {
         .is_some_and(|c| c["kernel"] == "debian")
 }
 
-/// berth's kernel with the command line the Debian kernel was exported with
-/// (its root partition), no initrd: everything it needs is built in. Like
-/// direct boot, it counts attempts that didn't come up; after two in a row
-/// that kernel release is set aside and the Debian kernel boots instead.
-fn berth_kernel_boot(paths: &Paths, cmdline: &str) -> Option<Retained<VZBootLoader>> {
-    if debian_kernel_chosen(paths) || safe_boot(paths) {
+/// berth's kernel, if it's to be used, with its release. Like direct boot,
+/// it counts attempts that didn't come up; after two in a row that kernel is
+/// set aside and the Debian kernel boots instead. A kernel is known by its
+/// release and its Image file's size and time, so a rebuild is tried afresh.
+fn berth_kernel(paths: &Paths) -> Option<(std::path::PathBuf, String)> {
+    if debian_kernel_chosen(paths) {
         return None;
     }
     let kernel = bundled_kernel()?;
     let release = fs::read_to_string(kernel.join("release")).ok()?.trim().to_string();
+    let image = fs::metadata(kernel.join("Image")).ok()?;
+    let modified = image.modified().ok()?.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let id = format!("{release} {} {modified}", image.len());
     let dir = paths.guest().join("boot");
     let (trying, failed) = (dir.join("berth-trying"), dir.join("berth-failed"));
     let attempts: u32 = fs::read_to_string(&trying).map_or(0, |s| s.trim().parse().unwrap_or(1));
     if attempts >= 2 {
         eprintln!("boot: berth's kernel {release} didn't come up; using the VM's Debian kernel");
-        let _ = fs::write(&failed, &release);
+        let _ = fs::write(&failed, &id);
         let _ = fs::remove_file(&trying);
     }
-    if fs::read_to_string(&failed).is_ok_and(|f| f.trim() == release) {
+    if fs::read_to_string(&failed).is_ok_and(|f| f.trim() == id) {
         return None;
     }
+    Some((kernel, release))
+}
+
+/// berth's kernel with the command line the Debian kernel was exported with
+/// (its root partition), no initrd: everything it needs is built in.
+fn berth_kernel_boot(paths: &Paths, cmdline: &str, kernel: &std::path::Path, release: &str) -> Option<Retained<VZBootLoader>> {
+    let dir = paths.guest().join("boot");
+    let trying = dir.join("berth-trying");
+    let attempts: u32 = fs::read_to_string(&trying).map_or(0, |s| s.trim().parse().unwrap_or(1));
     // Module metadata for modprobe, installed by the agent (agent/src/kmod.rs).
     let modules = kernel.join("modules.tar");
     let staged = paths.guest().join("kernel-modules.tar");
@@ -242,11 +254,23 @@ fn direct_boot(paths: &Paths) -> Option<Retained<VZBootLoader>> {
         eprintln!("boot: last direct boot didn't come up; using EFI");
         let _ = fs::rename(&trying, &failed);
     }
+    // Tell the agent whether berth's kernel (with the polling driver built
+    // in) is what the VM runs, so on the Debian kernel's first boot, which
+    // exports the command line berth's needs, it doesn't build the driver.
+    let berth = berth_kernel(paths);
+    let next = paths.guest().join("berth-kernel");
+    let _ = match &berth {
+        Some((_, release)) => fs::write(&next, release),
+        None => fs::remove_file(&next),
+    };
     let cmdline = fs::read_to_string(dir.join("cmdline")).ok()?;
     if cmdline.trim().is_empty() {
         return None;
     }
-    if let Some(boot) = berth_kernel_boot(paths, &cmdline) {
+    if !safe
+        && let Some((kernel, release)) = &berth
+        && let Some(boot) = berth_kernel_boot(paths, &cmdline, kernel, release)
+    {
         return Some(boot);
     }
     if (failed.exists() && !safe) || !kernel.exists() || !initrd.exists() {
@@ -268,6 +292,27 @@ fn direct_boot(paths: &Paths) -> Option<Retained<VZBootLoader>> {
         boot.setInitialRamdiskURL(Some(&file_url(&initrd)));
         boot.setCommandLine(&NSString::from_str(cmdline.trim()));
         Some(Retained::into_super(boot))
+    }
+}
+
+/// A stop asked for while the guest was still booting (the boot markers set
+/// at start are less than 20 s old): that attempt says nothing about whether
+/// the kernel or driver work, so it's taken back. A start that hangs is
+/// still counted, by the watchdog or a stop after that.
+pub fn boot_interrupted(paths: &Paths) {
+    let dir = paths.guest().join("boot");
+    for marker in ["trying", "berth-trying", "kmod-trying"] {
+        let path = dir.join(marker);
+        let fresh = fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().is_ok_and(|e| e < std::time::Duration::from_secs(20)));
+        if !fresh {
+            continue;
+        }
+        match fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u32>().ok()) {
+            Some(n) if n > 1 => drop(fs::write(&path, (n - 1).to_string())),
+            _ => drop(fs::remove_file(&path)),
+        }
     }
 }
 
