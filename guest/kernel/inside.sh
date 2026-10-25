@@ -8,7 +8,7 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq linux-source-6.12 linux-config-6.12 build-essential bc bison flex \
-    libssl-dev libelf-dev dwarves python3 kmod cpio rsync curl xz-utils patch >/dev/null
+    libssl-dev libelf-dev dwarves python3 kmod cpio rsync curl xz-utils patch gnupg >/dev/null
 
 if [ "${KERNEL_VERSION:-7.2.12}" = debian ]; then
     version=$(dpkg-query -W -f '${Version}' linux-source-6.12)
@@ -24,8 +24,20 @@ else
         base=https://cdn.kernel.org/pub/linux/kernel/v${version%%.*}.x
         tarball=/build/linux-$version.tar.xz
         [ -f "$tarball" ] || curl -fsSL -o "$tarball" "$base/linux-$version.tar.xz"
-        want=$(curl -fsSL "$base/sha256sums.asc" | awk -v f="linux-$version.tar.xz" '$2 == f { print $1 }')
-        echo "$want  $tarball" | sha256sum -c - >/dev/null
+        # The checksums are signed by kernel.org's checksum autosigner, whose
+        # key is pinned in guest/kernel (fingerprint checked below). Only the
+        # signed text is used: anything outside the signature is ignored.
+        key=/guest/kernel/kernel.org-autosigner.asc
+        fpr=B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1
+        gpg --batch --show-keys --with-colons "$key" | grep -qx "fpr:::::::::$fpr:" ||
+            { echo "$key isn't kernel.org's checksum autosigner key" >&2; exit 1; }
+        gpg --batch --yes --dearmor -o /tmp/autosigner.gpg "$key"
+        curl -fsSL -o /tmp/sha256sums.asc "$base/sha256sums.asc"
+        gpgv --keyring /tmp/autosigner.gpg --output /tmp/sha256sums /tmp/sha256sums.asc 2>/dev/null ||
+            { echo "$base/sha256sums.asc: bad or missing signature" >&2; exit 1; }
+        want=$(awk -v f="linux-$version.tar.xz" '$2 == f { print $1 }' /tmp/sha256sums)
+        [ -n "$want" ] || { echo "no signed checksum for linux-$version.tar.xz" >&2; exit 1; }
+        echo "$want  $tarball" | sha256sum -c - >/dev/null || { rm -f "$tarball"; exit 1; }
         mkdir -p "$tree"
         tar -xf "$tarball" -C "$tree" --strip-components=1
     fi

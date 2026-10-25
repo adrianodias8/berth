@@ -17,6 +17,10 @@ use crate::docker::{self, Container};
 pub const SUFFIX: &str = "berth.local";
 /// Label for extra domains: comma-separated, `*.` wildcards, `.local` only.
 /// The OrbStack spelling is honored too so existing compose files work.
+/// Names outside `berth.local` count only when the container itself was
+/// given the label (compose, `--label`): one that came with the image could
+/// otherwise point the Mac's `nas.local` or another device's name at a
+/// container just by being pulled and run.
 const DOMAIN_LABELS: [&str; 2] = ["dev.berth.domains", "dev.orbstack.domains"];
 /// Marks addresses we added, so stale ones from an earlier run can be removed.
 const ADDR_LABEL_SUFFIX: &str = ":berth";
@@ -286,7 +290,28 @@ fn pool(up: &Uplink) -> Vec<Ipv4Addr> {
         .collect()
 }
 
-fn names_for(c: &Container) -> Vec<(String, bool, bool, bool)> {
+/// Images' own labels by image ID (images don't change), so names_for can
+/// tell a container's labels from its image's.
+static IMAGE_LABELS: std::sync::Mutex<BTreeMap<String, Option<BTreeMap<String, String>>>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+fn image_labels(c: &Container) -> Option<BTreeMap<String, String>> {
+    if c.image_id.is_empty() || !DOMAIN_LABELS.iter().any(|l| c.labels.contains_key(*l)) {
+        return None;
+    }
+    let mut cache = IMAGE_LABELS.lock().unwrap();
+    if let Some(labels) = cache.get(&c.image_id) {
+        return labels.clone();
+    }
+    // A failed lookup (an engine busy for a moment) is tried again next time.
+    let labels = docker::image_labels(&c.image_id)?;
+    cache.insert(c.image_id.clone(), Some(labels.clone()));
+    Some(labels)
+}
+
+/// `image`: the labels of the container's image, None if unknown (then a
+/// domain label counts as the image's).
+fn names_for(c: &Container, image: Option<&BTreeMap<String, String>>) -> Vec<(String, bool, bool, bool)> {
     let mut names = Vec::new();
     if let Some(name) = c.name() {
         names.push((format!("{}.{SUFFIX}", name.to_ascii_lowercase()), true, false, false));
@@ -297,7 +322,9 @@ fn names_for(c: &Container) -> Vec<(String, bool, bool, bool)> {
         names.push((format!("{service}.{project}.{SUFFIX}").to_ascii_lowercase(), true, false, false));
     }
     for label in DOMAIN_LABELS {
-        for domain in c.labels.get(label).into_iter().flat_map(|v| v.split(',')) {
+        let Some(value) = c.labels.get(label) else { continue };
+        let from_image = image.is_none_or(|i| i.get(label) == Some(value));
+        for domain in value.split(',') {
             // `name@port[:https]` routing hints are for an HTTP proxy we don't
             // have yet; the name part still resolves.
             let domain = domain.split('@').next().unwrap_or("").trim().to_ascii_lowercase();
@@ -305,12 +332,29 @@ fn names_for(c: &Container) -> Vec<(String, bool, bool, bool)> {
                 Some(rest) => (rest.to_string(), true),
                 None => (domain, false),
             };
-            if domain.ends_with(".local") {
-                names.push((domain, false, subs, true));
+            if !domain.ends_with(".local") {
+                continue;
             }
+            if from_image && !domain.ends_with(&format!(".{SUFFIX}")) {
+                skipped(c, &domain);
+                continue;
+            }
+            names.push((domain, false, subs, true));
         }
     }
     names
+}
+
+/// Logs each refused image domain once.
+fn skipped(c: &Container, domain: &str) {
+    static LOGGED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+    if LOGGED.lock().unwrap().insert(format!("{} {domain}", c.id)) {
+        eprintln!(
+            "berth-agent: {}: not answering for {domain}: the image's label names it, and only names under {SUFFIX} \
+             are taken from images (set the label on the container to use it)",
+            c.name().unwrap_or(&c.id)
+        );
+    }
 }
 
 fn sync_now(table: &Shared) -> io::Result<()> {
@@ -349,7 +393,8 @@ fn sync_now(table: &Shared) -> io::Result<()> {
         taken.insert(svc);
         mapping.insert(svc, target);
         services.insert(svc, Service { id: c.id.clone(), name: name.to_string(), ip: target });
-        for (domain, wildcard, subdomains_only, from_label) in names_for(c) {
+        let image = image_labels(c);
+        for (domain, wildcard, subdomains_only, from_label) in names_for(c, image.as_ref()) {
             entries.push(Entry { domain, wildcard, subdomains_only, ip: svc, container: name.to_string(), from_label });
         }
     }
@@ -537,6 +582,35 @@ mod tests {
             container: "c".into(),
             from_label: false,
         }
+    }
+
+    fn container(labels: &[(&str, &str)]) -> Container {
+        Container {
+            id: "id".into(),
+            names: vec!["/web".into()],
+            labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            image_id: "sha256:x".into(),
+            network: None,
+            host_config: None,
+        }
+    }
+
+    fn claimed(c: &Container, image: Option<&BTreeMap<String, String>>) -> Vec<String> {
+        names_for(c, image).into_iter().filter(|n| n.3).map(|n| n.0).collect()
+    }
+
+    #[test]
+    fn image_labels_only_name_berth_local() {
+        let label = [("dev.berth.domains", "nas.local,*.app.berth.local")];
+        let image: BTreeMap<String, String> = label.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        // From the image (or unknown): only names under berth.local.
+        assert_eq!(claimed(&container(&label), Some(&image)), ["app.berth.local"]);
+        assert_eq!(claimed(&container(&label), None), ["app.berth.local"]);
+        // Set on the container: anything under .local.
+        assert_eq!(claimed(&container(&label), Some(&BTreeMap::new())), ["nas.local", "app.berth.local"]);
+        let orb = [("dev.orbstack.domains", "myapp.local")];
+        assert_eq!(claimed(&container(&orb), Some(&BTreeMap::new())), ["myapp.local"]);
+        assert!(claimed(&container(&orb), Some(&orb.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())).is_empty());
     }
 
     #[test]

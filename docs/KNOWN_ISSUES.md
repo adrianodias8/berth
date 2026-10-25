@@ -71,8 +71,6 @@ fix one, remove it here in the same change.
   20 s of starting isn't counted, but one later while boot hangs is, and a
   safe boot doesn't reset the count. Delete `~/.berth/guest/boot/berth-failed`
   to try it again.
-- **The kernel source's checksum comes from the same place as the source**
-  (kernel.org's `sha256sums.asc`, its signature not checked).
 - **Memory a workload used stays with the VM process** until the VM
   restarts. Virtualization.framework's balloon doesn't take back pages the
   guest touched, and it has no free page reporting (what OrbStack's own
@@ -88,9 +86,11 @@ fix one, remove it here in the same change.
 
 ## Guest agent (`agent/`)
 
-- **Label domains can claim any `.local` name**, such as `nas.local` (they
-  can't take a name berth generated for another container). Consider an
-  opt-in for names outside `berth.local`.
+- **A container's own domain label can claim any `.local` name**, such as
+  `nas.local` (an image's label only names under `berth.local`, and no label
+  takes a name berth generated for another container). That's the user's
+  choice in a compose file or `--label`; it overrides the real device's name
+  on the Mac while the container runs.
 - **Network-isolated machines get no IPv6** (it isn't forwarded for them),
   and their rules are iptables ones keyed on the machine's interface: a
   rename re-applies them, a machine renamed by hand outside berth loses them.
@@ -154,7 +154,8 @@ fix one, remove it here in the same change.
   controls. Fine on a single-user Mac; consider root-owned copies.
 - **Downloads:** the VM's base image and machine images are checked against
   checksum files from the same origin (the CLIs and podman-remote have
-  pinned SHA-256s; for the kernel source see Guest kernel).
+  pinned SHA-256s; the kernel source's checksums are signed by kernel.org's
+  pinned autosigner key).
 
 ## App (`app/`)
 

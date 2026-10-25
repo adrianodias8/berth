@@ -120,8 +120,9 @@ berth config set memory_mib 8192        # settings (also in the app); berth rest
   a change applies at the next start)
 - Container domains with no setup: `<container>.berth.local`,
   `<service>.<project>.berth.local` for Compose, any subdomain, plus custom names
-  from the `dev.berth.domains` (or `dev.orbstack.domains`) label; `berth domains`
-  lists them. Every port and protocol works on a domain, no publishing needed.
+  from the `dev.berth.domains` (or `dev.orbstack.domains`) label (names outside
+  `berth.local` only when the label is set on the container, not inherited
+  from its image); `berth domains` lists them. Every port and protocol works on a domain, no publishing needed.
 - `http://` and `https://<name>.berth.local` without port numbers: the web port is
   detected (override: `dev.berth.http-port`), HTTPS uses a local CA limited to
   `.local` names (`berth tls trust`, or the app's setup)

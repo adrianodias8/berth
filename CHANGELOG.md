@@ -18,6 +18,11 @@ are in the commit messages.
   0.93 s, OrbStack 0.75 s) and answers ioctls itself (musl's `fopen()`
   asked each file it wrote whether it was a terminal); the host closes
   files on a thread of its own.
+- **Hardening:** the kernel source's checksums are taken only from
+  kernel.org's signed `sha256sums.asc`, checked against the autosigner key
+  pinned in `guest/kernel`; a domain label inherited from an image can only
+  name `*.berth.local` (one set on the container still names any `.local`
+  name), so a pulled image can't take over the Mac's `nas.local`.
 - **Idle memory ~0.5 GB lower:** macOS indexed `~/Berth` each time it was
   mounted, walking every Docker volume over SMB and leaving the VM's Samba
   with a 600 MB heap; the share now opts out of indexing. `berth status`

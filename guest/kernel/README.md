@@ -4,7 +4,9 @@ The VM boots this kernel by default when the app (or a development build)
 ships one; otherwise, or with `berth config set kernel debian`, it boots the
 VM's own Debian kernel as before.
 
-It is Linux 7.2.12 from kernel.org (checksum checked) on Debian's 6.12
+It is Linux 7.2.12 from kernel.org (its checksum from kernel.org's signed
+`sha256sums.asc`, checked against the autosigner key pinned in
+`kernel.org-autosigner.asc`) on Debian's 6.12
 arm64 config, with:
 
 - **The modules the VM uses built in** (`modules.txt`, collected with Docker,

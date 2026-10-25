@@ -28,6 +28,9 @@ pub struct Container {
     pub names: Vec<String>,
     #[serde(rename = "Labels", default)]
     pub labels: BTreeMap<String, String>,
+    /// Empty for nerdctl's containers.
+    #[serde(rename = "ImageID", default)]
+    pub image_id: String,
     #[serde(rename = "NetworkSettings")]
     pub network: Option<NetworkSettings>,
     #[serde(rename = "HostConfig")]
@@ -166,6 +169,17 @@ pub fn containers() -> io::Result<Vec<Container>> {
 
 pub fn networks() -> io::Result<Vec<Network>> {
     list("/networks")
+}
+
+/// An image's own labels (`Config.Labels`), from whichever engine has it;
+/// None when none does.
+pub fn image_labels(id: &str) -> Option<BTreeMap<String, String>> {
+    sockets().into_iter().find_map(|socket| {
+        let mut body = String::new();
+        get_bounded(socket, &format!("/images/{id}/json")).and_then(|mut r| r.read_to_string(&mut body)).ok()?;
+        let image: serde_json::Value = serde_json::from_str(&body).ok()?;
+        Some(serde_json::from_value(image["Config"]["Labels"].clone()).unwrap_or_default())
+    })
 }
 
 /// `GET /containers/{id}/json`, untyped, from whichever engine has it.
