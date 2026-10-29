@@ -36,14 +36,16 @@ and boot messages). `berth shell` opens a shell in the VM.
 ## Containers and ports
 
 - **A published port isn't on the Mac.** `berth status` lists what's
-  forwarded. If something on the Mac already uses the port, `daemon.log`
-  says `cannot listen on …` and berth retries every 5 s until it's free.
+  forwarded, and under it each port that isn't (`not forwarded: …`) with
+  why; the app shows the same in a banner. berth retries those every 5 s,
+  so a port held by something on the Mac comes up once it's free.
 - **A `--net host` server isn't reachable.** It appears on the Mac's
   `localhost` (not the LAN) within 2 s, if it listens on all interfaces or on
   loopback. Servers bound to one specific guest address aren't forwarded.
-- **Ports below 1024 on loopback** need the route helper
-  (`sudo berth helper install`): macOS lets users bind them only on all
-  interfaces.
+- **Ports below 1024 on loopback** (`-p 127.0.0.1:80:80`, DDEV's router)
+  need the route helper (`sudo berth helper install`, or Install Helper… in
+  the app's banner): macOS lets users bind them only on all interfaces.
+  Without it they show as not forwarded.
 - **Container IPs (`curl 172.17.0.2`) don't answer.** They need the route
   helper. The `IPs:` line of `berth status` shows its state.
 - **`<name>.berth.local` doesn't resolve.** macOS resolves `.local` names

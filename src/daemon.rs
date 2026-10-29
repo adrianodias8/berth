@@ -82,6 +82,12 @@ pub struct Status {
     pub memory: u64,
     #[serde(default)]
     pub ports: Vec<String>,
+    /// Ports that should be forwarded but couldn't be, with why.
+    #[serde(default)]
+    pub ports_unavailable: Vec<String>,
+    /// Installing the root helper would forward all of those.
+    #[serde(default)]
+    pub ports_need_helper: bool,
     /// Direct container IP routing, human-readable.
     #[serde(default)]
     pub container_ips: String,
@@ -453,6 +459,7 @@ async fn handle_control(stream: UnixStream, cpus: usize, memory: u64) -> Result<
         Request::Status => {
             let state = vm::state().await?;
             let running = vm::state_name(state) == "running";
+            let (ports_unavailable, ports_need_helper) = ports::unavailable();
             serde_json::to_string(&Status {
                 pid: std::process::id(),
                 vm: vm::state_name(state).to_string(),
@@ -460,6 +467,8 @@ async fn handle_control(stream: UnixStream, cpus: usize, memory: u64) -> Result<
                 cpus,
                 memory,
                 ports: ports::forwarded(),
+                ports_unavailable,
+                ports_need_helper,
                 container_ips: crate::routes::state(),
                 memory_used: crate::memory::GUEST_USED.load(std::sync::atomic::Ordering::Relaxed),
                 memory_allowed: crate::memory::TARGET.load(std::sync::atomic::Ordering::Relaxed),

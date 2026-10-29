@@ -57,6 +57,14 @@ static SYNC: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static PENDING: AtomicBool = AtomicBool::new(false);
 /// The last sync couldn't bind everything.
 static FAILED: AtomicBool = AtomicBool::new(false);
+/// What the last sync couldn't bind, and why.
+static UNAVAILABLE: Mutex<BTreeMap<Key, Unavailable>> = Mutex::new(BTreeMap::new());
+
+struct Unavailable {
+    reason: String,
+    /// Installing (or updating) the root helper would fix it.
+    needs_helper: bool,
+}
 const RETRY: Duration = Duration::from_secs(5);
 
 /// A listening socket of a host-network container, as the agent reports it.
@@ -136,6 +144,14 @@ pub fn forwarded() -> Vec<String> {
         .keys()
         .map(|&key| display(key))
         .collect()
+}
+
+/// Ports that should be forwarded but aren't, with why, for `berth status`
+/// and the app; and whether the root helper would fix them all.
+pub fn unavailable() -> (Vec<String>, bool) {
+    let unavailable = UNAVAILABLE.lock().unwrap();
+    let list = unavailable.iter().map(|(&key, u)| format!("{}: {}", display(key), u.reason)).collect();
+    (list, !unavailable.is_empty() && unavailable.values().all(|u| u.needs_helper))
 }
 
 fn display((bind, port, proto): Key) -> String {
@@ -281,7 +297,7 @@ async fn sync_now() -> Result<()> {
         let forwards = FORWARDS.lock().unwrap();
         wanted.into_iter().filter(|(key, _)| !forwards.contains_key(key)).collect()
     };
-    let mut failed = false;
+    let mut unavailable = BTreeMap::new();
     for (key, route) in missing {
         // Bind before spawning so a conflict is reported (and retried) now;
         // off the async workers, since the root helper may be asked.
@@ -311,11 +327,17 @@ async fn sync_now() -> Result<()> {
                 if !FAILED.load(Ordering::SeqCst) {
                     eprintln!("ports: cannot listen on {}: {err} (retrying)", display(key));
                 }
-                failed = true;
+                let needs_helper = err.get_ref().is_some_and(|e| e.is::<NeedsHelper>());
+                let reason = match err.kind() {
+                    std::io::ErrorKind::AddrInUse => "something on the Mac already uses it".to_string(),
+                    _ => err.to_string(),
+                };
+                unavailable.insert(key, Unavailable { reason, needs_helper });
             }
         }
     }
-    FAILED.store(failed, Ordering::SeqCst);
+    FAILED.store(!unavailable.is_empty(), Ordering::SeqCst);
+    *UNAVAILABLE.lock().unwrap() = unavailable;
     Ok(())
 }
 
@@ -332,10 +354,28 @@ fn privileged(addr: &str, port: u16, err: &std::io::Error) -> Option<std::net::I
     (err.kind() == std::io::ErrorKind::PermissionDenied && port < 1024 && ip.is_loopback()).then_some(ip)
 }
 
+/// A port the helper has to bind, and couldn't (not installed, outdated).
+#[derive(Debug)]
+struct NeedsHelper(String);
+
+impl std::fmt::Display for NeedsHelper {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NeedsHelper {}
+
+fn via_helper(ip: std::net::IpAddr, port: u16, udp: bool) -> std::io::Result<std::os::fd::OwnedFd> {
+    crate::helper::bind_privileged(ip, port, udp).map_err(|e| {
+        std::io::Error::other(NeedsHelper(format!("macOS reserves ports below 1024 on {ip} for root, and berth's helper {e:#}")))
+    })
+}
+
 fn bind_tcp(addr: &str, port: u16) -> std::io::Result<std::net::TcpListener> {
     std::net::TcpListener::bind((addr, port)).or_else(|err| {
         let Some(ip) = privileged(addr, port, &err) else { return Err(err) };
-        let fd = crate::helper::bind_privileged(ip, port, false).map_err(|e| std::io::Error::other(format!("{err}; helper: {e:#}")))?;
+        let fd = via_helper(ip, port, false)?;
         let listener = std::net::TcpListener::from(fd);
         // The helper only binds; listening is ours.
         if unsafe { libc::listen(std::os::fd::AsRawFd::as_raw_fd(&listener), 1024) } != 0 {
@@ -348,7 +388,7 @@ fn bind_tcp(addr: &str, port: u16) -> std::io::Result<std::net::TcpListener> {
 fn bind_udp(addr: &str, port: u16) -> std::io::Result<std::net::UdpSocket> {
     std::net::UdpSocket::bind((addr, port)).or_else(|err| {
         let Some(ip) = privileged(addr, port, &err) else { return Err(err) };
-        let fd = crate::helper::bind_privileged(ip, port, true).map_err(|e| std::io::Error::other(format!("{err}; helper: {e:#}")))?;
+        let fd = via_helper(ip, port, true)?;
         Ok(std::net::UdpSocket::from(fd))
     })
 }
@@ -570,6 +610,17 @@ mod tests {
         // Loopback UDP can't be relayed to the NAT address.
         assert_eq!(listener_forward(&listener("udp", 5000, "127.0.0.1")), vec![]);
         assert_eq!(listener_forward(&listener("sctp", 1, "::")), vec![]);
+    }
+
+    #[test]
+    fn loopback_below_1024_says_it_needs_the_helper() {
+        // Only meaningful where the helper can't bind it for us.
+        if std::path::Path::new(crate::helper::SOCKET).exists() || unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let err = bind_tcp("127.0.0.1", 80).unwrap_err();
+        assert!(err.get_ref().is_some_and(|e| e.is::<NeedsHelper>()), "{err}");
+        assert!(err.to_string().contains("sudo berth helper install"), "{err}");
     }
 
     #[test]

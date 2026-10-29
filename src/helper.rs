@@ -574,9 +574,9 @@ fn send_bound(stream: &UnixStream, req: &BindRequest) -> Result<()> {
 pub fn bind_privileged(bind: std::net::IpAddr, port: u16, udp: bool) -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::{AsRawFd, FromRawFd};
     if !Path::new(SOCKET).exists() {
-        bail!("needs the berth helper");
+        bail!("isn't installed (sudo berth helper install)");
     }
-    let mut stream = UnixStream::connect(SOCKET)?;
+    let mut stream = UnixStream::connect(SOCKET).context("isn't running (sudo berth helper install)")?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     writeln!(stream, "{}", serde_json::to_string(&BindRequest { bind, port, udp })?)?;
     let mut buf = [0u8; 256];
@@ -606,7 +606,7 @@ pub fn bind_privileged(bind: std::net::IpAddr, port: u16, udp: bool) -> Result<s
         }
     }
     let text = String::from_utf8_lossy(&buf[..n as usize]);
-    bail!("{}", text.trim().strip_prefix("error: ").unwrap_or("helper did not bind (outdated helper?)"))
+    bail!("couldn't bind it: {}", text.trim().strip_prefix("error: ").unwrap_or("outdated helper? (sudo berth helper install)"))
 }
 
 /// Ask the helper to make exactly `routes` active and, if given, point the

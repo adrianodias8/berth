@@ -36,6 +36,10 @@ struct BerthStatus: Decodable, Equatable {
     let memoryAllowed: UInt64?
     /// Why file sharing is slower than it could be, if it is.
     let fileSharingNote: String?
+    /// Published ports berth couldn't listen on, with why; and whether the
+    /// root helper would fix them all.
+    let portsUnavailable: [String]?
+    let portsNeedHelper: Bool?
 
     enum CodingKeys: String, CodingKey {
         case pid, vm, docker, cpus, memory, ports
@@ -43,6 +47,8 @@ struct BerthStatus: Decodable, Equatable {
         case memoryUsed = "memory_used"
         case memoryAllowed = "memory_allowed"
         case fileSharingNote = "file_sharing_note"
+        case portsUnavailable = "ports_unavailable"
+        case portsNeedHelper = "ports_need_helper"
     }
 
     /// The root helper predates abilities this berth needs; reinstall it.

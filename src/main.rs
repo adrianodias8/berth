@@ -810,8 +810,11 @@ fn status(paths: &Paths) -> Result<()> {
             if !s.file_sharing_note.is_empty() {
                 println!("         note: {}", s.file_sharing_note);
             }
-            if !s.ports.is_empty() {
-                println!("Ports:   {}", s.ports.join(", "));
+            if !s.ports.is_empty() || !s.ports_unavailable.is_empty() {
+                println!("Ports:   {}", if s.ports.is_empty() { "none".to_string() } else { s.ports.join(", ") });
+            }
+            for port in &s.ports_unavailable {
+                println!("         not forwarded: {port}");
             }
             println!("IPs:     {}", s.container_ips);
             println!("HTTPS:   {}", https_state(paths));

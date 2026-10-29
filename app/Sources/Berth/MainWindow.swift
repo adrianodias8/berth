@@ -72,6 +72,7 @@ struct MainWindow: View {
                 VStack(spacing: 0) {
                     HelperUpdateBanner()
                     FileSharingBanner()
+                    PortsBanner()
                     ErrorBanner()
                 }
             }
@@ -183,6 +184,41 @@ struct FileSharingBanner: View {
                     Button("Restart") { engine.restart() }
                 }
                 Button { dismissed = note } label: { Image(systemName: "xmark") }.buttonStyle(.borderless)
+            }
+            .padding(10)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+            .padding([.horizontal, .top], 12)
+        }
+    }
+}
+
+/// Published ports that aren't reachable on the Mac (src/ports.rs), and
+/// the helper install when that's what they need (ports below 1024 on
+/// 127.0.0.1, which macOS reserves for root).
+struct PortsBanner: View {
+    @EnvironmentObject var engine: Engine
+    @State private var message: String?
+
+    var body: some View {
+        if let ports = engine.status?.portsUnavailable, !ports.isEmpty, engine.status?.helperOutdated != true {
+            HStack {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(ports.count == 1 ? "A published port isn't forwarded to the Mac:" : "Published ports aren't forwarded to the Mac:")
+                    ForEach(ports.prefix(3), id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
+                    if ports.count > 3 { Text("and \(ports.count - 3) more (berth status)").font(.caption).foregroundStyle(.secondary) }
+                    if let message { Text(message).font(.caption).foregroundStyle(.red) }
+                }
+                .lineLimit(2).textSelection(.enabled)
+                Spacer()
+                if engine.status?.portsNeedHelper == true {
+                    Button("Install Helper…") {
+                        Task {
+                            // Ports are retried every few seconds, so they come up on their own.
+                            if case let .failed(error) = await Setup.installPrivileged(force: true) { message = error }
+                        }
+                    }
+                }
             }
             .padding(10)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))

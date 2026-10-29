@@ -2,6 +2,13 @@
 
 What changed, newest first. Details are in the commit messages.
 
+## Unreleased
+
+- **Ports:** a published port berth can't listen on is no longer only in
+  `daemon.log`: `berth status` and the app list it with why. Ports below
+  1024 on 127.0.0.1 without the helper say to install it, and the app's
+  banner has an Install Helper… button.
+
 ## 0.1.0 (2026-10-29)
 
 The first release: everything below, up to this date.
