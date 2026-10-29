@@ -150,6 +150,14 @@ keychain) it signs with the hardened runtime, and with
 and staples. Without them the app is ad-hoc signed and opens only on the Mac
 that built it.
 
+The app updates itself from the latest GitHub release (`app/Sources/Berth/Updater.swift`).
+For a release to reach users it must be published (not a draft or a
+prerelease), tagged `v<version>` with `<version>` the one in `Cargo.toml`,
+and carry `Berth-<version>.zip` and `Berth-<version>.zip.sha256` as
+`release.sh` names them. The app installs it only if it's signed by the same
+Developer ID team and notarized, so an ad-hoc release is never installed.
+Bump `version` in `Cargo.toml` (and `Cargo.lock`) for each release.
+
 Pushing a tag such as `v0.2.0` runs the same script in GitHub Actions
 (`.github/workflows/release.yml`) and attaches the zip to a release. The
 workflow's header lists the secrets it needs for signing and notarization;
@@ -157,7 +165,8 @@ without them it publishes an ad-hoc prerelease. It also attaches the guest
 kernel's source (`berth-kernel-<release>-source.tar`), which GPL-2.0 asks to
 go with the kernel binary in the app. A release made by hand needs it too:
 build the kernel with `KERNEL_SOURCE=1 guest/kernel/build.sh` and attach
-`target/kernel/source.tar` under that name.
+`target/kernel/source.tar` under that name. If the release already exists
+(made by hand) when the tag is pushed, the workflow does nothing.
 
 ## Commits and pull requests
 

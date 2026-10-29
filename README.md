@@ -14,9 +14,16 @@ from its code.
 
 ## Quick start
 
-You need an Apple Silicon Mac, Xcode and rustup (see [Requirements](#requirements)).
+You need an Apple Silicon Mac (see [Requirements](#requirements)).
 
-**1. Build and open the app**
+**1. Install the app**
+
+Download `Berth-<version>.zip` from the
+[latest release](https://github.com/adrianodias8/berth/releases/latest),
+unzip it and move `Berth.app` to Applications. Releases are signed and
+notarized, and the app updates itself (Settings › Updates).
+
+Or build it yourself, with Xcode and rustup:
 
 ```sh
 brew install rustup && rustup default stable
@@ -318,6 +325,13 @@ Berth.app embeds the `berth` CLI (`Contents/Helpers/berth`) and talks to the
 daemon's control socket and Docker's API over unix sockets; it adds no services of
 its own. Closing the window keeps it in the menu bar.
 
+Updates: once a day the app looks at this repository's latest GitHub release,
+and downloads a newer one in the background. It installs it only if it's
+signed by the same Developer ID team as the running app, notarized, and
+newer, and only when you click **Install and Restart** (Settings › Updates,
+or the menu bar). Installing shuts berth down, replaces the app and opens
+the new one, which starts berth again. Builds you make yourself don't update.
+
 - **Menu bar**: status, start/stop, running containers with start/stop and open-in-browser
 - **Containers**: grouped by Compose project; start/stop/restart/delete, open in
   browser, copy domain/IP. Per container:
@@ -574,8 +588,7 @@ discussions) and the limits above:
   `.berth.local` names reachable from other devices, client source IP preservation
 - **Memory**: returning freed memory to macOS needs a VMM with free-page reporting
   (Hypervisor.framework / libkrun); worth it only if it keeps Rosetta working
-- **Distribution**: auto-update (releases are signed and notarized once a
-  Developer ID is configured, see CONTRIBUTING); data location setting
+- **Distribution**: Homebrew cask; data location setting
 
 ## Documentation
 

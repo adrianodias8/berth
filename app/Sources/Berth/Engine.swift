@@ -199,7 +199,10 @@ final class Engine: ObservableObject {
                 try? await Task.sleep(for: .seconds(2))
             }
         }
-        if UserDefaults.standard.object(forKey: "autoStart") as? Bool ?? true {
+        // After an update the new app starts berth if the old one had it
+        // running (Updater.relaunch), whatever the setting.
+        if UserDefaults.standard.object(forKey: "autoStart") as? Bool ?? true
+            || UserDefaults.standard.bool(forKey: "startAfterUpdate") {
             Task { [weak self] in
                 try? await Task.sleep(for: .milliseconds(300))
                 if self?.status == nil { self?.start() }

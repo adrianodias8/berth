@@ -5,11 +5,13 @@ import SwiftUI
 struct BerthApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var engine = Engine()
+    @StateObject private var updater = Updater()
 
     var body: some Scene {
         Window("Berth", id: "main") {
             MainWindow()
                 .environmentObject(engine)
+                .environmentObject(updater)
                 .frame(minWidth: 900, minHeight: 560)
         }
         .defaultSize(width: 1100, height: 700)
@@ -19,12 +21,14 @@ struct BerthApp: App {
                     engine.isRunning ? engine.stop() : engine.start()
                 }
                 .keyboardShortcut("s", modifiers: [.command, .shift])
+                Button("Check for Updates…") { updater.checkInteractively(engine: engine) }
             }
         }
 
         MenuBarExtra {
             MenuBarContent()
                 .environmentObject(engine)
+                .environmentObject(updater)
         } label: {
             Image(systemName: engine.isRunning ? "ferry.fill" : "ferry")
         }
@@ -33,6 +37,7 @@ struct BerthApp: App {
         Settings {
             SettingsView()
                 .environmentObject(engine)
+                .environmentObject(updater)
         }
     }
 }
@@ -44,6 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 struct MenuBarContent: View {
     @EnvironmentObject var engine: Engine
+    @EnvironmentObject var updater: Updater
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -87,6 +93,15 @@ struct MenuBarContent: View {
 
             if let error = engine.lastError {
                 Text(error).font(.caption).foregroundStyle(.red).lineLimit(3)
+            }
+
+            if case let .ready(release) = updater.phase {
+                Divider()
+                HStack {
+                    Text("Berth \(release.version) is ready").font(.callout)
+                    Spacer()
+                    Button("Install…") { updater.confirmInstall(release, engine: engine) }
+                }
             }
 
             Divider()

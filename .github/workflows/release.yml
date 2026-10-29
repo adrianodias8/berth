@@ -22,9 +22,28 @@ permissions:
   contents: write
 
 jobs:
+  # A release made by hand (scripts/release.sh, then `gh release create`)
+  # before the tag was pushed: nothing to build.
+  exists:
+    runs-on: ubuntu-24.04
+    outputs:
+      found: ${{ steps.check.outputs.found }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # berth's guest kernel (guest/kernel), on an arm64 Linux runner: the same
   # build script as `guest/kernel/build.sh` runs in a container locally.
   kernel:
+    needs: exists
+    if: needs.exists.outputs.found != 'true'
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4

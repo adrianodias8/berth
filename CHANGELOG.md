@@ -6,6 +6,11 @@ are in the commit messages.
 ## Unreleased
 
 ### 2026-10-29
+- **Updates:** the app checks the latest GitHub release daily, downloads a
+  newer one in the background, and installs it when you click Install and
+  Restart (Settings › Updates, the menu bar, or Berth › Check for Updates…).
+  Only releases signed by the same Developer ID team and notarized are
+  installed. The repository is public; releases are on GitHub.
 - **Fixed:** a container running as a user of its own (the Oracle database
   image's uid 54321, PostgreSQL's) couldn't read or create files in a bind
   mount: the guest checked modes against your Mac uid. On berth's share

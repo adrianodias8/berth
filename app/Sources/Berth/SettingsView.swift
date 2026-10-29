@@ -3,6 +3,8 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject var engine: Engine
+    @EnvironmentObject var updater: Updater
+    @AppStorage("autoUpdate") private var autoUpdate = true
     @Environment(\.openWindow) private var openWindow
     @State private var config = BerthConfig.load()
     @State private var saved = BerthConfig.load()
@@ -103,6 +105,26 @@ struct SettingsView: View {
                 }
             }
 
+            SwiftUI.Section("Updates") {
+                LabeledContent("Version", value: updater.current)
+                if let reason = updater.unavailableReason {
+                    Text(reason).font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Toggle("Check for updates automatically", isOn: $autoUpdate)
+                    HStack {
+                        Text(updateStatus).font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        if case let .ready(release) = updater.phase {
+                            Button("Release Notes") { NSWorkspace.shared.open(release.notes) }
+                            Button("Install and Restart") { updater.confirmInstall(release, engine: engine) }
+                        } else {
+                            Button("Check Now") { Task { await updater.check() } }
+                                .disabled([.checking, .installing].contains(updater.phase) || isDownloading)
+                        }
+                    }
+                }
+            }
+
             SwiftUI.Section("Moving over") {
                 LabeledContent("Images, volumes and containers from OrbStack or Docker Desktop") {
                     Button("Import…") { showImport = true }.disabled(!engine.isRunning)
@@ -188,6 +210,24 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .sheet(isPresented: $showImport) { ImportSheet() }
         .frame(width: 520, height: 720)
+    }
+
+    private var isDownloading: Bool {
+        if case .downloading = updater.phase { return true }
+        return false
+    }
+
+    private var updateStatus: String {
+        switch updater.phase {
+        case .checking: return "Checking…"
+        case let .downloading(version): return "Downloading Berth \(version)…"
+        case let .ready(release): return "Berth \(release.version) is ready to install."
+        case .installing: return "Installing…"
+        case let .failed(message): return message
+        case .upToDate, .idle:
+            guard let last = updater.lastCheck else { return "Checked daily, from GitHub releases." }
+            return "Up to date. Last checked \(last.formatted(.relative(presentation: .named)))."
+        }
     }
 
     private func loadEngines() async {
