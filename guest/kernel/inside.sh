@@ -69,7 +69,9 @@ else
     cp fs/fuse/virtio_fs.c fs/fuse/virtiofs_poll.c
     patch -s fs/fuse/virtiofs_poll.c < "$patchfile"
     # And the one change outside the driver: files on its shares show as
-    # owned by the caller (fuse_getattr in dir.c).
+    # owned by the caller (fuse_getattr in dir.c). The tree is kept between
+    # builds, so start from the tarball's dir.c.
+    tar -xOf "$tarball" "linux-$version/fs/fuse/dir.c" > fs/fuse/dir.c
     patch -s -p1 < /guest/kernel/fuse-owner-$series.patch
 fi
 grep -q virtiofs_poll fs/fuse/Makefile || echo 'obj-$(CONFIG_VIRTIO_FS) += virtiofs_poll.o' >> fs/fuse/Makefile
