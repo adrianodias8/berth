@@ -2,7 +2,7 @@
 
 What changed, newest first. Details are in the commit messages.
 
-## Unreleased
+## 0.1.1 (2026-10-29)
 
 - **Ports:** a published port berth can't listen on is no longer only in
   `daemon.log`: `berth status` and the app list it with why. Ports below
