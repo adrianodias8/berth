@@ -1,9 +1,10 @@
 # Changelog
 
-berth has no releases yet; this lists what changed, newest first. Details
-are in the commit messages.
+What changed, newest first. Details are in the commit messages.
 
-## Unreleased
+## 0.1.0 (2026-10-29)
+
+The first release: everything below, up to this date.
 
 ### 2026-10-29
 - **Updates:** the app checks the latest GitHub release daily, downloads a
