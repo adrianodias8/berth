@@ -1,6 +1,6 @@
 --- a/fs/fuse/virtio_fs.c
 +++ b/fs/fuse/virtiofs_poll.c
-@@ -2,6 +2,21 @@
+@@ -2,6 +2,23 @@
  /*
   * virtio-fs: Virtio Filesystem
   * Copyright (C) 2018 Red Hat, Inc.
@@ -18,11 +18,13 @@
 + *    are still valid, is answered here without a round trip (tools like
 + *    Composer chmod every file they write two or three times);
 + *  - ioctls are answered here too: berth's host implements none (see
-+ *    local_ioctls).
++ *    local_ioctls);
++ *  - no default_permissions: the host, acting as the Mac user, decides
++ *    access (see virtio_fs_ctx_set_defaults).
   */
  
  #include <linux/fs.h>
-@@ -59,6 +74,7 @@
+@@ -59,6 +76,7 @@
  	struct completion in_flight_zero; /* No inflight requests */
  	struct kobject *kobj;
  	char name[VQ_NAME_LEN];
@@ -30,12 +32,10 @@
  } ____cacheline_aligned_in_smp;
  
  /* A virtio-fs device instance */
-@@ -823,6 +839,30 @@
- 
- 	virtio_fs_request_complete(w->req, w->fsvq);
+@@ -825,6 +843,30 @@
  	kfree(w);
-+}
-+
+ }
+ 
 +/* berth: the end of virtio_fs_requests_done_work, shared with polling. */
 +static void virtio_fs_end_reqs(struct virtio_fs_vq *fsvq, struct list_head *reqs)
 +{
@@ -58,10 +58,12 @@
 +			virtio_fs_request_complete(req, fsvq);
 +		}
 +	}
- }
- 
++}
++
  static void virtio_fs_requests_done_work(struct work_struct *work)
-@@ -832,7 +872,6 @@
+ {
+ 	struct virtio_fs_vq *fsvq = container_of(work, struct virtio_fs_vq,
+@@ -832,7 +874,6 @@
  	struct fuse_pqueue *fpq = &fsvq->fud->pq;
  	struct virtqueue *vq = fsvq->vq;
  	struct fuse_req *req;
@@ -69,7 +71,7 @@
  	unsigned int len;
  	LIST_HEAD(reqs);
  
-@@ -853,23 +892,7 @@
+@@ -853,23 +894,7 @@
  	} while (!virtqueue_enable_cb(vq));
  	spin_unlock(&fsvq->lock);
  
@@ -94,7 +96,7 @@
  
  	/* Try to push previously queued requests, as the queue might no longer be full */
  	spin_lock(&fsvq->lock);
-@@ -1235,8 +1258,11 @@
+@@ -1235,8 +1260,11 @@
  }
  #endif /* CONFIG_PM_SLEEP */
  
@@ -107,7 +109,7 @@
  	{},
  };
  
-@@ -1494,6 +1520,195 @@
+@@ -1494,6 +1522,195 @@
  	}
  
  	return ret;
@@ -303,7 +305,7 @@
  }
  
  static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
-@@ -1507,6 +1722,9 @@
+@@ -1507,6 +1724,9 @@
  
  	clear_bit(FR_PENDING, &req->flags);
  
@@ -313,10 +315,11 @@
  	fs = fiq->priv;
  	queue_id = fs->mq_map[raw_smp_processor_id()];
  
-@@ -1540,6 +1758,28 @@
+@@ -1539,6 +1759,28 @@
+ 		schedule_work(&fsvq->dispatch_work);
  		spin_unlock(&fsvq->lock);
  		return;
- 	}
++	}
 +
 +	/*
 +	 * berth: poll only for requests sent by __fuse_request_send(): not
@@ -338,11 +341,25 @@
 +	else {
 +		virtio_fs_poll_reply(fsvq, req);
 +		atomic_set(&fsvq->polling, 0);
-+	}
+ 	}
  }
  
- static const struct fuse_iqueue_ops virtio_fs_fiq_ops = {
-@@ -1634,8 +1874,10 @@
+@@ -1552,7 +1794,13 @@
+ static inline void virtio_fs_ctx_set_defaults(struct fuse_fs_context *ctx)
+ {
+ 	ctx->rootmode = S_IFDIR;
+-	ctx->default_permissions = 1;
++	/*
++	 * berth: no default_permissions. The host serves every request as the
++	 * Mac user and macOS decides, so a container process of any uid gets
++	 * the Mac user's access, as on Docker Desktop and OrbStack. Checking
++	 * mode bits here, against the Mac user's uid, shut out every other uid.
++	 */
++	ctx->default_permissions = 0;
+ 	ctx->allow_other = 1;
+ 	ctx->max_read = UINT_MAX;
+ 	ctx->blksize = 512;
+@@ -1634,8 +1882,10 @@
  	/* Stop dax worker. Soon evict_inodes() will be called which
  	 * will free all memory ranges belonging to all inodes.
  	 */
@@ -355,7 +372,7 @@
  
  	/* Stop forget queue. Soon destroy will be sent */
  	spin_lock(&fsvq->lock);
-@@ -1781,7 +2023,7 @@
+@@ -1781,7 +2031,7 @@
  
  static struct file_system_type virtio_fs_type = {
  	.owner		= THIS_MODULE,
@@ -364,7 +381,7 @@
  	.init_fs_context = virtio_fs_init_fs_context,
  	.kill_sb	= virtio_kill_sb,
  	.fs_flags	= FS_ALLOW_IDMAP,
-@@ -1801,7 +2043,7 @@
+@@ -1801,7 +2051,7 @@
  
  static int __init virtio_fs_sysfs_init(void)
  {
@@ -373,7 +390,7 @@
  					     fs_kobj);
  	if (!virtio_fs_kset)
  		return -ENOMEM;
-@@ -1849,7 +2091,7 @@
+@@ -1849,7 +2099,7 @@
  module_exit(virtio_fs_exit);
  
  MODULE_AUTHOR("Stefan Hajnoczi <stefanha@redhat.com>");

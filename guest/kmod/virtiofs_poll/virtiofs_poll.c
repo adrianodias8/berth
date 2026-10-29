@@ -16,7 +16,9 @@
  *    are still valid, is answered here without a round trip (tools like
  *    Composer chmod every file they write two or three times);
  *  - ioctls are answered here too: berth's host implements none (see
- *    local_ioctls).
+ *    local_ioctls);
+ *  - no default_permissions: the host, acting as the Mac user, decides
+ *    access (see virtio_fs_ctx_set_defaults).
  */
 
 #include <linux/fs.h>
@@ -1750,7 +1752,13 @@ static const struct fuse_iqueue_ops virtio_fs_fiq_ops = {
 static inline void virtio_fs_ctx_set_defaults(struct fuse_fs_context *ctx)
 {
 	ctx->rootmode = S_IFDIR;
-	ctx->default_permissions = 1;
+	/*
+	 * berth: no default_permissions. The host serves every request as the
+	 * Mac user and macOS decides, so a container process of any uid gets
+	 * the Mac user's access, as on Docker Desktop and OrbStack. Checking
+	 * mode bits here, against the Mac user's uid, shut out every other uid.
+	 */
+	ctx->default_permissions = 0;
 	ctx->allow_other = 1;
 	ctx->max_read = UINT_MAX;
 	ctx->blksize = 512;

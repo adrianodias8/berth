@@ -56,6 +56,15 @@ guest app ─ syscall ─ Linux FUSE ─ virtio-fs driver ═ virtqueue ═ Virt
     walk over every node holds one shard at a time.
   - It replies ESTALE when the guest refers to something removed on the Mac,
     so the kernel looks it up again.
+  - Files show as owned by whoever looks, as on OrbStack, and access is the
+    Mac user's: a container running as any uid (the Oracle image's 54321,
+    PostgreSQL's 999) can use what you can, and what it creates is yours on
+    the Mac. The polling driver mounts without `default_permissions`, so the
+    guest kernel leaves access checks to the server, which works as the Mac
+    user; `access(2)` and `chdir` ask it too. berth's kernel reports the
+    caller as owner in `stat` (`guest/kernel/fuse-owner-7.2.patch`); with
+    Debian's kernel the server reports the uid of the request, and the
+    guest's cached attributes show whoever asked last, for up to 1 s.
 - **`src/fuse/nofollow.rs`**: every call refuses symlinks in any path
   component (`O_NOFOLLOW_ANY` and friends, or the parent directory plus
   `*at` calls). A container swapping a directory for a symlink can't lead
@@ -222,4 +231,7 @@ can't run.
 - Cache coherency relies on FSEvents: a change on the Mac reaches the guest
   in ~0.6 s. Until then the guest may use cached names, for at most the
   entry timeout.
+- Apple's share (before macOS 27, or `file_sharing` set to `apple`) still
+  checks modes against the owner it shows: a container running as another
+  uid can only use files whose "other" bits allow it.
 - More in `docs/KNOWN_ISSUES.md`.

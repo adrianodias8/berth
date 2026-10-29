@@ -1,0 +1,31 @@
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -2381,6 +2381,7 @@
+ {
+ 	struct inode *inode = d_inode(path->dentry);
+ 	struct fuse_conn *fc = get_fuse_conn(inode);
++	int err;
+ 
+ 	if (fuse_is_bad(inode))
+ 		return -EIO;
+@@ -2398,7 +2399,19 @@
+ 		return -EACCES;
+ 	}
+ 
+-	return fuse_update_get_attr(idmap, inode, NULL, stat, request_mask, flags);
++	err = fuse_update_get_attr(idmap, inode, NULL, stat, request_mask, flags);
++	/*
++	 * berth: on berth's shares (virtiofs_poll) files show as owned by
++	 * whoever looks, as on OrbStack. The host acts as the Mac user for every
++	 * uid (see virtiofs_poll.c), and tools that insist on owning their files
++	 * (PostgreSQL's data directory, ssh keys, git's safe.directory) then
++	 * accept them.
++	 */
++	if (!err && !strcmp(inode->i_sb->s_type->name, "virtiofs_poll")) {
++		stat->uid = current_fsuid();
++		stat->gid = current_fsgid();
++	}
++	return err;
+ }
+ 
+ static const struct inode_operations fuse_dir_inode_operations = {

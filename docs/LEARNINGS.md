@@ -299,6 +299,15 @@ something here stops being true, fix it.
   finish before saving.
 - **Ownership:** guest root extracting tarballs, or Linux group IDs, makes
   `chown` fail on the Mac. Ignore EPERM like Apple's share does.
+- **Other uids:** virtio-fs mounts with `default_permissions`, so the guest
+  checks modes against the owner the server reports. Reporting the Mac
+  user's uid shut out containers running as their own user (Oracle 54321).
+  Reporting the requester's uid alone isn't enough: attributes are cached
+  per inode, so the next uid to look within the attribute timeout sees the
+  last one's. Mount without `default_permissions` (the server, as the Mac
+  user, decides, and FUSE_ACCESS answers `access(2)`), and override
+  `stat`'s uid/gid with the caller's in `fuse_getattr`. OrbStack, observed
+  from a container: root sees 0:0, uid 1000 sees 1000:1000, on the same file.
 - **The VM's Debian kernel** (6.12; berth's own is 7.2) builds FUSE and
   virtio-fs in (`=y`), exports the symbols a module needs, has no preempt count
   (`PREEMPT_VOLUNTARY`), and supports multiqueue virtio-fs (6.11+).

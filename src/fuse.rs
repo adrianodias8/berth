@@ -127,6 +127,12 @@ fn trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("BERTH_FS_TRACE").is_some())
 }
 
+thread_local! {
+    /// The uid and gid of the request being served, reported as the owner
+    /// of every file (see `attr`).
+    static CALLER: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// macOS errno → Linux errno. 1–34 are the same on both.
 fn linux_errno(mac: i32) -> i32 {
     match mac {
@@ -553,7 +559,8 @@ impl Server {
         if let Some(n) = self.opcodes.get(opcode as usize) {
             n.fetch_add(1, Ordering::Relaxed);
         }
-        let (_uid, _gid, pid, _extlen, _pad) = (r.u32()?, r.u32()?, r.u32()?, r.u16()?, r.u16()?);
+        let (uid, gid, pid, _extlen, _pad) = (r.u32()?, r.u32()?, r.u32()?, r.u16()?, r.u16()?);
+        CALLER.with(|c| c.set((uid, gid)));
         let result = match opcode {
             op::FORGET => {
                 let n = r.u64().unwrap_or(0);
@@ -652,7 +659,7 @@ impl Server {
                 let (fh, offset, size) = (r.u64().unwrap_or(0), r.u64().unwrap_or(0), r.u32().unwrap_or(0));
                 self.readdir(nodeid, fh, offset, size, true)
             }
-            op::ACCESS => self.path(nodeid).map(|_| Vec::new()),
+            op::ACCESS => self.access(nodeid, r.u32().unwrap_or(0)),
             // IOCTL among them: the polling driver answers those itself (local_ioctls).
             _ => Err(lerr::ENOSYS),
         };
@@ -808,8 +815,16 @@ impl Server {
         }
     }
 
+    /// fuse_attr for `m`, owned by the caller, as on OrbStack: the guest
+    /// driver leaves access checks to us and every request is served as the
+    /// Mac user anyway, so a container user of any uid can use the file, and
+    /// tools that insist on owning their files (PostgreSQL, ssh) accept it.
+    /// berth's kernel shows each caller itself in `stat`
+    /// (guest/kernel/fuse-owner-*.patch); on Debian's, attributes cached in
+    /// the guest show whoever asked last.
     fn attr(out: &mut Out, nodeid: u64, m: &Stat) {
         let (atime, mtime, ctime) = (m.atime(), m.mtime(), m.ctime());
+        let (uid, gid) = CALLER.with(|c| c.get());
         out.u64(nodeid)
             .u64(m.size())
             .u64(m.blocks())
@@ -821,8 +836,8 @@ impl Server {
             .u32(ctime.1)
             .u32(m.mode())
             .u32(m.nlink())
-            .u32(m.uid())
-            .u32(m.gid())
+            .u32(uid)
+            .u32(gid)
             .u32(m.rdev())
             .u32(m.blksize())
             .u32(0);
@@ -924,6 +939,13 @@ impl Server {
         out.u64(self.policy.attr.as_secs()).u32(self.policy.attr.subsec_nanos()).u32(0);
         Self::attr(&mut out, nodeid, m);
         out.0
+    }
+
+    /// access(2) and chdir, as the Mac user: the guest no longer checks
+    /// mode bits itself (no default_permissions in virtiofs_poll).
+    fn access(&self, nodeid: u64, mask: u32) -> Reply {
+        let path = self.path(nodeid)?;
+        nofollow::access(&path, mask).map(|()| Vec::new()).map_err(|e| io_errno(&e))
     }
 
     fn getattr(&self, nodeid: u64) -> Reply {
@@ -1871,6 +1893,40 @@ mod tests {
         rd.u64(dh).u64(0).u32(4096).u32(0).u64(0).u32(0).u32(0);
         assert_eq!(reply(&t, op::READDIR, d, &rd.0).0, 0, "open directory handle came back");
         assert_eq!(reply(&t, op::OPEN, f, &[0; 8]).0, -lerr::ENOSYS);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn files_are_the_callers_and_access_is_the_mac_users() {
+        let dir = tempdir("owner");
+        fs::create_dir(dir.join("sub")).unwrap();
+        fs::write(dir.join("sub/f"), "hi").unwrap();
+        fs::set_permissions(dir.join("sub/f"), std::os::unix::fs::PermissionsExt::from_mode(0o440)).unwrap();
+        let s = Server::new(dir.clone(), CachePolicy::default());
+        // A request from uid 54321 (the Oracle image's user).
+        let as_oracle = |opcode, nodeid, body: &[u8]| {
+            let mut req = header(opcode, nodeid, body);
+            req[24..32].copy_from_slice(&[0x31, 0xd4, 0, 0, 0x31, 0xd4, 0, 0]);
+            let r = s.handle(&req).unwrap();
+            (i32::from_le_bytes(r[4..8].try_into().unwrap()), r[16..].to_vec())
+        };
+        let (err, body) = as_oracle(op::LOOKUP, FUSE_ROOT_ID, &name("sub"));
+        assert_eq!(err, 0);
+        let ids = |b: &[u8], at: usize| (u32::from_le_bytes(b[at..at + 4].try_into().unwrap()), u32::from_le_bytes(b[at + 4..at + 8].try_into().unwrap()));
+        assert_eq!(ids(&body, 40 + 68), (54321, 54321), "owned by the caller");
+        let sub = u64::from_le_bytes(body[0..8].try_into().unwrap());
+        let (_, body) = reply(&s, op::LOOKUP, sub, &name("f"));
+        assert_eq!(ids(&body, 40 + 68), (501, 20));
+        let f = u64::from_le_bytes(body[0..8].try_into().unwrap());
+        // access(2): R_OK yes, W_OK no (0440), as the Mac user would get.
+        assert_eq!(reply(&s, op::ACCESS, f, &[4, 0, 0, 0, 0, 0, 0, 0]).0, 0);
+        assert_eq!(reply(&s, op::ACCESS, f, &[2, 0, 0, 0, 0, 0, 0, 0]).0, -13);
+        // sub swapped for a symlink to a writable copy: not followed.
+        fs::rename(dir.join("sub"), dir.join("old")).unwrap();
+        fs::create_dir(dir.join("old2")).unwrap();
+        fs::write(dir.join("old2/f"), "").unwrap();
+        std::os::unix::fs::symlink("old2", dir.join("sub")).unwrap();
+        assert_eq!(reply(&s, op::ACCESS, f, &[2, 0, 0, 0, 0, 0, 0, 0]).0, -40, "ELOOP, never through a symlink");
         fs::remove_dir_all(dir).ok();
     }
 

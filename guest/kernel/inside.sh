@@ -68,6 +68,9 @@ else
     [ -f "$patchfile" ] || { echo "no polling driver port for $series ($patchfile)" >&2; exit 1; }
     cp fs/fuse/virtio_fs.c fs/fuse/virtiofs_poll.c
     patch -s fs/fuse/virtiofs_poll.c < "$patchfile"
+    # And the one change outside the driver: files on its shares show as
+    # owned by the caller (fuse_getattr in dir.c).
+    patch -s -p1 < /guest/kernel/fuse-owner-$series.patch
 fi
 grep -q virtiofs_poll fs/fuse/Makefile || echo 'obj-$(CONFIG_VIRTIO_FS) += virtiofs_poll.o' >> fs/fuse/Makefile
 
@@ -109,7 +112,8 @@ from these files, under GPL-2.0 (guest/LICENSE-GPL-2.0):
 
 - $(basename "$tarball"): the unmodified upstream source
 - guest/kernel/: berth's build scripts (inside.sh does the build),
-  config.fragment, modules.txt, and the polling virtio-fs driver's patch
+  config.fragment, modules.txt, the polling virtio-fs driver's patch and
+  fuse-owner-*.patch (its one change to fs/fuse/dir.c)
 - guest/kmod/virtiofs_poll/: the same driver for Linux 6.12
 - config: the final .config the kernel was built with
 - debian-6.12-arm64.config: Debian's config that inside.sh starts from
@@ -117,7 +121,7 @@ from these files, under GPL-2.0 (guest/LICENSE-GPL-2.0):
 
 To rebuild, run guest/kernel/build.sh from a berth checkout (it runs
 inside.sh in a debian:trixie container), or follow inside.sh by hand: unpack
-the tarball, apply the driver patch, start from Debian's config, then
+the tarball, apply the two patches, start from Debian's config, then
 modules.txt and config.fragment, and build Image and modules.
 SOURCE
     tar -C /tmp/source -cf /out/source.tar "$(basename "$src")"

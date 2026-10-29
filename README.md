@@ -212,8 +212,8 @@ Memory figures are system-wide and move by a few hundred MB with other apps.
   by berth's own
   file sharing on macOS 27 (Apple's virtiofs before): 3x faster than Apple's on
   small files and close to OrbStack (20k files extracted in 2.4 s; OrbStack
-  2.3 s, Apple's 7.5 s; read back in 0.75 s, OrbStack 0.63 s), real file
-  ownership in containers, and file change
+  2.3 s, Apple's 7.5 s; read back in 0.75 s, OrbStack 0.63 s), files a
+  container of any user can use, as on OrbStack, and file change
   notifications forwarded so hot reload works (`docs/file-sharing.md`)
 - Kubernetes: `berth k8s enable` gives a single-node k3s using berth's Docker, so
   locally built images run in pods without a registry; `berth` kubectl context,

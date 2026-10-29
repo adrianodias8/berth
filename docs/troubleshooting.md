@@ -103,6 +103,12 @@ and boot messages). `berth shell` opens a shell in the VM.
 - **A change on the Mac shows up late in a container.** Changes are
   forwarded from FSEvents, which takes ~0.6 s. Deleting a folder on the Mac
   raises IN_DELETE for the folder only, not for each file in it.
+- **"Permission denied" for a container that runs as its own user** (the
+  Oracle database image, PostgreSQL) on a bind mount: fixed on berth's
+  share (files show as owned by whoever looks, access is yours).
+  On Apple's share (before macOS 27, or `file_sharing` set to `apple`) only
+  the files' "other" bits apply to that user: `chmod -R o+rwX` the folder on
+  the Mac.
 - **"Operation not permitted" changing ownership** (`chown`, `rsync -g`)
   on Apple's share: files there show as root-owned. Use berth's share
   (the default on macOS 27).

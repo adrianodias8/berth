@@ -5,6 +5,14 @@ are in the commit messages.
 
 ## Unreleased
 
+### 2026-10-29
+- **Fixed:** a container running as a user of its own (the Oracle database
+  image's uid 54321, PostgreSQL's) couldn't read or create files in a bind
+  mount: the guest checked modes against your Mac uid. On berth's share
+  files now show as owned by whoever looks, as on OrbStack, and access is
+  your Mac user's, decided on the Mac. `access(2)` answers as the Mac user
+  too. Needs berth's kernel, which ships in the app.
+
 ### 2026-10-25
 - **Fixed:** berth took `/var/run/docker.sock` back every 15 s from an
   engine started after it (OrbStack's app); it now points the socket at

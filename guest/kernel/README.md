@@ -70,5 +70,8 @@ A new 7.2.y stable release: change the default version in `inside.sh`,
 rebuild, run `KCHECK_K8S=1 check.sh`, release. Another series needs the
 polling driver ported: it is berth's changes as a patch on that series'
 `fs/fuse/virtio_fs.c` (`virtiofs_poll-<series>.patch`); 6.12 uses the
-driver's own source (guest/kmod/virtiofs_poll). 7.2 isn't a long-term
+driver's own source (guest/kmod/virtiofs_poll). The one change outside
+the driver, `fuse-owner-<series>.patch`, makes `stat` on berth's shares
+report the caller as the owner; Debian's 6.12 has no such change, so there
+the host reports the uid of whoever asked last. 7.2 isn't a long-term
 release: move to the next one before its support ends.

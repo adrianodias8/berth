@@ -61,12 +61,6 @@ impl Stat {
     pub fn nlink(&self) -> u32 {
         u32::from(self.0.st_nlink)
     }
-    pub fn uid(&self) -> u32 {
-        self.0.st_uid
-    }
-    pub fn gid(&self) -> u32 {
-        self.0.st_gid
-    }
     pub fn rdev(&self) -> u32 {
         self.0.st_rdev as u32
     }
@@ -160,6 +154,13 @@ pub fn remove(path: &Path, dir: bool) -> io::Result<()> {
 pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
     let (f, t) = (cstr(from)?, cstr(to)?);
     check(unsafe { libc::renameatx_np(libc::AT_FDCWD, f.as_ptr(), libc::AT_FDCWD, t.as_ptr(), RENAME_NOFOLLOW_ANY) })
+}
+
+/// `access(2)` as this process (the Mac user). R_OK, W_OK and X_OK have the
+/// same values on Linux.
+pub fn access(path: &Path, mask: u32) -> io::Result<()> {
+    let c = cstr(path)?;
+    check(unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), (mask & 7) as libc::c_int, libc::AT_EACCESS | AT_SYMLINK_NOFOLLOW_ANY) })
 }
 
 pub fn chmod(path: &Path, mode: u32) -> io::Result<()> {

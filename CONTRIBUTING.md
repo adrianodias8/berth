@@ -132,6 +132,9 @@ the opt-out. The driver is in two forms, which must change together:
 - `guest/kernel/virtiofs_poll-7.2.patch`: the same changes on 7.2's
   `virtio_fs.c`, applied when the kernel is built.
 
+One more patch, `guest/kernel/fuse-owner-7.2.patch`, changes 7.2's
+`fs/fuse/dir.c`: on berth's shares `stat` shows the caller as the owner.
+
 Moving to another kernel series means porting the patch to that series'
 FUSE internals. A bug here can hang or crash the guest: run
 `KCHECK_K8S=1 guest/kernel/check.sh`, a DDEV run, and test unmounting, and
