@@ -2,6 +2,12 @@
 
 What changed, newest first. Details are in the commit messages.
 
+## 0.1.2 (2026-11-01)
+
+- **Fixed:** the menu bar panel no longer drops away from the menu bar
+  when its container list shrinks while it is open (`ddev poweroff`), and
+  no longer leaves the old size's shadow behind.
+
 ## 0.1.1 (2026-10-29)
 
 - **Ports:** a published port berth can't listen on is no longer only in
