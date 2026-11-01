@@ -117,6 +117,46 @@ struct MenuBarContent: View {
         }
         .padding(12)
         .frame(width: 320)
+        .background(MenuBarWindowAnchor())
+    }
+}
+
+/// MenuBarExtra's window resizes from its bottom-left origin, so when the
+/// list shrinks with the panel open (`ddev poweroff` removing a dozen
+/// containers) its top drops away from the menu bar, leaving the old size's
+/// shadow behind. Keep the top edge where it was and redraw the shadow.
+private struct MenuBarWindowAnchor: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { AnchorView() }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    final class AnchorView: NSView {
+        private var last = NSRect.zero
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            NotificationCenter.default.removeObserver(self)
+            guard let window else { return }
+            last = window.frame
+            NotificationCenter.default.addObserver(self, selector: #selector(resized), name: NSWindow.didResizeNotification, object: window)
+            NotificationCenter.default.addObserver(self, selector: #selector(moved), name: NSWindow.didMoveNotification, object: window)
+        }
+
+        @objc private func resized() {
+            guard let window else { return }
+            let frame = window.frame
+            // Only the height changed: SwiftUI fitting the content (its y may
+            // also have moved, AppKit keeping a taller panel on screen). A new
+            // x is the system placing the panel under the icon; keep that.
+            if frame.minX == last.minX, frame.width == last.width, frame.height != last.height {
+                window.setFrameTopLeftPoint(NSPoint(x: frame.minX, y: last.maxY))
+            }
+            window.invalidateShadow()
+            last = window.frame
+        }
+
+        @objc private func moved() {
+            if let window { last = window.frame }
+        }
     }
 }
 
