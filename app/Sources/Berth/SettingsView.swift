@@ -36,7 +36,62 @@ struct SettingsView: View {
     private let hostCPUs = ProcessInfo.processInfo.activeProcessorCount
     private let hostMemoryGiB = Int(ProcessInfo.processInfo.physicalMemory >> 30)
 
+    /// One tab per area, macOS Settings style; each tab is as tall as its form.
     var body: some View {
+        TabView {
+            general.tabItem { Label("General", systemImage: "gearshape") }
+            resources.tabItem { Label("Resources", systemImage: "cpu") }
+            network.tabItem { Label("Network", systemImage: "network") }
+            advanced.tabItem { Label("Advanced", systemImage: "wrench.and.screwdriver") }
+        }
+        .sheet(isPresented: $showImport) { ImportSheet() }
+        .frame(width: 520)
+    }
+
+    private var general: some View {
+        Form {
+            SwiftUI.Section("Startup") {
+                Toggle("Start Berth when the app opens", isOn: $autoStart)
+                Toggle("Keep containers running across stops (resume on start)", isOn: Binding(
+                    get: { config.stop == "suspend" },
+                    set: { setStop($0 ? "suspend" : nil) }
+                ))
+                Toggle("Open at login", isOn: $launchAtLogin)
+                    .onChange(of: launchAtLogin) { _, on in
+                        do {
+                            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+                        } catch {
+                            engine.lastError = "Open at login: \(error.localizedDescription)"
+                            launchAtLogin = SMAppService.mainApp.status == .enabled
+                        }
+                    }
+            }
+
+            SwiftUI.Section("Updates") {
+                LabeledContent("Version", value: updater.current)
+                if let reason = updater.unavailableReason {
+                    Text(reason).font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Toggle("Check for updates automatically", isOn: $autoUpdate)
+                    HStack {
+                        Text(updateStatus).font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        if case let .ready(release) = updater.phase {
+                            Button("Release Notes") { NSWorkspace.shared.open(release.notes) }
+                            Button("Install and Restart") { updater.confirmInstall(release, engine: engine) }
+                        } else {
+                            Button("Check Now") { Task { await updater.check() } }
+                                .disabled([.checking, .installing].contains(updater.phase) || isDownloading)
+                        }
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var resources: some View {
         Form {
             SwiftUI.Section("Resources") {
                 Stepper(value: cpusBinding, in: 1...hostCPUs) {
@@ -104,50 +159,13 @@ struct SettingsView: View {
                     }
                 }
             }
+        }
+        .formStyle(.grouped)
+        .fixedSize(horizontal: false, vertical: true)
+    }
 
-            SwiftUI.Section("Updates") {
-                LabeledContent("Version", value: updater.current)
-                if let reason = updater.unavailableReason {
-                    Text(reason).font(.caption).foregroundStyle(.secondary)
-                } else {
-                    Toggle("Check for updates automatically", isOn: $autoUpdate)
-                    HStack {
-                        Text(updateStatus).font(.caption).foregroundStyle(.secondary)
-                        Spacer()
-                        if case let .ready(release) = updater.phase {
-                            Button("Release Notes") { NSWorkspace.shared.open(release.notes) }
-                            Button("Install and Restart") { updater.confirmInstall(release, engine: engine) }
-                        } else {
-                            Button("Check Now") { Task { await updater.check() } }
-                                .disabled([.checking, .installing].contains(updater.phase) || isDownloading)
-                        }
-                    }
-                }
-            }
-
-            SwiftUI.Section("Moving over") {
-                LabeledContent("Images, volumes and containers from OrbStack or Docker Desktop") {
-                    Button("Import…") { showImport = true }.disabled(!engine.isRunning)
-                }
-            }
-
-            SwiftUI.Section("Startup") {
-                Toggle("Start Berth when the app opens", isOn: $autoStart)
-                Toggle("Keep containers running across stops (resume on start)", isOn: Binding(
-                    get: { config.stop == "suspend" },
-                    set: { setStop($0 ? "suspend" : nil) }
-                ))
-                Toggle("Open at login", isOn: $launchAtLogin)
-                    .onChange(of: launchAtLogin) { _, on in
-                        do {
-                            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
-                        } catch {
-                            engine.lastError = "Open at login: \(error.localizedDescription)"
-                            launchAtLogin = SMAppService.mainApp.status == .enabled
-                        }
-                    }
-            }
-
+    private var network: some View {
+        Form {
             SwiftUI.Section("Networking") {
                 LabeledContent("Container domains", value: "*.berth.local")
                 LabeledContent("Host from containers", value: "host.docker.internal")
@@ -160,15 +178,6 @@ struct SettingsView: View {
                 }
                 if let helperMessage { Text(helperMessage).font(.caption).foregroundStyle(.secondary) }
             }
-
-            SwiftUI.Section("Container engines") {
-                LabeledContent("Docker", value: "Always on")
-                Toggle("Podman", isOn: engineBinding("podman"))
-                Toggle("nerdctl (containerd)", isOn: engineBinding("nerdctl"))
-                Text(engineMessage ?? "Podman: `podman` on your Mac uses berth. nerdctl: `nerdctl` runs in the VM. Containers from every engine get ports, domains and IPs.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            .task { await loadEngines() }
 
             SwiftUI.Section("HTTPS") {
                 LabeledContent("Container domains over HTTPS", value: httpsTrusted ? "On" : "Certificate not trusted")
@@ -184,6 +193,30 @@ struct SettingsView: View {
                 }
                 if let httpsMessage { Text(httpsMessage).font(.caption).foregroundStyle(.secondary) }
             }
+        }
+        .formStyle(.grouped)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var advanced: some View {
+        Form {
+            SwiftUI.Section("Container engines") {
+                LabeledContent("Docker", value: "Always on")
+                Toggle("Podman", isOn: engineBinding("podman"))
+                Toggle("nerdctl (containerd)", isOn: engineBinding("nerdctl"))
+                Text(engineMessage ?? "Podman: `podman` on your Mac uses berth. nerdctl: `nerdctl` runs in the VM. Containers from every engine get ports, domains and IPs.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .task { await loadEngines() }
+
+            SwiftUI.Section("Docker") {
+                LabeledContent("Socket") { Text(BerthPaths.dockerSocket).textSelection(.enabled).font(.caption.monospaced()) }
+                LabeledContent("CLI") { Text("docker context use berth").textSelection(.enabled).font(.caption.monospaced()) }
+                HStack {
+                    Button("Show Data in Finder") { NSWorkspace.shared.open(BerthPaths.root) }
+                    Button("Open Daemon Log") { NSWorkspace.shared.open(BerthPaths.daemonLog) }
+                }
+            }
 
             SwiftUI.Section("Setup") {
                 HStack {
@@ -198,18 +231,14 @@ struct SettingsView: View {
                 }
             }
 
-            SwiftUI.Section("Docker") {
-                LabeledContent("Socket") { Text(BerthPaths.dockerSocket).textSelection(.enabled).font(.caption.monospaced()) }
-                LabeledContent("CLI") { Text("docker context use berth").textSelection(.enabled).font(.caption.monospaced()) }
-                HStack {
-                    Button("Show Data in Finder") { NSWorkspace.shared.open(BerthPaths.root) }
-                    Button("Open Daemon Log") { NSWorkspace.shared.open(BerthPaths.daemonLog) }
+            SwiftUI.Section("Moving over") {
+                LabeledContent("Images, volumes and containers from OrbStack or Docker Desktop") {
+                    Button("Import…") { showImport = true }.disabled(!engine.isRunning)
                 }
             }
         }
         .formStyle(.grouped)
-        .sheet(isPresented: $showImport) { ImportSheet() }
-        .frame(width: 520, height: 720)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private var isDownloading: Bool {
