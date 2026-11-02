@@ -23,7 +23,9 @@
 //! `berth-agent gui-local` for testing a build without replacing the agent.
 //! Only with `"gui": true` in berth's config.json.
 
+pub mod capture;
 mod exec;
+pub mod input;
 pub mod install;
 mod keys;
 mod sway;
@@ -111,11 +113,20 @@ pub fn enabled() -> bool {
 }
 
 /// The `gui <machine>` header: one request line, one reply line and its
-/// payload.
+/// payload; or, for a stream verb, the stream until either side closes.
 pub fn serve(machine: &str, mut host: std::os::unix::net::UnixStream) -> io::Result<()> {
     let mut input = host.try_clone()?;
     let reply = if enabled() {
-        handle_stream(machine, &mut input)
+        match read_request(&mut input) {
+            Ok(request) if STREAMS.contains(&request.verb.as_str()) => {
+                let peer = host.try_clone()?;
+                return stream(machine, &request, Box::new(input), &mut host, &move || {
+                    let _ = peer.shutdown(std::net::Shutdown::Both);
+                });
+            }
+            Ok(request) => answer(machine, &request, &mut input),
+            Err(reply) => (reply, Vec::new()),
+        }
     } else {
         (fail("Linux GUI sessions are off: set \"gui\": true in ~/.berth/config.json"), Vec::new())
     };
@@ -123,16 +134,98 @@ pub fn serve(machine: &str, mut host: std::os::unix::net::UnixStream) -> io::Res
     host.write_all(&reply.1)
 }
 
+/// The request line; a bad one is its reply.
+fn read_request(input: &mut dyn Read) -> Result<Request, Vec<u8>> {
+    let line = read_line(input, 4 << 20).map_err(|err| fail(&format!("bad request: {err}")))?;
+    serde_json::from_str::<Request>(&line).map_err(|err| fail(&format!("bad request: {err}")))
+}
+
 /// Read the request (and, for push, the tar stream after it) and answer.
 fn handle_stream(machine: &str, input: &mut dyn Read) -> (Vec<u8>, Vec<u8>) {
-    let line = match read_line(input, 4 << 20) {
-        Ok(line) => line,
-        Err(err) => return (fail(&format!("bad request: {err}")), Vec::new()),
-    };
-    match serde_json::from_str::<Request>(&line) {
+    match read_request(input) {
         Ok(request) => answer(machine, &request, input),
-        Err(err) => (fail(&format!("bad request: {err}")), Vec::new()),
+        Err(reply) => (reply, Vec::new()),
     }
+}
+
+/// Verbs that keep their connection open (docs/gui-protocol.md, Streams).
+const STREAMS: [&str; 2] = ["screen.stream", "input.stream"];
+
+/// How long a stream's process has to end by itself once the host has
+/// closed (input releases what it held) before it is stopped.
+const STREAM_GRACE: Duration = Duration::from_secs(2);
+
+/// A stream verb: the reply line, then the session's frame records to the
+/// host (screen.stream) or the host's input lines to the session
+/// (input.stream), until either side closes. What the process says on
+/// stdout goes to the host either way (input's `{"error"}` lines). `end`
+/// lets go of the host's connection, which a reader thread may be waiting
+/// on.
+fn stream(machine: &str, request: &Request, mut from_host: Box<dyn Read + Send>, to_host: &mut dyn Write, end: &dyn Fn()) -> io::Result<()> {
+    let mut child = match start_stream(machine, request) {
+        Ok(child) => child,
+        Err(err) => {
+            to_host.write_all(&fail(&err))?;
+            end();
+            return Ok(());
+        }
+    };
+    to_host.write_all(&line_of(&Reply { ok: true, result: json!({}), error: None, payload_len: 0, hit: None }))?;
+    to_host.flush()?;
+    let (Some(mut stdin), Some(mut stdout)) = (child.stdin(), child.stdout()) else {
+        return Err(io::Error::other("the stream's process has no pipes"));
+    };
+    let stopper = child.stopper();
+    std::thread::spawn(move || {
+        let _ = io::copy(&mut from_host, &mut stdin);
+        // The host has closed (or the stream is over): EOF for the process,
+        // and a stop if it's still there a moment later.
+        drop(stdin);
+        std::thread::sleep(STREAM_GRACE);
+        stopper.stop();
+    });
+    let sent = io::copy(&mut stdout, to_host).and_then(|_| to_host.flush());
+    drop(stdout);
+    if sent.is_ok() {
+        // The process ended: say why, when it didn't say itself.
+        let (code, stderr) = child.wait();
+        let last = if code == Some(3) || stderr.contains("berth-session-ended") {
+            Some("session ended".to_string())
+        } else {
+            (code != Some(0) && !stderr.is_empty()).then_some(stderr)
+        };
+        if let Some(error) = last {
+            let _ = to_host.write_all(capture::error_line(&error).as_bytes()).and_then(|()| to_host.flush());
+        }
+    }
+    // Stops the process if the host went away first.
+    drop(child);
+    end();
+    Ok(())
+}
+
+/// The process behind a stream, as the machine's user in the session.
+fn start_stream(machine: &str, request: &Request) -> Result<exec::Piped, String> {
+    if request.v != 1 {
+        return Err("unsupported version".into());
+    }
+    let m = Machine::open(machine).map_err(|e| e.to_string())?;
+    let s = resolve(&m, request.session.as_deref())?;
+    let rt = runtime(&s.session);
+    // The session's copy of this binary, current: one from an agent before
+    // this would take gui-capture for a request to start a whole agent.
+    let me = std::fs::read("/proc/self/exe").map_err(|e| e.to_string())?;
+    let refresh = format!("{}umask 077; cat > {rt}/.berth-gui-input.$$ && chmod 700 {rt}/.berth-gui-input.$$ && mv -f {rt}/.berth-gui-input.$$ {rt}/berth-gui-input", prelude(&s.session));
+    m.run(&refresh, &me, SHORT).map_err(|e| if e.to_string().contains("berth-session-ended") { format!("session {} has ended", s.session) } else { e.to_string() })?;
+    let (kind, command) = if request.verb == "screen.stream" {
+        let args = if request.args.is_null() { json!({}) } else { request.args.clone() };
+        ("cap", format!("gui-capture {}", quote(&args.to_string())))
+    } else {
+        ("inp", format!("gui-input {}x{}", s.size[0], s.size[1]))
+    };
+    // A unit per stream: several may watch one session.
+    let unit = format!("berth-gui-{}-{kind}-{}", s.session, &new_id()[2..]);
+    m.spawn_piped(&unit, &format!("{}exec $RT/berth-gui-input {command}", prelude(&s.session))).map_err(|e| format!("starting the stream: {e}"))
 }
 
 /// One request: the reply line (with its newline) and the payload.
@@ -191,6 +284,14 @@ pub fn local(args: &[String]) -> i32 {
         eprintln!("usage: berth-agent gui-local <machine> '<request json>' [payload-file]");
         return 2;
     };
+    // A stream runs on stdin and stdout until either closes.
+    if let Ok(request) = serde_json::from_str::<Request>(json.trim())
+        && STREAMS.contains(&request.verb.as_str())
+    {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        return if stream(machine, &request, Box::new(io::stdin()), &mut out, &|| {}).is_ok() { 0 } else { 1 };
+    }
     // The request line then stdin, read exactly as from the host.
     let mut input = io::Cursor::new(format!("{}\n", json.trim())).chain(io::stdin());
     let (line, payload) = handle_stream(machine, &mut input);
@@ -250,6 +351,9 @@ fn dispatch(machine: &str, request: &Request, payload: &mut dyn Read) -> Result<
     let verb = request.verb.as_str();
     if verb == "hello" {
         return Ok(Done::of(json!({"os": "linux", "agent": env!("CARGO_PKG_VERSION"), "screen": DEFAULT_SIZE, "scale": 1})));
+    }
+    if STREAMS.contains(&verb) {
+        return Err(format!("{verb} needs the gui channel (a stream)"));
     }
     let m = Machine::open(machine).map_err(|e| e.to_string())?;
     match verb {
@@ -1029,6 +1133,18 @@ mod tests {
         let (line, _) = answer("x", &req, &mut io::empty());
         let reply: Value = serde_json::from_slice(&line).unwrap();
         assert_eq!((reply["ok"].as_bool(), reply["result"]["os"].as_str()), (Some(true), Some("linux")));
+    }
+
+    #[test]
+    fn streams_need_the_channel() {
+        // Through answer (the machine action, a plain request) a stream verb
+        // is refused before any machine is looked at.
+        for verb in STREAMS {
+            let req: Request = serde_json::from_str(&format!(r#"{{"v":1,"verb":"{verb}"}}"#)).unwrap();
+            let (line, _) = answer("no-such-machine", &req, &mut io::empty());
+            let reply: Value = serde_json::from_slice(&line).unwrap();
+            assert_eq!(reply["error"], format!("{verb} needs the gui channel (a stream)"));
+        }
     }
 
     #[test]

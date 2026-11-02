@@ -8,7 +8,9 @@
 //! Arguments go to Command as argv, so only the scripts themselves are shell.
 
 use std::io::{self, Read, Write};
-use std::process::{Command, Stdio};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::machines;
@@ -151,6 +153,138 @@ pub fn run_with_timeout(mut cmd: Command, stdin: &[u8], timeout: Duration) -> io
 /// One shell word.
 pub fn quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\\''"))
+}
+
+/// A process in the machine whose stdin and stdout are ours: a session's
+/// stream (capture or input). Dropping it ends the process and its unit.
+pub struct Piped {
+    child: Child,
+    stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
+    stop: Stopper,
+}
+
+/// Ends a `Piped`'s process from another thread.
+#[derive(Clone)]
+pub struct Stopper {
+    machine: String,
+    unit: Option<String>,
+    pid: i32,
+    /// Set once the process has been waited for: its pid (and group) may
+    /// belong to someone else after that.
+    done: Arc<Mutex<bool>>,
+}
+
+impl Stopper {
+    pub fn stop(&self) {
+        let done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        if *done {
+            return;
+        }
+        if let Some(unit) = &self.unit {
+            let mut stop = Command::new("systemctl");
+            stop.args(["-M", &self.machine, "stop", unit]);
+            let _ = run_with_timeout(stop, &[], Duration::from_secs(10));
+        }
+        // Its own process group: nsenter, su and the shell under it.
+        unsafe { libc::kill(-self.pid, libc::SIGTERM) };
+    }
+}
+
+impl Piped {
+    pub fn stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    pub fn stdout(&mut self) -> Option<ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    pub fn stopper(&self) -> Stopper {
+        self.stop.clone()
+    }
+
+    /// Wait for the process to end: its exit code (None when killed) and the
+    /// last lines of its stderr.
+    pub fn wait(&mut self) -> (Option<i32>, String) {
+        // Reaped only under the lock, which isn't held while waiting: a
+        // stop() meanwhile still finds the process.
+        let status = loop {
+            {
+                let mut done = self.stop.done.lock().unwrap_or_else(|e| e.into_inner());
+                match self.child.try_wait() {
+                    Ok(Some(status)) => {
+                        *done = true;
+                        break Some(status);
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        *done = true;
+                        break None;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let stderr = self.stderr.take().and_then(|h| h.join().ok()).unwrap_or_default();
+        let text = String::from_utf8_lossy(&stderr);
+        let tail: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        (status.and_then(|s| s.code()), tail[tail.len().saturating_sub(3)..].join("; "))
+    }
+}
+
+impl Drop for Piped {
+    fn drop(&mut self) {
+        // Reaped under the lock, as in wait: a Stopper elsewhere must not
+        // signal a group whose pid may have been handed out again.
+        let exited = {
+            let mut done = self.stop.done.lock().unwrap_or_else(|e| e.into_inner());
+            if !*done && matches!(self.child.try_wait(), Ok(Some(_))) {
+                *done = true;
+            }
+            *done
+        };
+        if !exited {
+            self.stop.stop();
+            let _ = self.child.kill();
+        }
+        self.wait();
+    }
+}
+
+impl Machine {
+    /// Start `script` under `unit` with its stdin and stdout piped to us,
+    /// for as long as it runs: `systemd-run --pipe --wait` (the unit's
+    /// stdio are our pipes, handed over as they are), or nsenter + su.
+    pub fn spawn_piped(&self, unit: &str, script: &str) -> io::Result<Piped> {
+        let mut cmd;
+        if self.systemd {
+            cmd = Command::new("systemd-run");
+            cmd.args(["-M", &self.name, &format!("--uid={}", self.user), &format!("--unit={unit}"), "--pipe", "--quiet", "--wait", "--collect"]);
+            cmd.args(["-p", "WorkingDirectory=~", &format!("--setenv=BERTH_SCRIPT={script}"), "/bin/sh", "-c", SCRIPT_FROM_ENV]);
+        } else {
+            cmd = self.command(script)?;
+        }
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+        let mut child = cmd.spawn()?;
+        let mut err = child.stderr.take().unwrap();
+        // Kept whole while small; past 64 KiB, only what came last.
+        let stderr = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = err.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > 64 << 10 {
+                    buf.drain(..buf.len() - (16 << 10));
+                }
+            }
+            buf
+        });
+        let stop = Stopper { machine: self.name.clone(), unit: self.systemd.then(|| unit.to_string()), pid: child.id() as i32, done: Arc::new(Mutex::new(false)) };
+        Ok(Piped { child, stderr: Some(stderr), stop })
+    }
 }
 
 #[cfg(test)]
