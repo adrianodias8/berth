@@ -125,6 +125,15 @@ pub fn error_line(message: &str) -> String {
     format!("{}\n", serde_json::json!({ "error": message }))
 }
 
+/// What a stream's process says last for `err`: the compositor hanging up
+/// mid-stream is the session ending, as the protocol words it.
+pub fn last_word(err: &io::Error) -> String {
+    match err.kind() {
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset => "session ended".into(),
+        _ => err.to_string(),
+    }
+}
+
 // ---- Requests ----
 
 /// wl_shm.create_pool(new id, fd, size): the fd goes beside the bytes.
@@ -371,7 +380,7 @@ pub fn local(args: &[String]) -> i32 {
         Ok(()) => 0,
         Err(err) => {
             // Its last word on the stream, unless stdout is what failed.
-            let _ = out.write_all(error_line(&err.to_string()).as_bytes()).and_then(|()| out.flush());
+            let _ = out.write_all(error_line(&last_word(&err)).as_bytes()).and_then(|()| out.flush());
             1
         }
     }
@@ -510,6 +519,15 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(run(&mut out, &opts).unwrap_err().to_string(), "not implemented");
         assert_eq!(error_line("not implemented"), "{\"error\":\"not implemented\"}\n");
+    }
+
+    #[test]
+    fn a_compositor_hanging_up_ends_the_session() {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(theirs);
+        let err = Conn::over(ours).next_event().err().expect("an error");
+        assert_eq!(last_word(&err), "session ended");
+        assert_eq!(last_word(&io::Error::other("Wayland error: bad buffer")), "Wayland error: bad buffer");
     }
 
     /// The compositor's end of a connection: our requests in order, and the

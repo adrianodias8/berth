@@ -19,7 +19,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::capture::error_line;
+use super::capture::{error_line, last_word};
 use super::wayland::{self, Arg, Conn, encode};
 
 pub const KEYMAP: &str = include_str!("keymap-us.xkb");
@@ -282,7 +282,7 @@ pub fn local(args: &[String]) -> i32 {
         Ok(()) => 0,
         Err(err) => {
             let mut out = io::stdout();
-            let _ = out.write_all(error_line(&err.to_string()).as_bytes()).and_then(|()| out.flush());
+            let _ = out.write_all(error_line(&last_word(&err)).as_bytes()).and_then(|()| out.flush());
             1
         }
     }
