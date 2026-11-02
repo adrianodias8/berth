@@ -5,11 +5,20 @@ import Foundation
 final class UnixSocket {
     let fd: Int32
 
-    init(path: String) throws {
+    /// With a `timeout`, a read or write that waits longer throws
+    /// `SocketError.timedOut` instead of blocking forever. It bounds each
+    /// call, not the whole exchange.
+    init(path: String, timeout: TimeInterval? = nil) throws {
         fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw SocketError.posix("socket", errno) }
         var one: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+        if let timeout {
+            var tv = timeval(tv_sec: Int(timeout), tv_usec: Int32((timeout - timeout.rounded(.down)) * 1_000_000))
+            let len = socklen_t(MemoryLayout<timeval>.size)
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, len)
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, len)
+        }
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let bytes = Array(path.utf8)
@@ -42,6 +51,7 @@ final class UnixSocket {
                 let n = Darwin.write(fd, buf.baseAddress! + offset, buf.count - offset)
                 if n < 0 {
                     if errno == EINTR { continue }
+                    if errno == EAGAIN { throw SocketError.timedOut("write") }
                     throw SocketError.posix("write", errno)
                 }
                 offset += n
@@ -56,6 +66,8 @@ final class UnixSocket {
             let n = Darwin.read(fd, &buf, max)
             if n < 0 {
                 if errno == EINTR { continue }
+                // SO_RCVTIMEO expired.
+                if errno == EAGAIN { throw SocketError.timedOut("read") }
                 throw SocketError.posix("read", errno)
             }
             return n == 0 ? nil : Data(buf[0..<n])
@@ -70,10 +82,12 @@ final class UnixSocket {
 enum SocketError: LocalizedError {
     case posix(String, Int32)
     case message(String)
+    case timedOut(String)
 
     var errorDescription: String? {
         switch self {
         case let .posix(what, code): return "\(what): \(String(cString: strerror(code)))"
+        case let .timedOut(what): return "Docker didn't respond (\(what) timed out)"
         case let .message(m): return m
         }
     }
@@ -96,11 +110,20 @@ struct HTTPError: LocalizedError {
 /// HTTP/1.0 over a unix socket, so responses are never chunked: the body is
 /// everything until the server closes. Streams likewise end at close.
 enum UnixHTTP {
+    /// One-shot request with a timeout picked for the endpoint, so a hung
+    /// daemon can't hold the caller (and a thread) forever.
     static func request(
         _ socketPath: String, _ method: String, _ path: String, json: Any? = nil
     ) async throws -> HTTPResponse {
+        try await request(socketPath, method, path, json: json, timeout: defaultTimeout(method, path))
+    }
+
+    /// `timeout` bounds each read/write; nil waits indefinitely.
+    static func request(
+        _ socketPath: String, _ method: String, _ path: String, json: Any? = nil, timeout: TimeInterval?
+    ) async throws -> HTTPResponse {
         try await offPool {
-            let sock = try UnixSocket(path: socketPath)
+            let sock = try UnixSocket(path: socketPath, timeout: timeout)
             try sock.write(requestData(method, path, json: json))
             var data = Data()
             while let chunk = try sock.read() { data.append(chunk) }
@@ -110,6 +133,22 @@ enum UnixHTTP {
             }
             return response
         }
+    }
+
+    /// Docker answers these only once the work is done: a stop waits out the
+    /// container's grace period, deleting an image removes its layers, and an
+    /// exec start returns when the command exits.
+    private static func defaultTimeout(_ method: String, _ path: String) -> TimeInterval {
+        let route = path.split(separator: "?", maxSplits: 1).first.map(String.init) ?? path
+        let slow: Bool
+        switch method {
+        case "POST":
+            slow = route.hasSuffix("/stop") || route.hasSuffix("/restart")
+                || (route.hasPrefix("/exec/") && route.hasSuffix("/start"))
+        case "DELETE": slow = route.hasPrefix("/images/") || route.hasPrefix("/containers/")
+        default: slow = false
+        }
+        return slow ? 300 : 30
     }
 
     /// Body chunks until the server closes or the consumer stops listening.

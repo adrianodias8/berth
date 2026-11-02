@@ -90,11 +90,14 @@ final class Updater: ObservableObject {
             request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
             request.setValue("Berth/\(current)", forHTTPHeaderField: "User-Agent")
             let (data, response) = try await URLSession.shared.data(for: request)
-            UserDefaults.standard.set(Date(), forKey: "lastUpdateCheck")
             if (response as? HTTPURLResponse)?.statusCode == 404 {
+                UserDefaults.standard.set(Date(), forKey: "lastUpdateCheck")
                 phase = .upToDate // no release published yet
                 return
             }
+            try Self.requireOK(response, data)
+            // Only now: a failed check (rate limit, outage) is retried within the hour.
+            UserDefaults.standard.set(Date(), forKey: "lastUpdateCheck")
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
             let release = try decoder.decode(GitHubRelease.self, from: data)
@@ -121,9 +124,11 @@ final class Updater: ObservableObject {
         try? FileManager.default.removeItem(at: dir)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
-        let (sumData, _) = try await URLSession.shared.data(from: sumURL)
+        let (sumData, sumResponse) = try await URLSession.shared.data(from: sumURL)
+        try Self.requireOK(sumResponse, sumData)
         let expected = String(decoding: sumData, as: UTF8.self).split(separator: " ").first.map(String.init) ?? ""
-        let (downloaded, _) = try await URLSession.shared.download(from: zipURL)
+        let (downloaded, zipResponse) = try await URLSession.shared.download(from: zipURL)
+        try Self.requireOK(zipResponse, nil)
         let zip = dir.appendingPathComponent("Berth-\(version).zip")
         try FileManager.default.moveItem(at: downloaded, to: zip)
 
@@ -140,6 +145,19 @@ final class Updater: ObservableObject {
             try Self.verify(app, version: version, team: team)
             return app
         }
+    }
+
+    /// URLSession doesn't fail on HTTP errors, and GitHub's error bodies
+    /// would otherwise be decoded or checksummed as if they were the file.
+    private nonisolated static func requireOK(_ response: URLResponse, _ body: Data?) throws {
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard code != 200 else { return }
+        var message = "GitHub returned HTTP \(code)"
+        if let body, let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+           let detail = json["message"] as? String {
+            message += ": \(detail)"
+        }
+        throw UpdateError(message)
     }
 
     // MARK: Verifying
@@ -267,6 +285,11 @@ final class Updater: ObservableObject {
             case .upToDate: show("You're up to date", "Berth \(current) is the latest version.")
             case let .failed(message): show("Couldn't check for updates", message)
             case let .ready(release): confirmInstall(release, engine: engine)
+            // check() returns at once when one is already under way.
+            case .checking: show("Checking for updates…", "")
+            case let .downloading(version):
+                show("Downloading Berth \(version)…", "You'll be asked to install it when it's ready.")
+            case .installing: show("An update is being installed.", "")
             default: break
             }
         }

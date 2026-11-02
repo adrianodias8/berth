@@ -32,6 +32,9 @@ xcode-select -p                                  # Xcode, for the app and for ri
 ./scripts/build-app.sh && open target/Berth.app  # the app
 ```
 
+`xcodebuild -downloadComponent MetalToolchain` installs the Metal Toolchain;
+without it `build-app.sh` falls back to SwiftPM's native build system.
+
 If `cargo` isn't found, put the toolchain on your `PATH`
 (`~/.rustup/toolchains/stable-aarch64-apple-darwin/bin`). If ring fails to
 compile, set `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`

@@ -7,7 +7,14 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 
 "$root/scripts/build.sh"
-swift build -c release --package-path "$root/app"
+# SwiftPM's default build system compiles SwiftTerm's Metal shader, which
+# needs the Metal Toolchain (a separate Xcode download); the native one doesn't.
+build_system=""
+if ! xcrun metal --version >/dev/null 2>&1; then
+    echo "note: no Metal Toolchain; building with SwiftPM's native build system" >&2
+    build_system="--build-system native"
+fi
+swift build -c release --package-path "$root/app" $build_system
 
 app="$root/target/Berth.app"
 rm -rf "$app"

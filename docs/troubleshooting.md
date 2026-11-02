@@ -40,7 +40,8 @@ and boot messages). `berth shell` opens a shell in the VM.
   why; the app shows the same in a banner. berth retries those every 5 s,
   so a port held by something on the Mac comes up once it's free.
 - **A `--net host` server isn't reachable.** It appears on the Mac's
-  `localhost` (not the LAN) within 2 s, if it listens on all interfaces or on
+  `localhost` (not the LAN) within 2 s while a host-network container runs
+  (the first one can take up to 10 s), if it listens on all interfaces or on
   loopback. Servers bound to one specific guest address aren't forwarded.
 - **Ports below 1024 on loopback** (`-p 127.0.0.1:80:80`, DDEV's router)
   need the route helper (`sudo berth helper install`, or Install Helper… in

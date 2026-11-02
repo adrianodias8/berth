@@ -2,6 +2,31 @@
 
 What changed, newest first. Details are in the commit messages.
 
+## Unreleased
+
+- **App:** Settings is split into tabs (General, Resources, Network,
+  Advanced). The window remembers its section, with ⌘1–⌘7 and View ›
+  Refresh (⌘R); empty and no-match states for containers and images; the
+  Delete key removes selected images, volumes and networks (after the usual
+  confirmation); icon buttons have tooltips and VoiceOver labels.
+- **Fixed (app):** a restart no longer flashes Stopped with Start enabled
+  midway; a hung Docker daemon no longer freezes the app's status (requests
+  time out); a flood of output in a container terminal no longer freezes
+  the app; logs pick up again after a quick restart and no longer break
+  multi-byte characters; update checks report GitHub's HTTP errors instead
+  of a checksum mismatch.
+- **Fixed:** a short memory stall in the guest (containers stopping during
+  `ddev poweroff`) no longer hands the VM its whole configured memory, which
+  it then kept until restart. Stalls grow the limit by about half the guest's
+  use (all of it only when the guest is nearly out of room), and stalls right
+  after berth shrinks the limit are ignored.
+- **Fixed:** a burst of container events (`ddev poweroff`) now gets one
+  port sync instead of one per event, so a stopped project's ports are
+  freed on the Mac right away and a quick `ddev start` no longer finds
+  them still in use. A Podman, nerdctl or host-network listener query that
+  fails no longer drops that engine's forwarded ports: berth keeps them
+  and asks again within 5 s.
+
 ## 0.1.2 (2026-11-01)
 
 - **Fixed:** the menu bar panel no longer drops away from the menu bar

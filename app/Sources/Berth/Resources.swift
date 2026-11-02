@@ -54,7 +54,7 @@ struct FilesView: View {
                     HStack {
                         Text(actionError).font(.caption).foregroundStyle(.red).lineLimit(2)
                         Spacer()
-                        Button { self.actionError = nil } label: { Image(systemName: "xmark") }.buttonStyle(.borderless)
+                        Button { self.actionError = nil } label: { Image(systemName: "xmark") }.buttonStyle(.borderless).help("Dismiss")
                     }
                     .padding(8)
                 }
@@ -195,11 +195,25 @@ struct ImagesView: View {
             Button("Copy ID") { copy(ids.first ?? "") }
             Button("Delete", role: .destructive) { delete(ids) }
         }
+        .onDeleteCommand { delete(selection) }
+        .overlay {
+            if engine.images.isEmpty {
+                ContentUnavailableView {
+                    Label("No Images", systemImage: "square.stack.3d.up")
+                } description: {
+                    Text("Pull one here, or with docker pull.")
+                } actions: {
+                    Button("Pull Image…") { showPull = true }
+                }
+            }
+        }
         .toolbar {
             ToolbarItemGroup {
                 Button { showPull = true } label: { Label("Pull", systemImage: "arrow.down.circle") }
+                    .help("Pull an image")
                 Button { delete(selection) } label: { Label("Delete", systemImage: "trash") }
                     .disabled(selection.isEmpty)
+                    .help("Delete the selected images")
             }
         }
         .sheet(isPresented: $showPull) { PullSheet() }
@@ -316,10 +330,13 @@ struct VolumesView: View {
             }
             Button("Delete", role: .destructive) { delete(ids) }
         }
+        .onDeleteCommand { delete(selection) }
         .toolbar {
-            Button { delete(selection) } label: { Label("Delete", systemImage: "trash") }.disabled(selection.isEmpty)
+            Button { delete(selection) } label: { Label("Delete", systemImage: "trash") }
+                .disabled(selection.isEmpty)
+                .help("Delete the selected volumes")
         }
-        .overlay { if engine.volumes.isEmpty { EmptyHint(icon: "externaldrive", text: "No volumes") } }
+        .overlay { if engine.volumes.isEmpty { ContentUnavailableView("No Volumes", systemImage: "externaldrive") } }
         .navigationTitle("Volumes")
     }
 
@@ -359,11 +376,18 @@ struct NetworksView: View {
             .width(80)
         }
         .contextMenu(forSelectionType: DockerNetwork.ID.self) { ids in
-            let deletable = ids.filter { id in !(engine.networks.first { $0.id == id }?.isBuiltin ?? true) }
-            Button("Delete", role: .destructive) { delete(deletable) }.disabled(deletable.isEmpty)
+            let removable = deletable(ids)
+            Button("Delete", role: .destructive) { delete(removable) }.disabled(removable.isEmpty)
         }
+        // delete(_:) already ignores an empty set, e.g. only built-ins selected.
+        .onDeleteCommand { delete(deletable(selection)) }
         .navigationTitle("Networks")
         .navigationSubtitle(engine.status?.containerIps.map { "Container IPs: \($0)" } ?? "")
+    }
+
+    /// Docker refuses to remove bridge/host/none, so they're never offered.
+    private func deletable(_ ids: Set<DockerNetwork.ID>) -> Set<DockerNetwork.ID> {
+        ids.filter { id in !(engine.networks.first { $0.id == id }?.isBuiltin ?? true) }
     }
 
     private func delete(_ ids: Set<DockerNetwork.ID>) {

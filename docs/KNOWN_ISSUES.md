@@ -162,8 +162,6 @@ fix one, remove it here in the same change.
 - **Terminal sessions** are kept for the 8 terminals shown most recently;
   older ones are closed.
 - **UI:**
-  - logs re-attach when a container's running state changes, which a very
-    quick restart can slip between;
   - the Kubernetes screen shows pods, not services;
   - the CLI's `machine push/pull`, `config unset`, `delete`, the `kernel`
     setting and import's `--images/--volumes/--containers` aren't in the

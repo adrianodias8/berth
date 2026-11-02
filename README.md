@@ -461,7 +461,9 @@ connects there and splices bytes. The daemon follows Docker's event stream to
 open and close host listeners as containers with published ports start and stop.
 
 Host-network containers publish nothing, so the agent watches the guest's own
-socket tables (`/proc/net/tcp*`, `udp*`) every 2 s and keeps the listening
+socket tables (`/proc/net/tcp*`, `udp*`) every 2 s while a host-network
+container runs (every 10 s otherwise, so the first one's servers can take up
+to 10 s) and keeps the listening
 sockets owned by processes in a container cgroup (`docker-<id>.scope` and the
 like), which leaves out sshd, dockerd, k3s and the agent itself. When that set
 changes it asks the daemon to re-sync (a `sync` header on vsock 2401), and the

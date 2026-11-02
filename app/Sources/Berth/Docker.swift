@@ -183,18 +183,27 @@ enum Docker {
         return (try JSONSerialization.jsonObject(with: response.body) as? [String: Any]) ?? [:]
     }
 
-    /// Follows logs; yields text with stderr lines marked.
-    static func logs(_ id: String, tail: Int = 500) -> AsyncThrowingStream<String, Error> {
-        let raw = UnixHTTP.stream(socket, "GET", "/containers/\(id)/logs?stdout=1&stderr=1&follow=1&timestamps=0&tail=\(tail)")
+    /// Follows logs; yields text with stderr lines marked. With `since`, only
+    /// what was logged from then on, all of it rather than a tail.
+    static func logs(_ id: String, tail: Int = 500, since: Date? = nil) -> AsyncThrowingStream<String, Error> {
+        // Fractional seconds, so re-attaching doesn't repeat that second's lines.
+        let range = since.map { String(format: "since=%.6f&tail=all", $0.timeIntervalSince1970) } ?? "tail=\(tail)"
+        let raw = UnixHTTP.stream(socket, "GET", "/containers/\(id)/logs?stdout=1&stderr=1&follow=1&timestamps=0&\(range)")
         return AsyncThrowingStream { continuation in
             let task = Task {
                 var demux = StreamDemuxer()
+                // Per stream: chunks and frames can end mid-character, which
+                // decoding alone would turn into U+FFFD.
+                var carry: [Bool: Data] = [:]
                 do {
                     for try await chunk in raw {
                         for frame in demux.feed(chunk) {
-                            continuation.yield(String(decoding: frame.data, as: UTF8.self))
+                            var data = carry[frame.stderr, default: Data()] + frame.data
+                            carry[frame.stderr] = splitIncompleteUTF8(&data)
+                            if !data.isEmpty { continuation.yield(String(decoding: data, as: UTF8.self)) }
                         }
                     }
+                    for rest in carry.values where !rest.isEmpty { continuation.yield(String(decoding: rest, as: UTF8.self)) }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -202,6 +211,24 @@ enum Docker {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    /// Removes and returns a trailing incomplete UTF-8 sequence (at most 3
+    /// bytes); invalid bytes stay, to decode as U+FFFD.
+    static func splitIncompleteUTF8(_ data: inout Data) -> Data {
+        let end = data.endIndex
+        var i = end
+        while i > data.startIndex, end - i < 4 {
+            i -= 1
+            let b = data[i]
+            if b & 0xC0 == 0x80 { continue }  // continuation byte: keep looking for the lead
+            let need = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1
+            guard end - i < need else { return Data() }
+            let tail = Data(data[i...])
+            data.removeSubrange(i...)
+            return tail
+        }
+        return Data()
     }
 
     /// One CPU/memory sample (the daemon waits for two readings internally).
