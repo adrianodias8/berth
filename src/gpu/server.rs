@@ -313,8 +313,12 @@ pub struct Server {
     /// Set by MAP_BLOB and UNMAP_BLOB for `handle` to return.
     deferred: Option<Deferred>,
     /// Mapped blobs a reset removed, kept in the renderer until device.rs
-    /// has them out of the region.
-    orphans: HashSet<u32>,
+    /// has them out of the region, with the guest memory the renderer
+    /// still has as their iovecs.
+    orphans: HashMap<u32, Option<Backing>>,
+    /// Contexts CTX_DESTROY removed since device.rs last asked: their ring
+    /// fences will never signal.
+    destroyed: Vec<u32>,
 }
 
 type Answer = Result<Response, u32>;
@@ -342,7 +346,8 @@ impl Server {
             negotiated: 0,
             fence_seq: 0,
             deferred: None,
-            orphans: HashSet::new(),
+            orphans: HashMap::new(),
+            destroyed: Vec::new(),
         }
     }
 
@@ -373,6 +378,13 @@ impl Server {
     /// The features the guest accepted, once it has (DRIVER_OK).
     pub fn set_negotiated(&mut self, features: u32) {
         self.negotiated = features;
+    }
+
+    /// Contexts destroyed since the last call. The renderer drops their
+    /// ring fences unsignalled, so device.rs answers the requests waiting
+    /// on them itself.
+    pub fn take_destroyed(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.destroyed)
     }
 
     pub fn set_signal_sink(&mut self, sink: SignalSink) {
@@ -542,6 +554,7 @@ impl Server {
             Command::CtxDestroy => {
                 self.contexts.remove(&hdr.ctx_id).ok_or(RESP_ERR_INVALID_CONTEXT_ID)?;
                 self.backend.as_mut().unwrap().ctx_destroy(hdr.ctx_id);
+                self.destroyed.push(hdr.ctx_id);
                 Ok(Response::OkNoData)
             }
             Command::CtxAttachResource { resource_id } => {
@@ -587,7 +600,7 @@ impl Server {
     }
 
     fn new_id(&self, id: u32) -> Result<(), u32> {
-        if id == 0 || self.resources.contains_key(&id) || self.orphans.contains(&id) {
+        if id == 0 || self.resources.contains_key(&id) || self.orphans.contains_key(&id) {
             return Err(cmd::RESP_ERR_INVALID_RESOURCE_ID);
         }
         Ok(())
@@ -1010,9 +1023,10 @@ impl Server {
     /// only now may the renderer free its memory.
     pub fn unmapped(&mut self, id: u32) {
         let Some(backend) = self.backend.as_mut() else { return };
-        if self.orphans.remove(&id) {
+        if let Some(backing) = self.orphans.remove(&id) {
             let _ = backend.resource_unmap(id);
             backend.resource_unref(id);
+            drop(backing);
         } else if let Some(Resource { kind: Kind::Blob { mapped, .. }, .. }) = self.resources.get_mut(&id) {
             *mapped = None;
             let _ = backend.resource_unmap(id);
@@ -1040,8 +1054,13 @@ impl Server {
         let mut unmaps = Vec::new();
         for (id, res) in self.resources.drain() {
             if let Kind::Blob { mapped: Some(m), .. } = res.kind {
-                self.orphans.insert(id);
-                unmaps.push(Deferred::Unmap { resource_id: id, offset: m.offset, len: m.len });
+                self.orphans.insert(id, res.backing);
+                // One UNMAP_BLOB already asked for is on its way out: its
+                // completion finishes it, and a second unmap could land on
+                // a later mapping at the same offset.
+                if !m.leaving {
+                    unmaps.push(Deferred::Unmap { resource_id: id, offset: m.offset, len: m.len });
+                }
             } else if res.in_renderer() {
                 self.backend.as_mut().unwrap().resource_unref(id);
             }
@@ -1049,6 +1068,8 @@ impl Server {
         for (ctx, _) in self.contexts.drain() {
             self.backend.as_mut().unwrap().ctx_destroy(ctx);
         }
+        // device.rs answers every waiting request on a reset anyway.
+        self.destroyed.clear();
         self.scanouts.iter_mut().for_each(|s| *s = None);
         self.cursor = None;
         self.host_bytes = 0;
@@ -1969,6 +1990,18 @@ mod tests {
             assert_eq!(now(&mut s, &ram, on(0), Command::ResourceCreate2d { resource_id: 9, format: 2, width: 8, height: 8 }), Response::Err(cmd::RESP_ERR_INVALID_RESOURCE_ID));
             s.unmapped(9);
             assert!(calls(&shared).ends_with(&[Call::Unmap(9), Call::Unref(9)]));
+
+            // A reset while an UNMAP_BLOB is on its way out doesn't ask for
+            // a second one: that unmap's completion finishes the blob.
+            ctx(&mut s, &ram, 1);
+            assert_eq!(now(&mut s, &ram, on(1), blob(11, blob_mem::HOST3D, blob_flags::USE_MAPPABLE)), Response::OkNoData);
+            assert!(matches!(send(&mut s, &ram, on(1), Command::ResourceMapBlob { resource_id: 11, offset: 0 }), Reply::Deferred { .. }));
+            assert!(matches!(send(&mut s, &ram, on(1), Command::ResourceUnmapBlob { resource_id: 11 }), Reply::Deferred { .. }));
+            calls(&shared);
+            assert!(s.reset().is_empty());
+            assert_eq!(calls(&shared), vec![Call::CtxDestroy(1)], "the blob stays in the renderer");
+            s.unmapped(11);
+            assert_eq!(calls(&shared), vec![Call::Unmap(11), Call::Unref(11)]);
 
             // Guest blobs need their memory, as much as they claim.
             let guest = |entries| Command::ResourceCreateBlob { resource_id: 10, blob_mem: blob_mem::GUEST, blob_flags: 0, blob_id: 0, size: 8192, entries };

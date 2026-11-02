@@ -313,7 +313,16 @@ fn serve<E: Element>(server: &mut Server, mem: &dyn GuestMemory, pending: &mut P
         answer(&element, Response::Err(cmd::RESP_ERR_UNSPEC).serialize(&CtrlHdr::default()));
         return None;
     };
-    match server.handle(&request, mem) {
+    let reply = server.handle(&request, mem);
+    // Requests fenced on a context's rings that CTX_DESTROY took away:
+    // the renderer forgets those fences, so answer them now rather than
+    // never (the guest's driver would wait on them, and saves would fail).
+    for ctx in server.take_destroyed() {
+        for (waiting, bytes) in pending.take_context(ctx) {
+            answer(&waiting, bytes);
+        }
+    }
+    match reply {
         Reply::Now(reply) => answer(&element, reply),
         Reply::Fenced { on, bytes } => pending.push(on, element, bytes),
         Reply::Deferred { op, bytes } => return Some((element, op, bytes)),
@@ -849,6 +858,43 @@ mod tests {
         cursor.room = 0;
         serve(&mut server, &NoRam, &mut pending, cursor);
         assert_eq!(log.borrow()[6], (7, vec![]));
+    }
+
+    /// A context destroyed with requests still fenced on its rings: the
+    /// renderer drops those fences, so they're answered then.
+    #[test]
+    fn destroying_a_context_answers_its_ring_fences() {
+        use crate::gpu::backend::fake::FakeBackend;
+        use crate::gpu::protocol::{Command, F_CONTEXT_INIT, FLAG_FENCE, FLAG_INFO_RING_IDX, Request};
+        use crate::gpu::server::{GuestMemory, Mapping};
+
+        struct NoRam;
+        impl GuestMemory for NoRam {
+            fn map(&self, _: u64, _: usize) -> Option<Box<dyn Mapping>> {
+                None
+            }
+        }
+        let frames: &'static crate::gpu::frames::Frames = Box::leak(Box::new(crate::gpu::frames::Frames::new()));
+        let mut server = Server::new(vec![(64, 64)], vec![], 1 << 20, frames).with_backend(Box::new(FakeBackend::new().0));
+        server.set_negotiated(F_CONTEXT_INIT);
+        let log = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let element = |id, hdr: CtrlHdr, cmd| Fake { id, request: Request { hdr, cmd }.serialize(), room: 4096, log: log.clone(), reply: RefCell::new(vec![]) };
+        let on = |ctx_id| CtrlHdr { ctx_id, ..Default::default() };
+        let ring = |ctx_id, fence_id| CtrlHdr { flags: FLAG_FENCE | FLAG_INFO_RING_IDX, fence_id, ctx_id, ring_idx: 1, ..Default::default() };
+        let mut pending = Pending::default();
+        for e in [
+            element(1, on(1), Command::CtxCreate { context_init: 0, debug_name: vec![] }),
+            element(2, on(2), Command::CtxCreate { context_init: 0, debug_name: vec![] }),
+            element(3, ring(1, 7), Command::Submit3d { data: vec![] }),
+            element(4, ring(2, 8), Command::Submit3d { data: vec![] }),
+            element(5, on(1), Command::CtxDestroy),
+        ] {
+            assert!(serve(&mut server, &NoRam, &mut pending, e).is_none());
+        }
+        let answered: Vec<u32> = log.borrow().iter().map(|(id, _)| *id).collect();
+        assert_eq!(answered, vec![1, 2, 3, 5], "ctx 2's fence still waits");
+        assert_eq!(Response::parse(&log.borrow()[2].1).unwrap().0.fence_id, 7);
+        assert_eq!(pending.len(), 1);
     }
 
     #[test]

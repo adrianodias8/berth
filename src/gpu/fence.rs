@@ -83,6 +83,14 @@ impl<E> Pending<E> {
         done
     }
 
+    /// Everything waiting on a destroyed context's rings, oldest first on
+    /// each: the renderer drops those fences without signalling them.
+    pub fn take_context(&mut self, ctx: u32) -> Vec<(E, Vec<u8>)> {
+        let mut keys: Vec<_> = self.rings.keys().filter(|&&(c, _)| c == ctx).copied().collect();
+        keys.sort_unstable();
+        keys.into_iter().flat_map(|k| self.rings.remove(&k).unwrap()).map(|(_, e, r)| (e, r)).collect()
+    }
+
     /// Everything still waiting, global first: for a device reset, which
     /// answers them all with an error.
     pub fn take_all(&mut self) -> Vec<(E, Vec<u8>)> {
@@ -157,6 +165,20 @@ mod tests {
         assert_eq!(ids(p.complete(&[ring(1, 2, 3), ring(3, 1, 3)])), Vec::<u32>::new());
         assert_eq!(ids(p.complete(&[ring(1, 1, 99), Signal::Global(9), ring(1, 0, big + 1)])), vec![20, 40, 11]);
         assert!(p.is_empty());
+    }
+
+    #[test]
+    fn a_destroyed_context_lets_go_of_its_rings() {
+        let mut p = Pending::default();
+        let ring = |ctx, ring, fence| Signal::Ring { ctx, ring, fence };
+        p.push(ring(1, 1, 5), 11, vec![]);
+        p.push(ring(1, 0, 3), 10, vec![]);
+        p.push(ring(1, 0, 4), 12, vec![]);
+        p.push(ring(2, 0, 3), 20, vec![]);
+        p.push(Signal::Global(1), 30, vec![]);
+        assert_eq!(ids(p.take_context(1)), vec![10, 12, 11]);
+        assert_eq!(p.len(), 2);
+        assert_eq!(ids(p.take_context(1)), Vec::<u32>::new());
     }
 
     #[test]
