@@ -39,6 +39,16 @@ running), and from then on carries the connection's bytes to and from the
 agent's `gui <machine>` stream unchanged, so the client speaks the messages
 below exactly as it does to a macOS VM's `agent.sock`.
 
+`berth machine run|display` use the existing
+`machine gui` action instead (`Request::Machine`, args
+`[machine, request line]`): the reply line comes back as the action's
+output, followed by the payload as one base64 line; it carries no `push`.
+`berth-agent gui-local <machine> '<request>' [payload-file]`, as root in the
+VM, runs the same handler from a shell (testing a build without replacing
+the agent). Every Linux entry point answers
+`{"ok":false,"error":"Linux GUI sessions are off: …"}` unless berth's
+config.json has `"gui": true`.
+
 ## Messages
 
 After the transport header, the host sends **one JSON line**, optionally
@@ -95,6 +105,11 @@ Label lookup is case-insensitive on `label` (AX title/description, AT-SPI
 name), exact match first, then substring; an ambiguous label is an error
 listing the candidates.
 
+A container role (application, frame, window, dialog, panel, filler, scroll
+pane, viewport) loses to any other match, and a match inside another match
+is the same element (a GTK button "Save" holds a label "Save"): the outer
+one is clicked, at its frame's centre.
+
 `note` never reaches a guest: the host logs it.
 
 `push`'s tar (the request's payload) holds `name` at its top level (a
@@ -104,6 +119,29 @@ default folder (`~/Pushed`). For a Linux guest the host leaves out Apple's
 
 `berth gui screenshot` saves the PNG as
 `~/.berth/logs/gui/shots/<log id>.png`, the path in the log's `screenshot`.
+
+### Linux specifics
+
+- `session` may be null when the machine has exactly one session.
+- `session.new` also takes `"app":["cmd","arg",…]` for an **app session**
+  (cage, that one app full screen; `berth machine run`) and
+  `"size":[w,h]` (agent sessions, default 1280×800). Its result adds
+  `"size"` and `"kind"` (`"agent"` or `"app"`); `session.list` entries do
+  too. In an app session `open` is refused, `windows` is the app, and
+  `quit` ends the session.
+- `push` extracts into `~/Pushed` of the machine's user unless `dest` is an
+  absolute path or `~/…`; `open` finds a bare name there first (a folder
+  runs its `AppRun`, `<name>` or `bin/<name>`), then on `PATH`. Its result
+  adds `"app"` (the Wayland app id or X11 class).
+- `click`'s result is `{"x","y"}`, the point clicked. `windows` entries add
+  `"pid"`; `frame` is the client's surface.
+- `scroll`: `dx`/`dy` in points, positive `dy` scrolls the content down; sent
+  as mouse-wheel clicks of 15 points (at least one), so toolkits move by their
+  own step per click.
+- `wait` with `"label"` also returns the element as `hit`.
+- Frames come from the toolkits over AT-SPI in window coordinates, moved by
+  where sway put the window. GTK 4.18 reports some nested widgets 12 points
+  off (they still land inside the element: clicks aim at the centre).
 
 ## Activity log
 

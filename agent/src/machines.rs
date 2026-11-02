@@ -21,6 +21,10 @@
 //! Integration with the Mac (mac.rs): /run/berth is bind-mounted in, with the
 //! `mac` command's and the SSH agent's sockets; `/usr/local/bin/mac` links to
 //! the agent; and sshd is installed on first `ssh <name>.berth`.
+//!
+//! `--gui` machines (only with `"gui": true` in config.json) also get the
+//! packages GUI sessions need, and the VM's GPU render node when it has one
+//! (gui/install.rs); `machine gui` carries one GUI request (gui/mod.rs).
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -42,7 +46,7 @@ fn sh(script: &str) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     // ve-<name> must fit in a 15-character interface name.
     (1..=12).contains(&name.len())
         && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
@@ -135,7 +139,11 @@ fn create(
     isolated: bool,
     isolate_network: bool,
     mounts: &[String],
+    gui: &str,
 ) -> io::Result<()> {
+    if !gui.is_empty() && !crate::gui::enabled() {
+        return Err(io::Error::other("--gui needs \"gui\": true in ~/.berth/config.json"));
+    }
     if !valid_name(name) {
         return Err(io::Error::other("name: 1-12 characters, a-z 0-9 and -"));
     }
@@ -228,6 +236,18 @@ fn create(
     if isolate_network {
         marks.push_str(&format!("{ISOLATED_NETWORK}\n"));
     }
+    if !gui.is_empty() {
+        marks.push_str(&format!("{GUI}\n"));
+        if let Some((bind, dropin)) = crate::gui::install::gpu_binds(Path::new(crate::gui::install::RENDER_NODE).exists()) {
+            binds.push_str(&bind);
+            let path = crate::gui::install::gpu_dropin_path(name);
+            if let Some(dir) = Path::new(&path).parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&path, dropin)?;
+            let _ = sh("systemctl daemon-reload");
+        }
+    }
     std::fs::write(
         nspawn_path(name),
         format!(
@@ -241,6 +261,51 @@ fn create(
     allow_forwarding();
     apply_isolation();
     sh(&format!("machinectl enable {name} >/dev/null 2>&1; machinectl start {name}"))?;
+    if !gui.is_empty() {
+        setup_gui(name, gui)?;
+    }
+    Ok(())
+}
+
+const GUI: &str = "# berth: gui";
+
+/// The berth user of a machine (create() names it in the sudoers file).
+pub(crate) fn machine_user(name: &str) -> io::Result<String> {
+    crate::inroot::Root::new(format!("{MACHINES}/{name}"))
+        .and_then(|r| r.read("/etc/sudoers.d/berth", 4096))
+        .ok()
+        .and_then(|s| String::from_utf8_lossy(&s).split_whitespace().next().map(str::to_string))
+        .filter(|u| !u.is_empty() && u.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')))
+        .ok_or_else(|| io::Error::other("no berth user in the machine"))
+}
+
+pub(crate) fn isolated(name: &str) -> bool {
+    isolation(name).files
+}
+
+/// Install what GUI sessions need in a running machine (`kind` "1" or
+/// "omarchy"); the machine may have just booted, so its network gets a few
+/// tries.
+pub(crate) fn setup_gui(name: &str, kind: &str) -> io::Result<()> {
+    exists(name)?;
+    let os_release = crate::inroot::Root::new(format!("{MACHINES}/{name}"))
+        .and_then(|r| r.read("/etc/os-release", 1 << 16).or_else(|_| r.read("/usr/lib/os-release", 1 << 16)))
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    let user = machine_user(name)?;
+    let scripts = crate::gui::install::scripts(&os_release, kind, &user)?;
+    eprintln!("berth-agent: machines: installing GUI packages in {name}");
+    for script in scripts {
+        let mut result = run_in(name, &script);
+        for _ in 0..3 {
+            if result.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            result = run_in(name, &script);
+        }
+        result.map_err(|e| io::Error::other(format!("installing GUI packages: {e}")))?;
+    }
     Ok(())
 }
 
@@ -429,7 +494,7 @@ fn integrate_files(name: &str) {
 
 /// Whether the machine's PID 1 is systemd (its own `systemd-run -M` and
 /// `machinectl shell` then work, confined like the machine).
-fn runs_systemd(name: &str) -> bool {
+pub(crate) fn runs_systemd(name: &str) -> bool {
     sh(&format!("machinectl show {name} -p Leader --value"))
         .ok()
         .and_then(|leader| std::fs::read_to_string(format!("/proc/{}/comm", leader.trim())).ok())
@@ -505,15 +570,9 @@ pub fn ensure_sshd(name: &str) -> io::Result<()> {
     if !valid_name(name) {
         return Err(io::Error::other("bad name"));
     }
-    let root = format!("{MACHINES}/{name}");
     // The machine's user (create() wrote it there) and the key the Mac uses
     // for the VM, from that user's VM account.
-    let user = crate::inroot::Root::new(&root)
-        .and_then(|r| r.read("/etc/sudoers.d/berth", 4096))
-        .ok()
-        .and_then(|s| String::from_utf8_lossy(&s).split_whitespace().next().map(str::to_string))
-        .filter(|u| u.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')))
-        .ok_or_else(|| io::Error::other("no berth user in the machine"))?;
+    let user = machine_user(name)?;
     let key = std::fs::read_to_string(format!("/home/{user}/.ssh/authorized_keys"))
         .ok()
         .and_then(|k| k.lines().find(|l| l.starts_with("ssh-")).map(str::to_string))
@@ -606,8 +665,10 @@ pub fn handle(action: &str, mut host: UnixStream) -> io::Result<()> {
     let result: io::Result<String> = match action {
         "create" => {
             let mounts: Vec<String> = arg(9).lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
-            create(arg(0), arg(1), arg(2), arg(3), arg(4), arg(5), arg(6), arg(7) == "1", arg(8) == "1", &mounts).map(|_| "ok".into())
+            create(arg(0), arg(1), arg(2), arg(3), arg(4), arg(5), arg(6), arg(7) == "1", arg(8) == "1", &mounts, arg(10)).map(|_| "ok".into())
         }
+        // One GUI request (berth machine run/display): [machine, request].
+        "gui" => Ok(crate::gui::machine_action(arg(0), arg(1))),
         "restart" => stop(arg(0)).and_then(|_| start(arg(0))).map(|_| "ok".into()),
         "rename" => rename(arg(0), arg(1)).map(|_| "ok".into()),
         "info" => info(arg(0)),
@@ -629,6 +690,11 @@ pub fn handle(action: &str, mut host: UnixStream) -> io::Result<()> {
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
                 let _ = std::fs::remove_file(nspawn_path(name));
+                let _ = std::fs::remove_dir_all(format!("/run/berth-gui/{name}"));
+                let dropin = crate::gui::install::gpu_dropin_path(name);
+                if std::fs::remove_file(&dropin).is_ok() {
+                    let _ = std::fs::remove_dir(Path::new(&dropin).parent().unwrap_or(Path::new("/nonexistent")));
+                }
                 apply_isolation(); // without it now
                 std::fs::remove_dir_all(format!("{MACHINES}/{name}")).map(|_| "ok".into())
             }
@@ -663,7 +729,7 @@ fn exists(name: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn running(name: &str) -> bool {
+pub(crate) fn running(name: &str) -> bool {
     sh(&format!("machinectl show {name} -p State --value 2>/dev/null")).is_ok_and(|s| s.trim() == "running")
 }
 
@@ -686,6 +752,18 @@ fn rename(old: &str, new: &str) -> io::Result<()> {
     let config = std::fs::read_to_string(nspawn_path(old)).unwrap_or_default();
     std::fs::write(nspawn_path(new), config.replace(&format!("ve-{old}:"), &format!("ve-{new}:")))?;
     let _ = std::fs::remove_file(nspawn_path(old));
+    // A --gui machine's GPU drop-in is named after it; its sessions ended
+    // with the stop.
+    let (old_dropin, new_dropin) = (crate::gui::install::gpu_dropin_path(old), crate::gui::install::gpu_dropin_path(new));
+    if let Ok(dropin) = std::fs::read_to_string(&old_dropin) {
+        if let Some(dir) = Path::new(&new_dropin).parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&new_dropin, dropin)?;
+        let _ = std::fs::remove_file(&old_dropin);
+        let _ = sh("systemctl daemon-reload");
+    }
+    let _ = std::fs::remove_dir_all(format!("/run/berth-gui/{old}"));
     if let Ok(root) = crate::inroot::Root::new(format!("{MACHINES}/{new}")) {
         let _ = root.write("/etc/hostname", format!("{new}\n").as_bytes());
         if let Ok(hosts) = root.read("/etc/hosts", 1 << 20) {

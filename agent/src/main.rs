@@ -9,6 +9,8 @@
 //!   info listeners\n        (replies with host-network containers' listening ports, listeners.rs)
 //!   k8s <action>\n          enable|disable|status|kubeconfig (k8s.rs)
 //!   machine <action>\n      then JSON args until EOF: create|start|stop|delete|list (machines.rs)
+//!   gui <machine>\n         one GUI-session request for that machine (gui/mod.rs,
+//!                           docs/gui-protocol.md)
 //!   engine <action> [name]\n enable|disable podman|nerdctl, status (engines.rs)
 //!   host-token <hex>\n      the token requests to the Mac carry (mac.rs); replies "ok"
 //!   machine-ssh <name>\n    connect to a machine's sshd, starting it if needed (mac.rs)
@@ -40,6 +42,7 @@ mod domains;
 mod engine;
 mod engines;
 mod files;
+mod gui;
 mod hostnet;
 mod imagestore;
 mod inroot;
@@ -85,6 +88,15 @@ fn main() {
         (Some("mount-shares"), _) => {
             shares::mount_all();
             std::process::exit(0);
+        }
+        // GUI sessions (gui/mod.rs): pointer input inside a session, and the
+        // request handler and --gui setup from a shell, for testing a build.
+        (Some("gui-pointer"), Some(plan)) => std::process::exit(gui::local_pointer(&[plan])),
+        (Some("gui-local"), Some(machine)) => {
+            std::process::exit(gui::local(&std::iter::once(machine).chain(args).collect::<Vec<_>>()))
+        }
+        (Some("gui-install"), Some(machine)) => {
+            std::process::exit(gui::local_install(&std::iter::once(machine).chain(args).collect::<Vec<_>>()))
         }
         _ => {}
     }
@@ -264,6 +276,7 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
         Some(("unix", path)) => splice(host, UnixStream::connect(path)?),
         Some(("k8s", action)) => k8s::handle(action, host),
         Some(("machine", action)) => machines::handle(action, host),
+        Some(("gui", machine)) => gui::serve(machine, host),
         Some(("engine", args)) => engines::handle(args, host),
         Some(("info", "nerdctl")) => {
             serde_json::to_writer(&mut host, &engines::nerdctl_containers()).map_err(io::Error::other)?;

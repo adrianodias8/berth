@@ -1,5 +1,9 @@
 //! `berth machine`: Linux machines (full distros with systemd) as
 //! systemd-nspawn containers in the VM; see agent/src/machines.rs.
+//!
+//! With `"gui": true` in config.json, also GUI machines (`create --gui`) and
+//! their headless app sessions (`run`, `display`), through the agent's GUI
+//! module (agent/src/gui/, docs/gui-protocol.md).
 
 use std::time::Duration;
 
@@ -33,7 +37,21 @@ pub struct Isolation {
     pub mounts: Vec<std::path::PathBuf>,
 }
 
-pub fn create(paths: &Paths, name: &str, distro: &str, arch: &str, cloud_init: Option<&std::path::Path>, iso: Isolation) -> Result<()> {
+pub fn create(
+    paths: &Paths,
+    name: &str,
+    distro: &str,
+    arch: &str,
+    cloud_init: Option<&std::path::Path>,
+    iso: Isolation,
+    gui: Option<&str>,
+) -> Result<()> {
+    if let Some(kind) = gui {
+        require_gui(paths)?;
+        if !matches!(kind, "1" | "omarchy") {
+            bail!("--gui {kind}: plain --gui, or --gui omarchy");
+        }
+    }
     let user = std::env::var("USER")?;
     let uid = unsafe { libc::getuid() }.to_string();
     let home = paths.home.to_string_lossy();
@@ -59,18 +77,144 @@ pub fn create(paths: &Paths, name: &str, distro: &str, arch: &str, cloud_init: O
     if iso.isolated {
         notes.push(if iso.network { "isolated, network too".into() } else { "isolated".into() });
     }
+    match gui {
+        Some("omarchy") => notes.push("GUI, Omarchy".into()),
+        Some(_) => notes.push("GUI".into()),
+        None => {}
+    }
     println!("Creating {name} ({distro_name}, {})...", notes.join(", "));
     let flag = |b: bool| if b { "1" } else { "" };
-    call(
-        paths,
-        "create",
-        &[name, distro, &user, &uid, &home, arch, &user_data, flag(iso.isolated), flag(iso.network), &mounts.join("\n")],
-    )?;
+    let mounts = mounts.join("\n");
+    let mut args = vec![name, distro, &user, &uid, &home, arch, &user_data, flag(iso.isolated), flag(iso.network), &mounts];
+    // Only --gui machines send the extra argument: everything else goes to
+    // the agent exactly as before.
+    if let Some(kind) = gui {
+        args.push(kind);
+    }
+    call(paths, "create", &args)?;
     if !user_data.is_empty() {
         println!("cloud-init runs on this first boot: berth machine shell {name} -- cloud-init status --wait");
     }
     println!("Machine {name} is running. Open a shell: berth machine shell {name}");
     println!("Domain: {name}.berth.local");
+    if gui.is_some() {
+        println!("Run an app in it: berth machine run {name} -- <command>");
+    }
+    Ok(())
+}
+
+/// Linux GUI sessions are behind `"gui": true` in config.json until
+/// they're stable (docs/plans/gui-vms-agent-testing.md).
+fn gui_enabled(paths: &Paths) -> bool {
+    std::fs::read(paths.config())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|c| c.get("gui").and_then(|v| v.as_bool()) == Some(true))
+}
+
+fn require_gui(paths: &Paths) -> Result<()> {
+    if !gui_enabled(paths) {
+        bail!("Linux GUI sessions are experimental: turn them on with \"gui\": true in ~/.berth/config.json");
+    }
+    Ok(())
+}
+
+/// One request to the machine's GUI agent (docs/gui-protocol.md) through
+/// the `machine gui` action: its reply, and a payload (a screenshot) if any.
+fn gui_call(paths: &Paths, name: &str, session: Option<&str>, verb: &str, args: serde_json::Value) -> Result<(serde_json::Value, Vec<u8>)> {
+    let request = serde_json::json!({"v": 1, "session": session, "verb": verb, "args": args});
+    let output = call(paths, "gui", &[name, &request.to_string()]).map_err(|e| {
+        if e.to_string().contains("unknown action gui") {
+            anyhow::anyhow!("the VM's berth agent is older than GUI sessions; restart berth to update it")
+        } else {
+            e
+        }
+    })?;
+    parse_gui_output(&output)
+}
+
+/// The action's output: the reply line, then the payload as a base64 line.
+fn parse_gui_output(output: &str) -> Result<(serde_json::Value, Vec<u8>)> {
+    let mut lines = output.lines();
+    let reply: serde_json::Value = serde_json::from_str(lines.next().unwrap_or("")).context("the GUI agent's reply")?;
+    if reply["ok"].as_bool() != Some(true) {
+        bail!("{}", reply["error"].as_str().unwrap_or("the GUI request failed"));
+    }
+    let payload = match lines.next() {
+        Some(b64) => base64_decode(b64.trim()).context("the GUI agent's payload")?,
+        None => Vec::new(),
+    };
+    Ok((reply["result"].clone(), payload))
+}
+
+/// Standard base64, as the agent writes payloads (agent/src/gui/mod.rs).
+fn base64_decode(text: &str) -> Result<Vec<u8>> {
+    let value = |c: u8| -> Result<u32> {
+        Ok(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => bail!("bad base64"),
+        } as u32)
+    };
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        bail!("bad base64 length");
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+        let mut n = 0u32;
+        for &c in &chunk[..4 - pad] {
+            n = (n << 6) | value(c)?;
+        }
+        n <<= 6 * pad as u32;
+        out.extend_from_slice(&n.to_be_bytes()[1..4 - pad]);
+    }
+    Ok(out)
+}
+
+/// `berth machine run <name> -- <command>`: the command in an app session
+/// of its own (cage, one window); prints the session id.
+pub fn run(paths: &Paths, name: &str, command: &[String]) -> Result<()> {
+    require_gui(paths)?;
+    if command.is_empty() {
+        bail!("give a command: berth machine run {name} -- <command>");
+    }
+    let (result, _) = gui_call(paths, name, None, "session.new", serde_json::json!({"agent": "terminal", "app": command}))?;
+    let session = result["session"].as_str().context("no session id in the reply")?;
+    eprintln!("{} runs in {name}, session {session}. Its screen: berth machine display {name} --session {session}", command[0]);
+    println!("{session}");
+    Ok(())
+}
+
+/// `berth machine display <name>`: the machine's GUI sessions, and a
+/// screenshot of one on request. A Mac window showing a session live comes
+/// with berth's GPU display; until then this says so rather than pretend.
+pub fn display(paths: &Paths, name: &str, session: Option<&str>, screenshot: Option<&std::path::Path>) -> Result<()> {
+    require_gui(paths)?;
+    if let Some(file) = screenshot {
+        let (result, png) = gui_call(paths, name, session, "screenshot", serde_json::json!({}))?;
+        std::fs::write(file, &png).with_context(|| file.display().to_string())?;
+        println!("Saved {}x{} screenshot to {}", result["width"], result["height"], file.display());
+        return Ok(());
+    }
+    let (result, _) = gui_call(paths, name, None, "session.list", serde_json::json!({}))?;
+    let sessions = result["sessions"].as_array().cloned().unwrap_or_default();
+    if sessions.is_empty() {
+        println!("No GUI sessions in {name}. Start an app: berth machine run {name} -- <command>");
+    } else {
+        for s in &sessions {
+            let apps: Vec<&str> = s["apps"].as_array().into_iter().flatten().filter_map(|a| a.as_str()).collect();
+            let size = s["size"].as_array().map(|v| format!("{}x{}", v[0], v.get(1).unwrap_or(&serde_json::Value::Null))).unwrap_or_default();
+            println!("{:10} {:6} {:10} {:22} {}", s["session"].as_str().unwrap_or(""), s["kind"].as_str().unwrap_or(""), size, s["since"].as_str().unwrap_or(""), apps.join(", "));
+        }
+    }
+    println!();
+    println!("Sessions run headless: berth can't show one in a Mac window yet (that comes with GPU display support).");
+    println!("To see one now, save its screen: berth machine display {name} --session <id> --screenshot screen.png");
     Ok(())
 }
 
@@ -198,6 +342,27 @@ pub fn shell_command(name: &str, command: &[String]) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_payloads() {
+        for (raw, enc) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("foobar", "Zm9vYmFy")] {
+            assert_eq!(base64_decode(enc).unwrap(), raw.as_bytes());
+        }
+        assert_eq!(base64_decode("iVBORwD/gA==").unwrap(), [0x89u8, b'P', b'N', b'G', 0, 255, 128]);
+        assert!(base64_decode("abc").is_err());
+        assert!(base64_decode("ab!d").is_err());
+    }
+
+    #[test]
+    fn gui_replies() {
+        // As agent/src/gui/mod.rs's machine_action writes them.
+        let (result, payload) = parse_gui_output("{\"ok\":true,\"result\":{\"width\":2,\"height\":1},\"error\":null,\"payload_len\":3}\nZm9v\n").unwrap();
+        assert_eq!((result["width"].as_u64(), payload.as_slice()), (Some(2), b"foo".as_slice()));
+        let (result, payload) = parse_gui_output("{\"ok\":true,\"result\":{\"session\":\"s-1\"},\"error\":null,\"payload_len\":0}\n").unwrap();
+        assert_eq!((result["session"].as_str(), payload.len()), (Some("s-1"), 0));
+        let err = parse_gui_output("{\"ok\":false,\"result\":{},\"error\":\"no machine x\",\"payload_len\":0}\n").unwrap_err();
+        assert_eq!(err.to_string(), "no machine x");
+    }
 
     #[test]
     fn shell_quoting_survives_every_shell() {
