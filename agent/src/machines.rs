@@ -624,6 +624,22 @@ fn run_in(name: &str, script: &str) -> io::Result<String> {
 
 /// Bring machines made before an integration feature up to date: files,
 /// the /run/berth bind in their .nspawn file and, if running, live.
+/// The render node, for everyone. In the VM it's root:render 0660, and a
+/// bind into a machine keeps the VM's group number, which is another group
+/// or none in the machine (Arch's render isn't Debian's 991), so the
+/// machine's user can't open it. A render node gives no display or modeset
+/// control, which is why it's safe to open to unprivileged users; card0 stays
+/// as it is, handed out by seatd.
+fn open_render_node() {
+    use std::os::unix::fs::PermissionsExt;
+    let node = crate::gui::install::RENDER_NODE;
+    if let Err(e) = std::fs::set_permissions(node, std::fs::Permissions::from_mode(0o666))
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        eprintln!("berth-agent: gui: opening {node} to machines: {e}");
+    }
+}
+
 pub fn integrate_all() {
     let Ok(entries) = std::fs::read_dir(MACHINES) else { return };
     // iptables rules don't survive a reboot; Docker makes DOCKER-USER once
@@ -640,6 +656,7 @@ pub fn integrate_all() {
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
     });
+    open_render_node();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') || !valid_name(&name) || !entry.path().is_dir() {

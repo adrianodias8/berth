@@ -627,9 +627,20 @@ fn launcher_desktop(id: &str, desktop: install::Desktop, renderer: Renderer) -> 
             launch_script(id, &env, &format!("sway -c {}/sway.conf", runtime(id)))
         }
         Flavour::Hyprland => {
-            let software = if renderer == Renderer::Software { " LIBGL_ALWAYS_SOFTWARE=1" } else { "" };
-            let env = format!("{seat}export AQ_DRM_DEVICES={} XDG_CURRENT_DESKTOP=Hyprland{software}; ", install::CARD_NODE);
-            launch_script(id, &env, if desktop.uwsm { "uwsm start -- hyprland.desktop" } else { "Hyprland" })
+            // Hyprland needs GLES 3. Mesa's virgl reports 2.0 while the host
+            // renderer is ANGLE's ES 3.0 (docs/LEARNINGS.md, S2): ask for 3.0.
+            let software = match renderer {
+                Renderer::Software => " LIBGL_ALWAYS_SOFTWARE=1",
+                _ => " MESA_GLES_VERSION_OVERRIDE=3.0",
+            };
+            // Omarchy's config finds itself through OMARCHY_PATH (else
+            // /usr/share/omarchy, where its own installer puts it), and its
+            // scripts through PATH; berth clones it to ~/.local/share.
+            let omarchy = "[ -d \"$HOME/.local/share/omarchy\" ] && export OMARCHY_PATH=\"$HOME/.local/share/omarchy\" PATH=\"$HOME/.local/share/omarchy/bin:$PATH\"; ";
+            let env = format!("{seat}export AQ_DRM_DEVICES={} XDG_CURRENT_DESKTOP=Hyprland{software}; {omarchy}", install::CARD_NODE);
+            // start-hyprland (Hyprland 0.57+) is its supported way in.
+            let run = if desktop.uwsm { "uwsm start -- hyprland.desktop" } else { "$(command -v start-hyprland || echo Hyprland)" };
+            launch_script(id, &env, run)
         }
     }
 }
@@ -837,6 +848,11 @@ fn session_new(m: &Machine, args: &Value) -> Result<Done, String> {
     // binary for pointer input (fed over stdin: it's the user writing in
     // their own folder).
     let me = std::fs::read("/proc/self/exe").map_err(|e| e.to_string())?;
+    // The GPU's nodes are root:render and root:video in the machine; the
+    // user's compositor needs them.
+    if renderer == Renderer::Gles2 || desktop.is_some() {
+        let _ = m.run_root(&install::gpu_groups_script(&m.user), SHORT);
+    }
     if desktop.is_some() {
         claim_desktop(DESKTOP_CLAIM, &m.name, &id, session_alive)?;
         if let Err(e) = start_seatd(m) {

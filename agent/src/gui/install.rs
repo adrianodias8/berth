@@ -362,6 +362,15 @@ pub fn seat_script(user: &str) -> String {
     )
 }
 
+/// A root script putting `user` in the groups the GPU's nodes belong to
+/// (render for renderD128, video for card0), where the machine has them.
+pub fn gpu_groups_script(user: &str) -> String {
+    format!(
+        "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
+         for g in render video; do getent group $g >/dev/null && {{ id -nG {user} | tr ' ' '\\n' | grep -qx $g || usermod -aG $g {user} 2>/dev/null || addgroup {user} $g 2>/dev/null || true; }}; done; true"
+    )
+}
+
 /// seatd for the machine, as root: not tied to a VT (the VM has none in the
 /// machine), its socket the user's and the seat group's.
 pub fn seatd_script(user: &str) -> String {
@@ -502,6 +511,12 @@ mod tests {
         assert_eq!(desktop_ready(None, probe), Ok(Desktop { flavour: Flavour::Hyprland, uwsm: true }));
         assert_eq!(desktop_ready(Some(Flavour::Sway), probe), Ok(Desktop { flavour: Flavour::Sway, uwsm: false }));
         assert!(desktop_ready(None, "").is_err(), "a probe that didn't run isn't ready");
+    }
+
+    #[test]
+    fn gpu_groups() {
+        let s = gpu_groups_script("dev");
+        assert!(s.contains("for g in render video") && s.contains("usermod -aG $g dev"), "{s}");
     }
 
     #[test]

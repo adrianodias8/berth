@@ -106,6 +106,37 @@ something here stops being true, fix it.
     (`create_gl_context`, `destroy_gl_context`, `make_current`:
     surfaceless, no config, shared with the first). Don't pass `USE_EGL`.
 
+- **3D in the guest works on the live VM (Phase 3, 2026-11-02, M5 Max).**
+  The device offers `virgl` and the guest's `virtio_gpu` takes both
+  capsets; Mesa in a machine reports `virgl (ANGLE … Apple M5 Max)`.
+  Fenced virtqueue elements held past `drain` and answered later from the
+  device queue are fine (the plan's biggest unknown): glmark2 ran with no
+  fence timeouts. Numbers, glmark2-es2-wayland at 1280x720 in a headless
+  sway session: virgl 1642 (build 1456 fps, texture 1987, phong 1488),
+  llvmpipe 969 (1014, 1245, 651). The small scenes are bound by per-frame
+  round trips, so the gap is modest; phong, the shader-heavy one, is 2.3x.
+  What it took:
+  - the guest only gets **OpenGL ES 2.0 / GL 2.1**: Mesa's virgl derives
+    its version from the host's caps, and ANGLE gives ES 3.0 contexts.
+    `MESA_GLES_VERSION_OVERRIDE=3.0` gets ES 3.0 (GL 3.3 core with the GL
+    and GLSL overrides), which Hyprland needs to start. The real fix is a
+    host renderer with more than ES 3.0 (ANGLE's ES 3.1 on Metal, or
+    Venus), not yet done;
+  - **GPU nodes bound into a machine keep the VM's group numbers** (render
+    991, video 44 in berth's Debian VM). They match by luck in a Debian
+    machine; in Arch they're kmem and nothing, so the user can't open
+    them whatever groups it's in. The agent makes `renderD128` 0666 (a
+    render node grants no modesetting); `card0` stays 0660 and seatd hands
+    it to the desktop compositor;
+  - Hyprland on card0 in an nspawn machine works through seatd
+    (`SEATD_VTBOUND=0`, `LIBSEAT_BACKEND=seatd`, `AQ_DRM_DEVICES`). Hyprland
+    0.57 wants `start-hyprland`; Omarchy v4's lua config finds itself
+    through `OMARCHY_PATH` (default `/usr/share/omarchy`, where its own
+    installer puts it) and its scripts on PATH. With those, Omarchy's bar
+    comes up. Its terminal binding needs Alacritty or Ghostty, which
+    berth's partial install doesn't add, and its launcher (walker) can
+    grab the keyboard from `berth gui` input (open question).
+
 - **Rosetta's translation cache isn't worth it here (measured 2026-10-24).**
   `VZLinuxRosettaUnixSocketCachingOptions` plus `rosettad daemon` in the
   guest works: it binds `<cache>/uds/rosetta.sock` (link
