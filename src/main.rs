@@ -867,21 +867,24 @@ fn gpu_probe(json: bool) -> Result<()> {
     #[cfg(feature = "virgl")]
     {
         use gpu::protocol::capset;
-        let Some(renderer) = gpu::virgl::ffi::Renderer::get() else {
-            if json {
-                println!("{}", serde_json::json!({ "virgl": false, "error": "renderer didn't start" }));
-            } else {
-                println!("virgl: renderer didn't start");
+        let caps = match gpu::virgl::probe() {
+            Ok(caps) => caps,
+            Err(err) => {
+                if json {
+                    println!("{}", serde_json::json!({ "virgl": false, "error": err }));
+                } else {
+                    println!("virgl: renderer didn't start ({err})");
+                }
+                std::process::exit(1);
             }
-            std::process::exit(1);
         };
-        let caps = renderer.capsets();
         let name = |id| match id {
             capset::VIRGL => "VIRGL",
             capset::VIRGL2 => "VIRGL2",
             _ => "?",
         };
-        let gl = gl_renderer();
+        // GL contexts are current only on the renderer's worker thread.
+        let gl = gpu::virgl_thread::VirglWorker::get().ok().and_then(|w| w.run(|_| gl_renderer()).ok().flatten());
         if json {
             let caps: Vec<_> = caps
                 .iter()

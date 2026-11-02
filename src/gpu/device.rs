@@ -572,9 +572,8 @@ static CURRENT: Mutex<Option<(DispatchRetained<DispatchQueue>, OnQueue)>> = Mute
 
 /// Read `rect` of resource `id` as BGRA into `dst` (rows `stride` apart),
 /// on the device queue: for the display's stream of resources (frames.rs).
-/// Never from the device queue itself. (Wired to the display's
-/// RESOURCE_READER once that lands.)
-#[allow(dead_code)]
+/// Never from the device queue itself. The daemon sets it as the display's
+/// RESOURCE_READER.
 pub fn read_resource(id: u32, rect: Rect, dst: &mut [u8], stride: usize) -> Result<(), String> {
     let (queue, device) = {
         let current = CURRENT.lock().unwrap();

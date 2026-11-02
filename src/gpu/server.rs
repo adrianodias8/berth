@@ -1916,6 +1916,39 @@ mod tests {
         }
 
         #[test]
+        fn resource_records_reach_the_renderer() {
+            use crate::gpu::frames::{SurfaceKey, Surfaces};
+            // The display's reader is a plain fn, as device::read_resource
+            // is; the feeder calls it on this thread.
+            thread_local! { static GPU: RefCell<Option<Server>> = const { RefCell::new(None) }; }
+            fn reader(id: u32, rect: Rect, dst: &mut [u8], stride: usize) -> anyhow::Result<()> {
+                GPU.with_borrow_mut(|s| s.as_mut().unwrap().read_resource(id, rect, dst, stride))
+                    .map_err(|code| anyhow::anyhow!("error {code:#x}"))
+            }
+            let ram = Ram::new(BASE, 4096);
+            let (mut s, shared) = gpu(frames());
+            shared.lock().unwrap().pixel = Some(|x, y| [x as u8, y as u8, 0x10, 0x20]);
+            ctx(&mut s, &ram, 1);
+            now(&mut s, &ram, on(1), texture(7, R8G8B8A8, 64, 32, 1));
+            calls(&shared);
+            GPU.set(Some(s));
+
+            let surfaces: &'static Surfaces = Box::leak(Box::new(Surfaces::new()));
+            let key = SurfaceKey::Session { machine: "dev".into(), session: "gl".into() };
+            let rec = b"{\"format\":\"resource\",\"res_id\":7,\"w\":64,\"h\":32,\"damage\":[[0,0,64,32]],\"payload_len\":0}\n";
+            crate::gui::display::feed_with(&mut &rec[..], surfaces, &key, Some(reader)).unwrap();
+            assert!(matches!(calls(&shared)[..], [Call::ReadBack(7, r, _)] if r == Rect::new(0, 0, 64, 32)));
+            let frame = surfaces.frame(&key).unwrap();
+            assert_eq!((frame.width, frame.height), (64, 32));
+            // RGBA from the renderer, BGRA in the surface, top row first.
+            assert_eq!(frame.pixels[(2 * 64 + 3) * 4..][..4], [0x10, 2, 3, 0x20]);
+            // An unknown resource ends the stream.
+            let rec = b"{\"format\":\"resource\",\"res_id\":9,\"damage\":[[0,0,1,1]],\"payload_len\":0}\n";
+            let err = crate::gui::display::feed_with(&mut &rec[..], surfaces, &key, Some(reader)).unwrap_err();
+            assert!(err.contains("GPU resource 9"), "{err}");
+        }
+
+        #[test]
         fn saving_fails_while_3d_exists() {
             let ram = Ram::new(BASE, 4096);
             let (mut s, _) = gpu(frames());

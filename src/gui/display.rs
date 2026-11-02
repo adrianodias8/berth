@@ -37,7 +37,7 @@ use crate::paths::Paths;
 /// Reads `rect` of a GPU resource into an image of the given stride (the
 /// slice is the whole image; `rect` is where in it, as in the resource).
 /// For records that name a virtio-gpu resource instead of carrying pixels:
-/// set by the GPU device once it can (gpu::device::read_resource).
+/// the daemon sets it to gpu::device::read_resource when it starts.
 pub type ResourceReader = fn(u32, Rect, &mut [u8], usize) -> anyhow::Result<()>;
 pub static RESOURCE_READER: OnceLock<ResourceReader> = OnceLock::new();
 
@@ -343,6 +343,12 @@ struct Record {
 /// Read records into `key`'s surface until the stream ends (Ok) or breaks
 /// the protocol or reports an error (Err).
 pub fn feed(r: &mut impl BufRead, surfaces: &Surfaces, key: &SurfaceKey) -> Result<(), String> {
+    feed_with(r, surfaces, key, RESOURCE_READER.get().copied())
+}
+
+/// `feed`, with the reader for resource records given rather than the
+/// process's (tests, which can't share one global).
+pub fn feed_with(r: &mut impl BufRead, surfaces: &Surfaces, key: &SurfaceKey, reader: Option<ResourceReader>) -> Result<(), String> {
     while let Some(line) = read_line(r).map_err(|e| format!("reading the screen stream: {e}"))? {
         if line.is_empty() {
             continue;
@@ -353,7 +359,7 @@ pub fn feed(r: &mut impl BufRead, surfaces: &Surfaces, key: &SurfaceKey) -> Resu
         }
         match rec.format.as_deref() {
             Some("bgra8") => pixels(r, surfaces, key, &rec)?,
-            Some("resource") => resource(surfaces, key, &rec)?,
+            Some("resource") => resource(surfaces, key, &rec, reader)?,
             other => return Err(format!("unknown screen record format {other:?}")),
         }
     }
@@ -396,8 +402,8 @@ fn pixels(r: &mut impl BufRead, surfaces: &Surfaces, key: &SurfaceKey, rec: &Rec
 }
 
 /// A record naming a GPU resource: its pixels come from the device.
-fn resource(surfaces: &Surfaces, key: &SurfaceKey, rec: &Record) -> Result<(), String> {
-    let reader = RESOURCE_READER.get().ok_or("the screen stream sent a GPU resource, which this berth can't read yet")?;
+fn resource(surfaces: &Surfaces, key: &SurfaceKey, rec: &Record, reader: Option<ResourceReader>) -> Result<(), String> {
+    let reader = reader.ok_or("the screen stream sent a GPU resource, which this berth can't read yet")?;
     let res_id = rec.res_id.ok_or("a resource record without res_id")?;
     if rec.payload_len != 0 {
         return Err("a resource record with a payload".into());

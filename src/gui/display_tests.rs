@@ -107,7 +107,7 @@ fn the_feeder_parses_records_into_the_ring() {
     fixture.extend(record(4, 2, &[[0, 0, 1, 1], [3, 1, 1, 1]], |_, _| [9, 9, 9, 9]));
     fixture.extend(b"{\"format\":\"resource\",\"res_id\":7,\"damage\":[[0,0,4,2]],\"payload_len\":0}\n");
     let mut r = BufReader::new(&fixture[..]);
-    let err = feed(&mut r, surfaces, &key).unwrap_err();
+    let err = feed_with(&mut r, surfaces, &key, None).unwrap_err();
     assert!(err.contains("GPU resource"), "{err}");
     let frame = surfaces.frame(&key).unwrap();
     let at = |x: usize, y: usize| frame.pixels[(y * 4 + x) * 4..][..4].to_vec();

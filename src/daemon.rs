@@ -382,6 +382,9 @@ pub fn run(paths: Paths) -> Result<()> {
     if let Err(err) = crate::gpu::frames::SURFACES.set_dir(&surfaces) {
         eprintln!("display: can't use {} ({err}); frames stay in memory", surfaces.display());
     }
+    // Screen records that name a virtio-gpu resource read it from the device.
+    let _ = crate::gui::display::RESOURCE_READER
+        .set(|id, rect, dst, stride| crate::gpu::device::read_resource(id, rect, dst, stride).map_err(anyhow::Error::msg));
     *RESTART_AFTER_BOOT.lock().unwrap() = restore.map(|r| r.start).unwrap_or_default();
     eprintln!(
         "{} VM: {} CPUs, {} MiB",
