@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  berth-gui-mac as a LaunchAgent: it runs in the logged-in user's GUI
+  (Aqua) session, because AX, CGEvent and ScreenCaptureKit only reach the
+  screen from there. install.sh fills in __BIN__ and __LOG__ and copies this
+  to ~/Library/LaunchAgents/.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.berth.gui-mac</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BIN__</string>
+    </array>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <!-- Input and screenshots are latency-sensitive; don't let App Nap throttle it. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardErrorPath</key>
+    <string>__LOG__</string>
+    <key>StandardOutPath</key>
+    <string>__LOG__</string>
+</dict>
+</plist>
