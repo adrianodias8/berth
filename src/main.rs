@@ -11,6 +11,7 @@ mod helper;
 mod import;
 mod k8s;
 mod macexec;
+mod macvm;
 mod machines;
 mod memory;
 mod paths;
@@ -169,6 +170,13 @@ enum Cmd {
     Helper {
         #[command(subcommand)]
         action: HelperCmd,
+    },
+    /// macOS VMs for testing Mac apps (experimental: "mac": true in
+    /// ~/.berth/config.json)
+    #[command(hide = true)]
+    Mac {
+        #[command(subcommand)]
+        action: macvm::MacCmd,
     },
     /// Run the VM in the foreground (used internally by `start`)
     #[command(hide = true)]
@@ -480,6 +488,7 @@ fn main() -> Result<()> {
             println!("{}", https_state(&paths));
             Ok(())
         }
+        Cmd::Mac { action } => macvm::command(&paths, action),
         Cmd::Daemon => daemon::run(paths),
         Cmd::Helper { .. } => unreachable!(),
     }
