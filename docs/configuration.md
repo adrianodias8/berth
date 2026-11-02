@@ -52,6 +52,8 @@ With both flags off, nothing below runs or writes files.
 | `gui` | `false` | Linux GUI machines (`berth machine create --gui`, `docs/gui.md`), `linux:*` targets for `berth gui`, the app's Agents section and Display windows, and (on macOS 27, at the next start) a virtio-gpu display device in the VM |
 | `gpu_memory_mib` | `256` | MiB of host memory shared with the VM's GPU device, 16–16384, rounded up to a power of two; with `gui` on, applies on the next start |
 | `gpu_display` | `"1920x1080"` | the GPU device's display size, `WIDTHxHEIGHT` from 640x480 to 7680x4320; with `gui` on, applies on the next start |
+| `gpu_virgl` | `true` | 3D for the GPU device: virglrenderer on ANGLE, which draws with Metal on the Mac's GPU. Only in a berth built with virgl (`berth gpu-probe` says whether it is, see [3D](#3d)); `false`, or a renderer that doesn't start, leaves the device 2D. With `gui` on, applies on the next start |
+| `gpu_blob` | `false` | also offer the guest blob resources and context types (`RESOURCE_BLOB`, `CONTEXT_INIT`), the hooks for Venus/Vulkan; off by default because Linux then allocates its dumb framebuffers as blobs too. Needs `gpu_virgl`; applies on the next start |
 | `gui_idle_minutes` | `30` | `berth gui` sessions unused this long are ended by the next `berth gui` call (a throwaway macOS clone is deleted); `0` never ends them |
 | `gui_titles` | `false` | name Claude Code chats in the agent activity log by their titles, read from `~/.claude/projects` on this Mac (`docs/agents.md`) |
 
@@ -92,6 +94,35 @@ These are for testing and debugging; set them for `berth start`.
 | `BERTH_FS_POLL_US` | how long the host polls idle queues, in µs (default 100) |
 | `BERTH_FS_THREADS`, `BERTH_FS_QUEUES`, `BERTH_FS_WRITEBACK`, `BERTH_FS_NO_OPENDIR`, `BERTH_FS_ASYNC_READ` | file server tuning, see `docs/file-sharing.md` |
 | `BERTH_FS_STATS`, `BERTH_FS_TRACE` | `1`: per-request timings, or every request, in `daemon.log` |
+| `BERTH_GPU_VIRGL` | `0`: the GPU device stays 2D whatever `gpu_virgl` says |
+
+## 3D
+
+A berth built with the `virgl` cargo feature links virglrenderer and
+ANGLE's libEGL, and gives the Linux display 3D (`gpu_virgl`). The libraries
+come from `bench/spikes/gpu/s2-virgl-angle.sh` (spike S2), which builds
+them into `target/spikes/gpu/prefix`. These are read when building, not by
+`berth start`:
+
+| Variable | |
+|---|---|
+| `BERTH_VIRGL` | `auto` (default): `scripts/build.sh` builds with virgl when the prefix has virglrenderer; `1` requires it (and fails without the libraries); `0` builds without. The script prints `berth: virgl on` or `off` |
+| `BERTH_VIRGL_PREFIX` | where the libraries are (`lib/`), for `scripts/build.sh` and for `cargo build --features virgl`; default `target/spikes/gpu/prefix` |
+
+A development build finds the libraries in the prefix through its rpath,
+so `cargo test --features virgl` needs no `RUSTFLAGS` or `DYLD_*`.
+`scripts/build-app.sh` copies them into `Berth.app/Contents/Frameworks`
+(virglrenderer, libepoxy, libEGL and libGLESv2), drops the rpath to the
+prefix and ad-hoc signs them, and `scripts/check-bundle.sh` checks the
+result. The app isn't signed with the hardened runtime: under it, the
+libraries would need the same Developer ID as the app (`scripts/release.sh`
+does that when `BERTH_SIGN_IDENTITY` is set).
+
+`berth gpu-probe` (hidden) starts the renderer in its own process, with
+no daemon, and prints the capsets it would offer (`capset 2 VIRGL2 v2
+…`) and ANGLE's GL renderer; `--json` for a script. It exits 0 when the
+renderer starts, 1 when it doesn't, and 2 when berth was built without
+virgl.
 
 ## Files
 
