@@ -140,6 +140,104 @@ pub fn restore(paths: &Paths, records: &[Record]) -> Result<()> {
     save_sessions(paths, &lock, &sessions)
 }
 
+// ---- Sessions that ended without `session end` ----
+//
+// A session dies with what holds it: every Linux session with berth's VM
+// (they're compositors in machines inside it) or with its machine, a macOS
+// session with its VM. Their records are dropped where berth knows that
+// happened (the daemon on boot and exit and after machine stop|delete|
+// restart|rename, `berth mac stop|delete`), by `session list`, which looks
+// at each target once, and by a call the guest answers "no session".
+
+/// What one look at a target found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Seen {
+    /// The guest's own list of its live sessions (Linux).
+    Live(Vec<String>),
+    /// The VM or machine is gone or stopped: none of its sessions survive.
+    Down,
+    /// Up, or no telling (berth isn't running, a timeout): keep its records.
+    /// berth-gui-mac doesn't hold verbs to a session, so a running macOS VM
+    /// is as far as a look goes.
+    Unsure,
+}
+
+pub fn is_gone(record: &Record, seen: &Seen) -> bool {
+    match seen {
+        Seen::Live(ids) => !ids.contains(&record.session),
+        Seen::Down => true,
+        Seen::Unsure => false,
+    }
+}
+
+/// A macOS VM is down if it's gone or its process isn't running.
+pub fn mac_seen(exists: bool, running: bool) -> Seen {
+    if exists && running { Seen::Unsure } else { Seen::Down }
+}
+
+/// A Linux machine from its guest's `session.list`: the result, or the
+/// refusal's text. A reply without a list tells nothing.
+pub fn linux_seen(machine: &str, listed: std::result::Result<&serde_json::Value, &str>) -> Seen {
+    match listed {
+        Ok(result) => match result["sessions"].as_array() {
+            Some(list) => Seen::Live(list.iter().filter_map(|s| s["session"].as_str().map(str::to_string)).collect()),
+            None => Seen::Unsure,
+        },
+        Err(error) if machine_down(machine, error) => Seen::Down,
+        Err(_) => Seen::Unsure,
+    }
+}
+
+/// The Linux agent's refusals for a machine that isn't there or isn't
+/// running (agent/src/gui/exec.rs, Machine::open).
+fn machine_down(machine: &str, error: &str) -> bool {
+    error == format!("no machine {machine}") || error.starts_with(&format!("machine {machine} isn't running"))
+}
+
+/// Whether a failed call's error shows its session is gone: the Linux agent
+/// no longer knows it (agent/src/gui/mod.rs, resolve), or its machine is
+/// down. A macOS guest never refuses a session; its VM is looked at instead.
+pub fn gone_by_error(record: &Record, error: &str) -> bool {
+    match record.target.split_once(':') {
+        Some(("linux", machine)) => error == format!("no session {} in {machine}", record.session) || machine_down(machine, error),
+        _ => false,
+    }
+}
+
+/// Take the records `gone` picks out of sessions.json, under the lock;
+/// returns them (a clone among them is the caller's to delete). Without a
+/// sessions.json there's nothing to drop, and ~/.berth/gui isn't made.
+pub fn drop_where(paths: &Paths, gone: impl Fn(&Record) -> bool) -> Result<Vec<Record>> {
+    if !dir(paths).join("sessions.json").exists() {
+        return Ok(Vec::new());
+    }
+    let lock = lock(paths)?;
+    let (dropped, keep): (Vec<Record>, Vec<Record>) = load_sessions(paths, &lock).into_iter().partition(|r| gone(r));
+    if !dropped.is_empty() {
+        save_sessions(paths, &lock, &keep)?;
+    }
+    Ok(dropped)
+}
+
+/// Whether a record is a session on Linux `machine`, or on any machine.
+pub fn on_linux(record: &Record, machine: Option<&str>) -> bool {
+    record.target.strip_prefix("linux:").is_some_and(|m| machine.is_none_or(|want| m == want))
+}
+
+/// Drop the Linux sessions on `machine` (None: every machine), which died
+/// with it. Linux sessions have no clone to delete.
+pub fn forget_linux(paths: &Paths, machine: Option<&str>) -> Result<Vec<Record>> {
+    drop_where(paths, |r| on_linux(r, machine))
+}
+
+/// Drop the sessions on macOS VM `vm`; its clone sessions only with
+/// `clones` (the VM is deleted), else a stopped clone would be forgotten
+/// and never deleted.
+pub fn forget_mac(paths: &Paths, vm: &str, clones: bool) -> Result<Vec<Record>> {
+    let target = format!("mac:{vm}");
+    drop_where(paths, |r| r.target == target && (clones || !r.clone))
+}
+
 pub fn alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
 }
@@ -187,6 +285,75 @@ mod tests {
         assert_eq!(prune_and_place(&mut queue, "me", |pid| pid != 2), Some(1));
         assert_eq!(queue.len(), 3);
         assert_eq!(prune_and_place(&mut queue, "gone", |_| true), None);
+    }
+
+    fn on(session: &str, target: &str, clone: bool) -> Record {
+        Record { target: target.into(), clone, ..record(session, "2026-11-02T09:00:00Z") }
+    }
+
+    #[test]
+    fn a_look_at_a_target_tells_which_sessions_are_gone() {
+        let r = on("s-1", "linux:desk", false);
+        assert!(!is_gone(&r, &Seen::Live(vec!["s-0".into(), "s-1".into()])));
+        assert!(is_gone(&r, &Seen::Live(vec!["s-0".into()])));
+        assert!(is_gone(&r, &Seen::Down));
+        assert!(!is_gone(&r, &Seen::Unsure));
+
+        assert_eq!(mac_seen(true, true), Seen::Unsure);
+        assert_eq!(mac_seen(true, false), Seen::Down);
+        assert_eq!(mac_seen(false, false), Seen::Down);
+
+        let listed = serde_json::json!({"sessions": [{"session": "s-1", "agent": "claude-code"}, {"session": "s-2"}]});
+        assert_eq!(linux_seen("desk", Ok(&listed)), Seen::Live(vec!["s-1".into(), "s-2".into()]));
+        assert_eq!(linux_seen("desk", Ok(&serde_json::json!({}))), Seen::Unsure);
+        assert_eq!(linux_seen("desk", Err("no machine desk")), Seen::Down);
+        assert_eq!(linux_seen("desk", Err("machine desk isn't running: berth machine start desk")), Seen::Down);
+        assert_eq!(linux_seen("desk", Err("no machine desktop")), Seen::Unsure);
+        assert_eq!(linux_seen("desk", Err("berth is not running (berth start)")), Seen::Unsure);
+        assert_eq!(linux_seen("desk", Err("Linux GUI sessions are off: …")), Seen::Unsure);
+    }
+
+    #[test]
+    fn a_refusal_naming_the_session_means_its_gone() {
+        // As seen live: the VM restarted under linux:desk's session s-cabf81.
+        let r = on("s-cabf81", "linux:desk", false);
+        assert!(gone_by_error(&r, "no session s-cabf81 in desk"));
+        assert!(gone_by_error(&r, "machine desk isn't running: berth machine start desk"));
+        assert!(!gone_by_error(&r, "no session s-other in desk"));
+        assert!(!gone_by_error(&r, "no element labelled \"Save\""));
+        assert!(!gone_by_error(&on("s-1", "mac:test", false), "no session s-1 in test"));
+    }
+
+    #[test]
+    fn dead_sessions_are_dropped_under_the_lock() {
+        let root = std::env::temp_dir().join(format!("berth-sessions-{}", gui_log::new_id()));
+        let paths = Paths { home: root.clone(), root: root.clone() };
+        // No sessions.json: nothing to do, and nothing made under ~/.berth.
+        assert!(forget_linux(&paths, None).unwrap().is_empty());
+        assert!(!root.exists());
+        {
+            let lock = lock(&paths).unwrap();
+            let all = [
+                on("s-a", "linux:desk", false),
+                on("s-b", "linux:desk-2", false),
+                on("s-c", "linux:web", false),
+                on("s-d", "mac:test", false),
+                on("s-e", "mac:test", true),
+                on("s-f", "mac:other", false),
+            ];
+            save_sessions(&paths, &lock, &all).unwrap();
+        }
+        let names = |rs: Vec<Record>| rs.into_iter().map(|r| r.session).collect::<Vec<_>>();
+        let left = || names(load_sessions(&paths, &lock(&paths).unwrap()));
+        assert_eq!(names(forget_linux(&paths, Some("desk")).unwrap()), ["s-a"]);
+        // A stopped VM's clone sessions stay, to be deleted along with their VM.
+        assert_eq!(names(forget_mac(&paths, "test", false).unwrap()), ["s-d"]);
+        assert_eq!(left(), ["s-b", "s-c", "s-e", "s-f"]);
+        assert_eq!(names(forget_linux(&paths, None).unwrap()), ["s-b", "s-c"]);
+        assert_eq!(names(forget_mac(&paths, "test", true).unwrap()), ["s-e"]);
+        assert!(forget_mac(&paths, "test", true).unwrap().is_empty());
+        assert_eq!(left(), ["s-f"]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

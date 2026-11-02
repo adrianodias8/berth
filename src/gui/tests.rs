@@ -33,10 +33,18 @@ impl Fake {
         Fake { paths: Paths { home: root.clone(), root: root.clone() }, root, seen: Arc::default() }
     }
 
-    /// A running macOS VM named `vm` whose agent answers.
+    /// A running macOS VM named `vm` whose agent answers: its vm.json, and
+    /// run.pid's lock held as the VM's process holds it.
     pub fn mac_guest(&self, vm: &str) {
         let dir = proto::mac_dir(&self.paths, vm);
         std::fs::create_dir_all(&dir).unwrap();
+        if !dir.join("vm.json").exists() {
+            std::fs::write(dir.join("vm.json"), r#"{"cpus":4,"memory_mib":8192,"base":null,"created":1}"#).unwrap();
+        }
+        let pid = std::fs::File::create(dir.join("run.pid")).unwrap();
+        std::io::Write::write_all(&mut &pid, std::process::id().to_string().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&pid), libc::LOCK_EX) }, 0);
+        std::mem::forget(pid);
         let listener = UnixListener::bind(dir.join("agent.sock")).unwrap();
         let seen = self.seen.clone();
         std::thread::spawn(move || {
@@ -118,6 +126,9 @@ fn serve(stream: UnixStream, seen: &Mutex<Seen>) {
         (json!({"ok": false, "error": "unsupported version"}), b"")
     } else {
         match request["verb"].as_str().unwrap_or("") {
+            // A session the guest lost (its VM restarted), as the Linux agent says it.
+            _ if request["session"] == "s-lost" => (json!({"ok": false, "error": "no session s-lost in dev"}), b""),
+            "session.list" => (json!({"ok": true, "result": {"sessions": [{"session": "s-1234", "agent": "claude-code", "apps": []}]}}), b""),
             "hello" => (json!({"ok": true, "result": {"os": "macos", "agent": "fake", "screen": [1440, 900], "scale": 2}}), b""),
             "session.new" => (json!({"ok": true, "result": {"session": "s-1234"}}), b""),
             "screenshot" => (json!({"ok": true, "result": {"width": 1440, "height": 900}, "payload_len": PNG.len()}), PNG),
@@ -382,4 +393,91 @@ fn a_clone_session_wins_over_its_base_target() {
     let mut ctx = Ctx { session: Some("s-c1".into()), ..fake.ctx(Some("mac:other")) };
     let err = perform(&mut ctx, Action::Guest { verb: "windows", args: json!({}) }).unwrap_err();
     assert!(err.to_string().contains("session s-c1 is on mac:gui-c1, not mac:other"), "{err}");
+}
+
+fn saved(fake: &Fake, records: &[(&str, &str, bool)]) {
+    let lock = sessions::lock(&fake.paths).unwrap();
+    let records: Vec<_> = records
+        .iter()
+        .map(|(session, target, clone)| sessions::Record {
+            session: (*session).into(),
+            target: (*target).into(),
+            agent: Who::default(),
+            clone: *clone,
+            started: gui_log::now(),
+            last_used: gui_log::now(),
+            note: None,
+        })
+        .collect();
+    sessions::save_sessions(&fake.paths, &lock, &records).unwrap();
+}
+
+fn left(fake: &Fake) -> Vec<String> {
+    let lock = sessions::lock(&fake.paths).unwrap();
+    sessions::load_sessions(&fake.paths, &lock).into_iter().map(|r| r.session).collect()
+}
+
+/// A macOS VM that's there but not running.
+fn stopped_mac(fake: &Fake, vm: &str) {
+    let dir = proto::mac_dir(&fake.paths, vm);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("vm.json"), r#"{"cpus":4,"memory_mib":8192,"base":null,"created":1}"#).unwrap();
+}
+
+/// Seen live: s-cabf81 on linux:desk ended with berth's VM, and was still
+/// listed (and shown in Berth.app) until something cleaned it up.
+#[test]
+fn session_list_forgets_what_is_gone() {
+    let fake = Fake::new(json!({"mac": true, "gui": true}));
+    fake.linux_daemon();
+    fake.mac_guest("test");
+    stopped_mac(&fake, "off");
+    saved(
+        &fake,
+        &[
+            ("s-1234", "linux:dev", false),
+            ("s-cabf81", "linux:dev", false),
+            ("s-mac", "mac:test", false),
+            ("s-off", "mac:off", false),
+            // A clone deleted by hand: nothing left to delete.
+            ("s-clone", "mac:gui-0000aaaa", true),
+            // No telling for this one's machine: kept.
+            ("s-far", "linux:missing", false),
+        ],
+    );
+    let list = perform(&mut fake.ctx(None), Action::SessionList).unwrap();
+    let listed: Vec<&str> = list.result["sessions"].as_array().unwrap().iter().map(|s| s["session"].as_str().unwrap()).collect();
+    assert_eq!(listed, ["s-1234", "s-mac", "s-far"]);
+    assert_eq!(left(&fake), ["s-1234", "s-mac", "s-far"]);
+    // One look per Linux machine the guest answers for, none per macOS VM.
+    assert_eq!(fake.requests().iter().filter(|r| r["verb"] == "session.list").count(), 1);
+
+    // With a target, only that target is looked at.
+    saved(&fake, &[("s-x", "linux:dev", false), ("s-off", "mac:off", false)]);
+    let list = perform(&mut fake.ctx(Some("linux:dev")), Action::SessionList).unwrap();
+    assert_eq!(list.result["sessions"].as_array().unwrap().len(), 0);
+    assert_eq!(left(&fake), ["s-off"]);
+}
+
+#[test]
+fn a_call_the_guest_says_has_no_session_forgets_it() {
+    let fake = Fake::new(json!({"mac": true, "gui": true}));
+    fake.linux_daemon();
+    saved(&fake, &[("s-lost", "linux:dev", false), ("s-1234", "linux:dev", false)]);
+    let mut ctx = Ctx { session: Some("s-lost".into()), ..fake.ctx(None) };
+    let err = perform(&mut ctx, Action::Guest { verb: "windows", args: json!({}) }).unwrap_err();
+    assert_eq!(err.to_string(), "no session s-lost in dev");
+    assert_eq!(left(&fake), ["s-1234"]);
+    // Any other failure leaves the session be.
+    let mut ctx = Ctx { session: Some("s-1234".into()), ..fake.ctx(None) };
+    assert!(perform(&mut ctx, Action::Guest { verb: "click", args: click_args(&At::Label("Missing".into()), false, 1) }).is_err());
+    assert_eq!(left(&fake), ["s-1234"]);
+
+    // A macOS session whose VM stopped under it.
+    stopped_mac(&fake, "off");
+    saved(&fake, &[("s-mac", "mac:off", false)]);
+    let mut ctx = Ctx { session: Some("s-mac".into()), ..fake.ctx(None) };
+    let err = perform(&mut ctx, Action::Guest { verb: "windows", args: json!({}) }).unwrap_err();
+    assert!(err.to_string().contains("isn't running"), "{err}");
+    assert!(left(&fake).is_empty());
 }

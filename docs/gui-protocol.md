@@ -195,6 +195,27 @@ next `berth gui` call (the daemon doesn't expire them yet). macOS: at most 2 VMs
 (Apple's license); `session new --clone` past that waits in
 `~/.berth/gui/queue.json`, first come first served.
 
+A session that ends without `session end` (its VM or machine went away)
+loses its record without anyone calling it:
+
+- every `linux:*` record when berth's VM boots (not when it resumes from a
+  suspend) and when the daemon exits other than for a suspend; a machine's
+  records after `machine stop|delete|restart|rename` (the daemon does all
+  of these, so Berth.app's own machine actions count too);
+- a macOS VM's records after `berth mac stop` (except clone sessions, see
+  below) and `berth mac delete`;
+- `session list` looks once at each target it lists: a Linux machine's
+  `session.list` (a record the guest doesn't list is gone, and all of them
+  if the machine is missing or stopped; no answer keeps them), a macOS VM's
+  `vm.json` and `run.pid` lock (gone or not running: all of its records);
+- a failed call in a session: a Linux guest's `no session <id> in
+  <machine>` (or its machine missing or stopped), or a macOS VM that's gone
+  or not running.
+
+A dropped clone session's VM is deleted as `session end` deletes it; if
+that fails the record is kept and tried again. `stderr` names each session
+forgotten.
+
 Details: times are UTC, `2026-11-02T10:00:00Z`; `note` is the session's
 latest `berth gui note`. `queue.json` is
 `[{"ticket","base","agent":who,"since","pid"}]`; an entry whose `pid` is

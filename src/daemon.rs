@@ -390,6 +390,9 @@ pub fn run(paths: Paths) -> Result<()> {
                 crate::snapshots::discard_suspended(&Paths::new());
             }
             BOOTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Linux GUI sessions are compositors in machines in the VM: a
+            // boot (unlike a resume) starts without any.
+            forget_gui_sessions(&Paths::new(), None, "the VM booted");
         }
         Err(err) => {
             eprintln!("VM failed to start: {err:#}");
@@ -499,6 +502,14 @@ async fn handle_control(stream: UnixStream, cpus: usize, memory: u64) -> Result<
             guest.shutdown().await?;
             let mut output = String::new();
             guest.read_to_string(&mut output).await?;
+            // Each of these stops the machine, and its GUI sessions with it.
+            if matches!(action.as_str(), "stop" | "delete" | "restart" | "rename")
+                && output.trim() == "ok"
+                && let Some(machine) = args.first().cloned()
+            {
+                let why = format!("machine {action}");
+                let _ = tokio::task::spawn_blocking(move || forget_gui_sessions(&Paths::new(), Some(&machine), &why)).await;
+            }
             serde_json::to_string(&MachineReply { output })?
         }
         Request::Engine { args } => {
@@ -781,8 +792,22 @@ async fn shutdown() {
     exit(&Paths::new());
 }
 
+/// Drop the records of `berth gui` sessions on Linux `machine` (None:
+/// every machine) from ~/.berth/gui/sessions.json: they died with it.
+fn forget_gui_sessions(paths: &Paths, machine: Option<&str>, why: &str) {
+    match crate::gui::sessions::forget_linux(paths, machine) {
+        Ok(gone) if !gone.is_empty() => eprintln!("gui: forgot {} Linux GUI session(s) ({why})", gone.len()),
+        Ok(_) => {}
+        Err(err) => eprintln!("gui: couldn't drop the Linux GUI sessions ({why}): {err:#}"),
+    }
+}
+
 fn exit(paths: &Paths) -> ! {
     crate::files::unmount_for_stop(paths);
+    // A suspended VM keeps its sessions for the resume; otherwise they died.
+    if !SUSPENDING.load(Ordering::SeqCst) {
+        forget_gui_sessions(paths, None, "the VM stopped");
+    }
     crate::routes::clear();
     for path in [paths.control_socket(), paths.docker_socket(), paths.ssh_socket(), paths.podman_socket(), paths.machine_ssh_socket(), paths.pid_file()] {
         let _ = std::fs::remove_file(path);

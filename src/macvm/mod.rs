@@ -142,11 +142,21 @@ pub fn command(paths: &Paths, cmd: MacCmd) -> Result<()> {
         ),
         MacCmd::List { json } => list(&root, json),
         MacCmd::Start { name, display } => start_in(&root, &name, display),
-        MacCmd::Stop { name, force } => stop_in(&root, &name, force),
+        MacCmd::Stop { name, force } => {
+            stop_in(&root, &name, force)?;
+            // A stopped clone keeps its session's record until `berth gui`
+            // deletes the clone along with it.
+            forget_gui_sessions(paths, &name, false);
+            Ok(())
+        }
         MacCmd::Reset { name } => reset(&root, &name),
         MacCmd::Clone { base, name } => clone(&root, &base, &name),
         MacCmd::SetBase { name } => set_base(&root, &name),
-        MacCmd::Delete { name, yes } => delete(&root, &name, yes),
+        MacCmd::Delete { name, yes } => {
+            delete(&root, &name, yes)?;
+            forget_gui_sessions(paths, &name, true);
+            Ok(())
+        }
         MacCmd::Shell { name, command } => shell(paths, &root, &name, &command),
         MacCmd::Info { name, json } => info(&root, &name, json),
         MacCmd::Grant { name } => {
@@ -157,6 +167,14 @@ pub fn command(paths: &Paths, cmd: MacCmd) -> Result<()> {
             guest::grant(paths, &vm)
         }
         MacCmd::Run { name, display } => vz::run(&existing(&root, &name)?, display),
+    }
+}
+
+/// `berth gui` sessions on a VM that stopped or was deleted are over: drop
+/// their records (docs/gui-protocol.md, "Sessions").
+fn forget_gui_sessions(paths: &Paths, name: &str, clones: bool) {
+    if let Err(err) = crate::gui::sessions::forget_mac(paths, name, clones) {
+        eprintln!("couldn't drop {name}'s berth gui sessions: {err:#}");
     }
 }
 
@@ -189,6 +207,11 @@ pub fn default_base(paths: &Paths) -> Option<String> {
     let name = std::fs::read_to_string(default_base_file(&store::root(paths))).ok()?;
     let name = name.trim().to_string();
     store::valid_name(&name).is_ok().then_some(name)
+}
+
+/// Whether a macOS VM named `name` exists.
+pub fn exists(paths: &Paths, name: &str) -> bool {
+    store::valid_name(name).is_ok() && Vm::new(&store::root(paths), name).exists()
 }
 
 /// The VM a clone was made from, if `name` is a clone.

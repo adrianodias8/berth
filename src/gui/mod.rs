@@ -383,6 +383,9 @@ pub fn perform(ctx: &mut Ctx, action: Action) -> Result<Outcome> {
     if !watcher {
         log(ctx.paths, &line);
     }
+    if let Err(err) = &result {
+        forget_if_gone(ctx, err);
+    }
     if result.is_ok()
         && !watcher
         && verb != "session.end"
@@ -433,7 +436,10 @@ fn end_in_guest(paths: &Paths, record: &sessions::Record) -> bool {
     if record.clone
         && let Target::Mac(vm) = &target
     {
-        if let Err(err) = macos::delete(vm) {
+        // A clone deleted by hand is as good as deleted here.
+        if let Err(err) = macos::delete(vm)
+            && macos::exists(paths, vm)
+        {
             eprintln!("berth gui: couldn't delete the session's VM {vm}: {err:#}");
             return false;
         }
@@ -441,6 +447,56 @@ fn end_in_guest(paths: &Paths, record: &sessions::Record) -> bool {
         eprintln!("berth gui: ending {} in the guest: {err:#}", record.session);
     }
     true
+}
+
+/// Forget sessions found gone: nothing to tell their guest, but a clone VM
+/// is deleted as `session end` would, and a record whose clone can't be
+/// deleted is kept so it's tried again.
+fn forget(paths: &Paths, gone: Vec<sessions::Record>, why: &str) {
+    let mut failed = Vec::new();
+    for record in gone {
+        eprintln!("berth gui: forgot session {} on {} ({why})", record.session, record.target);
+        if record.clone
+            && let Ok(Target::Mac(vm)) = Target::parse(&record.target)
+            && macos::exists(paths, &vm)
+            && let Err(err) = macos::delete(&vm)
+            && macos::exists(paths, &vm)
+        {
+            eprintln!("berth gui: couldn't delete the session's VM {vm}: {err:#}");
+            failed.push(record);
+        }
+    }
+    if let Err(err) = sessions::restore(paths, &failed) {
+        eprintln!("berth gui: couldn't keep the record of a session whose VM is still there: {err:#}");
+    }
+}
+
+/// One look at a target: a macOS VM's run.pid lock, a Linux machine's
+/// session.list.
+fn look(paths: &Paths, target: &Target) -> sessions::Seen {
+    match target {
+        Target::Mac(vm) => sessions::mac_seen(macos::exists(paths, vm), macos::is_running(paths, vm)),
+        Target::Linux(machine) => match call(paths, target, None, "session.list", json!({}), None, Duration::from_secs(30)) {
+            Ok((reply, _)) => sessions::linux_seen(machine, Ok(&reply.result)),
+            Err(err) => sessions::linux_seen(machine, Err(&err.to_string())),
+        },
+    }
+}
+
+/// After a failed call in a session: forget it if the failure shows it's
+/// gone (the guest says "no session", or its VM or machine is down). Only
+/// on errors, so a working session costs nothing.
+fn forget_if_gone(ctx: &Ctx, err: &anyhow::Error) {
+    let (Some(session), Some(target)) = (&ctx.session, &ctx.target) else { return };
+    let Ok(Some(record)) = sessions::find(ctx.paths, session) else { return };
+    let error = err.to_string();
+    let down = match target {
+        Target::Mac(_) => sessions::is_gone(&record, &look(ctx.paths, target)),
+        Target::Linux(_) => sessions::gone_by_error(&record, &error),
+    };
+    if down && let Ok(gone) = sessions::drop_where(ctx.paths, |r| r.session == record.session) {
+        forget(ctx.paths, gone, "it's gone from its guest");
+    }
 }
 
 /// How long a verb may take in the guest, plus room for the round trip.
@@ -559,8 +615,24 @@ fn act(ctx: &mut Ctx, id: &str, action: Action) -> Result<Outcome> {
             done(json!({"session": session}))
         }
         Action::SessionList => {
-            let lock = sessions::lock(ctx.paths)?;
             let wanted = ctx.target.as_ref().map(Target::to_string);
+            // One look per target, outside the lock (a Linux look asks the
+            // guest), then drop what's gone under it: only records there
+            // before the look, not a session started meanwhile.
+            let before: Vec<sessions::Record> = {
+                let lock = sessions::lock(ctx.paths)?;
+                sessions::load_sessions(ctx.paths, &lock).into_iter().filter(|r| wanted.as_ref().is_none_or(|w| w == &r.target)).collect()
+            };
+            let mut targets: Vec<&str> = before.iter().map(|r| r.target.as_str()).collect();
+            targets.sort();
+            targets.dedup();
+            let seen: Vec<(&str, sessions::Seen)> =
+                targets.into_iter().filter_map(|t| Target::parse(t).ok().map(|target| (t, look(ctx.paths, &target)))).collect();
+            let gone = sessions::drop_where(ctx.paths, |r| {
+                before.iter().any(|b| b.session == r.session) && seen.iter().any(|(t, s)| *t == r.target && sessions::is_gone(r, s))
+            })?;
+            forget(ctx.paths, gone, "its VM, machine or guest session is gone");
+            let lock = sessions::lock(ctx.paths)?;
             let all: Vec<_> = sessions::load_sessions(ctx.paths, &lock).into_iter().filter(|r| wanted.as_ref().is_none_or(|t| &r.target == t)).collect();
             done(json!({"sessions": all}))
         }

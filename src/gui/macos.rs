@@ -10,8 +10,8 @@
 //!   berth mac stop <name> --force
 //!   berth mac delete <name> --yes
 //!   berth mac list --json               [{"name", "state", "base", …}]
-//! and, in-process, on `macvm::running` (VMs whose run.pid lock is held)
-//! and `macvm::default_base`.
+//! and, in-process, on `macvm::running` (VMs whose run.pid lock is held),
+//! `macvm::exists` and `macvm::default_base`.
 
 use std::process::Command;
 
@@ -62,6 +62,16 @@ pub fn delete(name: &str) -> Result<()> {
 /// another `berth gui` is starting one (its process holds run.pid's lock).
 pub fn running(paths: &Paths) -> usize {
     crate::macvm::running(paths).len()
+}
+
+pub fn is_running(paths: &Paths, name: &str) -> bool {
+    crate::macvm::running(paths).iter().any(|vm| vm == name)
+}
+
+/// Whether the VM is still there (a session's clone may have been deleted
+/// by hand).
+pub fn exists(paths: &Paths, name: &str) -> bool {
+    crate::macvm::exists(paths, name)
 }
 
 /// The VM `berth mac set-base` saved last.
