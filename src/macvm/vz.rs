@@ -393,6 +393,7 @@ define_class!(
         /// running like one started without it, and `berth mac stop` stops it.
         #[unsafe(method(applicationShouldTerminate:))]
         fn should_terminate(&self, app: &NSApplication) -> NSApplicationTerminateReply {
+            eprintln!("Quit: hiding the window, the VM keeps running");
             WINDOW.with(|w| {
                 if let Some(window) = w.borrow().as_ref() {
                     window.orderOut(None);
