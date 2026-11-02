@@ -12,7 +12,8 @@ import SwiftUI
 
 /// Which screen a window shows. Codable: SwiftUI restores windows by value.
 struct DisplayTarget: Codable, Hashable {
-    /// "linux:<machine>" (docs/gui-protocol.md, Activity log).
+    /// "linux:<machine>" (docs/gui-protocol.md, Activity log); the Agents
+    /// view's cards also shoot "mac:<vm>" sessions this way.
     var target: String
     var session: String
 }
@@ -24,6 +25,10 @@ enum DisplayBackend {
 }
 
 enum DisplayCapture {
+    /// BERTH_GUI_WHO for the app's own screenshots, and the `who.kind` the
+    /// CLI gives them (docs/gui-protocol.md, Activity log).
+    static let who = "berth-app"
+
     /// The PNG's path in `berth gui screenshot --json` output: the "path"
     /// (or "file"/"screenshot") of the last JSON object printed, else a
     /// last line that is itself a path.
@@ -48,7 +53,7 @@ enum DisplayCapture {
         process.executableURL = URL(fileURLWithPath: BerthPaths.cli)
         process.arguments = args
         var env = ProcessInfo.processInfo.environment
-        env["BERTH_GUI_WHO"] = "berth-app"
+        env["BERTH_GUI_WHO"] = who
         process.environment = env
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -65,6 +70,23 @@ enum DisplayCapture {
 
     static func arguments(_ target: DisplayTarget) -> [String] {
         ["gui", "screenshot", "--target", target.target, "--session", target.session, "--json"]
+    }
+
+    struct Failure: Error {
+        let message: String
+    }
+
+    /// One screenshot of a session: the PNG's path (for the app the CLI
+    /// replaces one file per session, `shots/live-<session>.png`), or what
+    /// went wrong. Display windows and the Agents view's cards both use it.
+    static func shoot(_ target: DisplayTarget) async -> Result<String, Failure> {
+        let args = arguments(target)
+        let result = await offPool { run(args) }
+        guard result.code == 0, let path = path(fromOutput: result.output) else {
+            let message = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            return .failure(Failure(message: message.isEmpty ? "No screenshot" : message))
+        }
+        return .success(path)
     }
 }
 
@@ -96,11 +118,11 @@ final class DisplayFrames: ObservableObject {
     }
 
     func capture() async {
-        let args = DisplayCapture.arguments(target)
-        let result = await offPool { DisplayCapture.run(args) }
-        guard result.code == 0, let path = DisplayCapture.path(fromOutput: result.output) else {
-            let message = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
-            error = message.isEmpty ? "No screenshot" : message
+        let path: String
+        switch await DisplayCapture.shoot(target) {
+        case let .success(saved): path = saved
+        case let .failure(failure):
+            error = failure.message
             return
         }
         let image = await offPool { () -> CGImage? in

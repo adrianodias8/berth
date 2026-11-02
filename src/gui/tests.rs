@@ -383,3 +383,44 @@ fn a_clone_session_wins_over_its_base_target() {
     let err = perform(&mut ctx, Action::Guest { verb: "windows", args: json!({}) }).unwrap_err();
     assert!(err.to_string().contains("session s-c1 is on mac:gui-c1, not mac:other"), "{err}");
 }
+
+/// Berth.app's Agents cards peek at every session every few seconds: if
+/// that counted as use, no watched session would ever idle out.
+#[test]
+fn the_apps_screenshots_are_not_use() {
+    let fake = Fake::new(json!({"mac": true, "gui_idle_minutes": 30}));
+    fake.mac_guest("test");
+    let used = gui_log::rfc3339(gui_log::unix_now() - 10 * 60);
+    let record = sessions::Record {
+        session: "s-1".into(),
+        target: "mac:test".into(),
+        agent: Who::default(),
+        clone: false,
+        started: used.clone(),
+        last_used: used.clone(),
+        note: None,
+    };
+    {
+        let lock = sessions::lock(&fake.paths).unwrap();
+        sessions::save_sessions(&fake.paths, &lock, &[record]).unwrap();
+    }
+    let shot = |ctx: &mut Ctx| perform(ctx, Action::Guest { verb: "screenshot", args: json!({"window": null, "format": "png"}) }).unwrap();
+    let app = Who { kind: gui_log::APP_KIND.into(), ..Who::default() };
+    let mut ctx = Ctx { session: Some("s-1".into()), who: app, ..fake.ctx(None) };
+    let first = shot(&mut ctx).screenshot.unwrap();
+    let second = shot(&mut ctx).screenshot.unwrap();
+    // One file per session, replaced whole; nothing left aside.
+    assert_eq!(first, gui_log::shots(&fake.paths).join("live-s-1.png"));
+    assert_eq!(second, first);
+    assert_eq!(std::fs::read(&first).unwrap(), PNG);
+    let names: Vec<_> = std::fs::read_dir(gui_log::shots(&fake.paths)).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert_eq!(names, ["live-s-1.png"]);
+    // Not logged, and the session is as idle as before.
+    assert!(fake.log_lines().is_empty());
+    assert_eq!(sessions::find(&fake.paths, "s-1").unwrap().unwrap().last_used, used);
+    // An agent's screenshot is use.
+    let mut agent = Ctx { session: Some("s-1".into()), ..fake.ctx(None) };
+    shot(&mut agent);
+    assert_ne!(sessions::find(&fake.paths, "s-1").unwrap().unwrap().last_used, used);
+    assert_eq!(fake.log_lines().len(), 2);
+}
