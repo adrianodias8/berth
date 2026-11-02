@@ -23,8 +23,10 @@
 //! the agent; and sshd is installed on first `ssh <name>.berth`.
 //!
 //! `--gui` machines (only with `"gui": true` in config.json) also get the
-//! packages GUI sessions need, and the VM's GPU render node when it has one
-//! (gui/install.rs); `machine gui` carries one GUI request (gui/mod.rs).
+//! packages GUI sessions need, and the VM's GPU nodes it has: the render
+//! node and the display, card0 (gui/install.rs). Machines made before a
+//! node existed get it bound in later (`ensure_gpu_binds`, at agent start
+//! and on `gui-install`). `machine gui` carries one GUI request (gui/mod.rs).
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -119,13 +121,16 @@ fn isolation(name: &str) -> Isolation {
 }
 
 /// Folders an isolated machine was given (`Bind=` lines; a --gui machine's
-/// render node isn't one).
+/// GPU nodes aren't ones).
 fn mounts(name: &str) -> Vec<String> {
-    std::fs::read_to_string(nspawn_path(name))
-        .unwrap_or_default()
+    mounts_in(&std::fs::read_to_string(nspawn_path(name)).unwrap_or_default())
+}
+
+fn mounts_in(config: &str) -> Vec<String> {
+    config
         .lines()
+        .filter(|l| !crate::gui::install::is_gpu_bind(l))
         .filter_map(|l| l.strip_prefix("Bind=").map(str::to_string))
-        .filter(|m| m != crate::gui::install::RENDER_NODE)
         .collect()
 }
 
@@ -252,15 +257,6 @@ fn create(
     }
     if !gui.is_empty() {
         marks.push_str(&format!("{GUI}\n"));
-        if let Some((bind, dropin)) = crate::gui::install::gpu_binds(Path::new(crate::gui::install::RENDER_NODE).exists()) {
-            binds.push_str(&bind);
-            let path = crate::gui::install::gpu_dropin_path(name);
-            if let Some(dir) = Path::new(&path).parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            std::fs::write(&path, dropin)?;
-            let _ = sh("systemctl daemon-reload");
-        }
     }
     std::fs::write(
         nspawn_path(name),
@@ -269,6 +265,9 @@ fn create(
             kill_signal(name)
         ),
     )?;
+    if !gui.is_empty() && ensure_gpu_binds(name)? {
+        let _ = sh("systemctl daemon-reload");
+    }
     if !(isolated || isolate_network) {
         integrate_files(name);
     }
@@ -302,6 +301,14 @@ pub(crate) fn isolated(name: &str) -> bool {
 /// tries.
 pub(crate) fn setup_gui(name: &str, kind: &str) -> io::Result<()> {
     exists(name)?;
+    // A machine set up after it was made is a GUI machine from now on, so
+    // later retrofits find it too.
+    let nspawn = nspawn_path(name);
+    let config = std::fs::read_to_string(&nspawn)?;
+    if !config.lines().any(|l| l == GUI) {
+        std::fs::write(&nspawn, format!("{GUI}\n{config}"))?;
+    }
+    refresh_gpu_binds(name)?;
     let os_release = crate::inroot::Root::new(format!("{MACHINES}/{name}"))
         .and_then(|r| r.read("/etc/os-release", 1 << 16).or_else(|_| r.read("/usr/lib/os-release", 1 << 16)))
         .map(|b| String::from_utf8_lossy(&b).into_owned())
@@ -319,6 +326,86 @@ pub(crate) fn setup_gui(name: &str, kind: &str) -> io::Result<()> {
             result = run_in(name, &script);
         }
         result.map_err(|e| io::Error::other(format!("installing GUI packages: {e}")))?;
+    }
+    Ok(())
+}
+
+fn gui_machine(name: &str) -> bool {
+    std::fs::read_to_string(nspawn_path(name)).unwrap_or_default().lines().any(|l| l == GUI)
+}
+
+/// Bind the VM's GPU nodes into machine `name` as they are now: its .nspawn
+/// `Bind=` lines and its unit's DeviceAllow drop-in, for the nodes that
+/// exist (a node can appear after the machine was made: the render node
+/// comes with virgl), and none for a node that's gone, which nspawn would
+/// refuse to start with. Whether anything changed.
+pub(crate) fn ensure_gpu_binds(name: &str) -> io::Result<bool> {
+    ensure_gpu_binds_at(Path::new(&nspawn_path(name)), Path::new(&crate::gui::install::gpu_dropin_path(name)), &crate::gui::install::GpuNodes::present())
+}
+
+fn ensure_gpu_binds_at(nspawn: &Path, dropin: &Path, nodes: &crate::gui::install::GpuNodes) -> io::Result<bool> {
+    let wanted = crate::gui::install::gpu_binds(nodes);
+    let config = std::fs::read_to_string(nspawn)?;
+    let updated = with_gpu_binds(&config, wanted.as_ref().map_or("", |(binds, _)| binds.as_str()));
+    let mut changed = false;
+    if updated != config {
+        std::fs::write(nspawn, updated)?;
+        changed = true;
+    }
+    match wanted {
+        Some((_, unit)) if std::fs::read_to_string(dropin).ok().as_deref() != Some(unit.as_str()) => {
+            if let Some(dir) = dropin.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(dropin, unit)?;
+            changed = true;
+        }
+        Some(_) => {}
+        None => {
+            if std::fs::remove_file(dropin).is_ok() {
+                if let Some(dir) = dropin.parent() {
+                    let _ = std::fs::remove_dir(dir);
+                }
+                changed = true;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+/// An .nspawn file with `binds` as its GPU lines. Left as it is when it
+/// already has those lines (wherever they are); otherwise the old ones go
+/// and the new ones open its [Files] section.
+fn with_gpu_binds(config: &str, binds: &str) -> String {
+    let is_gpu = crate::gui::install::is_gpu_bind;
+    let mut have: Vec<&str> = config.lines().filter(|l| is_gpu(l)).collect();
+    let mut want: Vec<&str> = binds.lines().collect();
+    have.sort_unstable();
+    want.sort_unstable();
+    if have == want {
+        return config.to_string();
+    }
+    let kept: String = config.lines().filter(|l| !is_gpu(l)).map(|l| format!("{l}\n")).collect();
+    if binds.is_empty() {
+        kept
+    } else if kept.contains("[Files]\n") {
+        kept.replacen("[Files]\n", &format!("[Files]\n{binds}"), 1)
+    } else {
+        format!("{kept}[Files]\n{binds}")
+    }
+}
+
+/// `ensure_gpu_binds`, then what applies it: systemd reloads the drop-in,
+/// and a running machine restarts to get the new binds.
+fn refresh_gpu_binds(name: &str) -> io::Result<()> {
+    if !ensure_gpu_binds(name)? {
+        return Ok(());
+    }
+    let _ = sh("systemctl daemon-reload");
+    if running(name) {
+        eprintln!("berth-agent: gui: {name}: GPU nodes bound, restarting");
+        stop(name)?;
+        start(name)?;
     }
     Ok(())
 }
@@ -551,7 +638,16 @@ pub fn integrate_all() {
     });
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || !valid_name(&name) || !entry.path().is_dir() || isolation(&name).files {
+        if name.starts_with('.') || !valid_name(&name) || !entry.path().is_dir() {
+            continue;
+        }
+        // Isolated GUI machines too: the GPU is all they get of the VM.
+        if gui_machine(&name)
+            && let Err(e) = refresh_gpu_binds(&name)
+        {
+            eprintln!("berth-agent: gui: {name}: binding the GPU nodes: {e}");
+        }
+        if isolation(&name).files {
             continue;
         }
         integrate_files(&name);
@@ -890,5 +986,50 @@ mod tests {
         assert!(!valid_name("-x"));
         assert!(!valid_name("thirteen-char"));
         assert!(!valid_name("a;rm -rf"));
+    }
+
+    use crate::gui::install::GpuNodes;
+
+    const NSPAWN: &str = "# berth: gui\n[Exec]\nBoot=yes\nPrivateUsers=no\n\n[Files]\nBind=/Users/me\nBindReadOnly=/run/berth\nBind=/dev/dri/renderD128\n\n[Network]\nVirtualEthernetExtra=ve-dev:eth0\n";
+
+    #[test]
+    fn gpu_binds_are_retrofitted_once() {
+        let dir = std::env::temp_dir().join(format!("berth-binds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (nspawn, dropin) = (dir.join("dev.nspawn"), dir.join("systemd-nspawn@dev.service.d/berth-gpu.conf"));
+        std::fs::write(&nspawn, NSPAWN).unwrap();
+        let both = GpuNodes { render: true, card: true };
+        assert!(ensure_gpu_binds_at(&nspawn, &dropin, &both).unwrap());
+        let config = std::fs::read_to_string(&nspawn).unwrap();
+        assert_eq!(config.matches("Bind=/dev/dri/renderD128\n").count(), 1, "{config}");
+        assert!(config.contains("[Files]\nBind=/dev/dri/renderD128\nBind=/dev/dri/card0\nBind=/Users/me\nBindReadOnly=/run/berth\n"), "{config}");
+        assert!(config.starts_with("# berth: gui\n[Exec]\nBoot=yes\n") && config.ends_with("[Network]\nVirtualEthernetExtra=ve-dev:eth0\n"), "{config}");
+        assert!(std::fs::read_to_string(&dropin).unwrap().contains("DeviceAllow=/dev/dri/card0 rw"));
+        // The second run finds nothing to do.
+        assert!(!ensure_gpu_binds_at(&nspawn, &dropin, &both).unwrap());
+        assert_eq!(std::fs::read_to_string(&nspawn).unwrap(), config);
+        // A node that's gone loses its bind; with none, the drop-in goes.
+        assert!(ensure_gpu_binds_at(&nspawn, &dropin, &GpuNodes { render: false, card: true }).unwrap());
+        assert!(!std::fs::read_to_string(&nspawn).unwrap().contains("renderD128"));
+        assert!(ensure_gpu_binds_at(&nspawn, &dropin, &GpuNodes::default()).unwrap());
+        assert!(!dropin.exists());
+        assert!(!std::fs::read_to_string(&nspawn).unwrap().contains("/dev/dri"));
+        assert!(std::fs::read_to_string(&nspawn).unwrap().contains("Bind=/Users/me\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_gpu_lines_stay_where_they_are() {
+        // Only the render node, where an older berth put it: nothing to do.
+        assert_eq!(with_gpu_binds(NSPAWN, "Bind=/dev/dri/renderD128\n"), NSPAWN);
+        let no_files = with_gpu_binds("[Exec]\nBoot=yes\n", "Bind=/dev/dri/card0\n");
+        assert_eq!(no_files, "[Exec]\nBoot=yes\n[Files]\nBind=/dev/dri/card0\n");
+    }
+
+    #[test]
+    fn mounts_hide_the_gpu_nodes() {
+        let config = format!("{NSPAWN}Bind=/dev/dri/card0\nBind=/Volumes/x\n");
+        assert_eq!(mounts_in(&config), vec!["/Users/me", "/Volumes/x"]);
     }
 }

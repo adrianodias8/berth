@@ -2,19 +2,24 @@
 //! (docs/gui-protocol.md is the contract; docs/plans/gui-vms-agent-testing.md
 //! the plan).
 //!
-//! A session is a headless Wayland compositor inside a machine, run as the
-//! machine's user: sway for agent sessions (any number of apps, windows
-//! managed over sway's IPC), cage for an app session (one app, full screen).
-//! Each has its own runtime folder in the machine, /tmp/berth-gui-<id>,
-//! which is its XDG_RUNTIME_DIR: its Wayland socket, sway's IPC socket, its
-//! own session D-Bus (where at-spi2 runs, for the accessibility tree) and its
+//! A session is a Wayland compositor inside a machine, run as the machine's
+//! user: headless sway for agent sessions (any number of apps, windows
+//! managed over sway's IPC), headless cage for an app session (one app, full
+//! screen), and for a desktop session sway or Hyprland on the VM's display
+//! (card0, through seatd), which the host reads back as scanout 0. A desktop
+//! is the DRM master of card0, so a VM has at most one. Each session has its
+//! own runtime folder in the machine, /tmp/berth-gui-<id>, which is its
+//! XDG_RUNTIME_DIR: its Wayland socket, the compositor's IPC socket, its own
+//! session D-Bus (where at-spi2 runs, for the accessibility tree) and its
 //! logs. So sessions never see each other's windows or input.
 //!
-//! Rendering is wlroots' pixman (CPU) unless the machine has the VM's GPU
-//! render node (install.rs binds it in), then GLES. Screenshots are grim
-//! (wlr-screencopy), the keyboard is wtype (virtual-keyboard), the pointer
-//! our own virtual-pointer client (wayland.rs), the tree a python3 AT-SPI
-//! script (atspi.py), window management swaymsg.
+//! Rendering is wlroots' GLES on the render node when the VM's GPU does 3D
+//! and the machine has the node (install.rs binds it in), else pixman (CPU);
+//! a compositor that fails to start on GLES is started again on pixman.
+//! Screenshots are grim (wlr-screencopy), the keyboard is wtype
+//! (virtual-keyboard), the pointer our own virtual-pointer client
+//! (wayland.rs), the tree a python3 AT-SPI script (atspi.py), window
+//! management swaymsg or hyprctl (hypr.rs).
 //!
 //! The agent keeps each session's record in /run/berth-gui/<machine>/ in the
 //! VM; a session whose compositor is gone is dropped the next time it's
@@ -24,6 +29,7 @@
 //! Only with `"gui": true` in berth's config.json.
 
 mod exec;
+mod hypr;
 pub mod install;
 mod keys;
 mod sway;
@@ -37,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use exec::{Machine, quote};
+use install::Flavour;
 
 const STATE: &str = "/run/berth-gui";
 const ATSPI: &str = include_str!("atspi.py");
@@ -92,12 +99,63 @@ struct Session {
     session: String,
     agent: String,
     since: String,
-    /// "agent" (sway) or "app" (cage).
+    /// "agent" (sway), "app" (cage) or "desktop".
     kind: String,
     size: [u32; 2],
     apps: Vec<App>,
     #[serde(default)]
     next_app: u32,
+    /// "gles2", "pixman" or (Hyprland without 3D) "software"; unknown for
+    /// sessions an older agent started.
+    #[serde(default)]
+    renderer: Option<String>,
+    /// A desktop's compositor: "sway" or "hyprland".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    flavour: Option<String>,
+}
+
+/// What a session is, for the verbs that differ.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Kind {
+    Agent,
+    App,
+    Desktop(Flavour),
+}
+
+impl Kind {
+    fn of(s: &Session) -> Kind {
+        match s.kind.as_str() {
+            "app" => Kind::App,
+            "desktop" => Kind::Desktop(s.flavour.as_deref().and_then(Flavour::parse).unwrap_or(Flavour::Sway)),
+            _ => Kind::Agent,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Agent => "agent",
+            Kind::App => "app",
+            Kind::Desktop(_) => "desktop",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Renderer {
+    Gles2,
+    Pixman,
+    /// Hyprland has no pixman: Mesa's software GL.
+    Software,
+}
+
+impl Renderer {
+    fn name(self) -> &'static str {
+        match self {
+            Renderer::Gles2 => "gles2",
+            Renderer::Pixman => "pixman",
+            Renderer::Software => "software",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -405,41 +463,88 @@ fn prelude(id: &str) -> String {
          export XDG_RUNTIME_DIR=$RT DBUS_SESSION_BUS_ADDRESS=unix:path=$RT/bus; \
          for s in $RT/wayland-[0-9]; do [ -S \"$s\" ] && export WAYLAND_DISPLAY=${{s##*/}} && break; done; \
          for s in $RT/sway-ipc.*.sock; do [ -S \"$s\" ] && export SWAYSOCK=$s && break; done; \
+         for s in $RT/hypr/*/.socket.sock; do [ -S \"$s\" ] && d=${{s%/.socket.sock}} && export HYPRLAND_INSTANCE_SIGNATURE=${{d##*/}} && break; done; \
          [ -s $RT/display ] && export DISPLAY=$(cat $RT/display); \
          {APP_ENV}cd ~ 2>/dev/null || true; "
     )
 }
 
-fn sway_config(size: [u32; 2]) -> String {
+/// sway's config: a headless output of `size`, or (a desktop) the display
+/// in the mode its EDID gives.
+fn sway_config(size: Option<[u32; 2]>) -> String {
+    let output = match size {
+        Some([w, h]) => format!("# berth: a headless agent session (agent/src/gui/mod.rs)\noutput HEADLESS-1 resolution {w}x{h} position 0 0 scale 1 bg #2e3440 solid_color\n"),
+        None => "# berth: a desktop session on the VM's display (agent/src/gui/mod.rs)\noutput * bg #2e3440 solid_color\n".to_string(),
+    };
     format!(
-        "# berth: a headless agent session (agent/src/gui/mod.rs)\n\
-         output HEADLESS-1 resolution {}x{} position 0 0 scale 1 bg #2e3440 solid_color\n\
-         default_border pixel 1\nfocus_on_window_activation focus\nxwayland enable\n\
-         exec sh -c 'echo $DISPLAY > $XDG_RUNTIME_DIR/display'\n",
-        size[0], size[1]
+        "{output}default_border pixel 1\nfocus_on_window_activation focus\nxwayland enable\n\
+         exec sh -c 'echo $DISPLAY > $XDG_RUNTIME_DIR/display'\n"
     )
 }
 
-/// The compositor's launcher: its own session bus, then sway or cage.
-fn launcher(id: &str, app: Option<&[String]>, gpu_3d: bool) -> String {
+/// What every launcher does: record its pid, start the session's own bus
+/// (so AT-SPI works), then become the compositor.
+fn launch_script(id: &str, env: &str, compositor: &str) -> String {
     let rt = runtime(id);
-    // gles2 only on a GPU that does 3D and is bound into the machine.
-    let renderer = if gpu_3d {
-        format!("if [ -e {} ]; then export WLR_RENDERER=gles2; else export WLR_RENDERER=pixman; fi; ", install::RENDER_NODE)
-    } else {
-        "export WLR_RENDERER=pixman; ".to_string()
-    };
-    let compositor = match app {
-        Some(argv) => format!("cage -- {}", argv.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")),
-        None => format!("sway -c {rt}/sway.conf"),
-    };
     format!(
-        "RT={rt}; echo $$ > $RT/compositor.pid; \
-         export XDG_RUNTIME_DIR=$RT WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_HEADLESS_OUTPUTS=1; \
-         {renderer}{APP_ENV}\
+        "RT={rt}; echo $$ > $RT/compositor.pid; export XDG_RUNTIME_DIR=$RT; {env}{APP_ENV}\
          if command -v dbus-daemon >/dev/null; then dbus-daemon --session --address=unix:path=$RT/bus --fork --nopidfile --print-pid > $RT/dbus.pid; fi; \
          export DBUS_SESSION_BUS_ADDRESS=unix:path=$RT/bus; \
          exec {compositor} >$RT/compositor.log 2>&1"
+    )
+}
+
+/// wlroots' renderer: GLES on the render node, or pixman.
+fn wlr_renderer(renderer: Renderer) -> String {
+    match renderer {
+        Renderer::Gles2 => format!("export WLR_RENDERER=gles2 WLR_RENDER_DRM_DEVICE={}; ", install::RENDER_NODE),
+        Renderer::Pixman | Renderer::Software => "export WLR_RENDERER=pixman; ".to_string(),
+    }
+}
+
+/// A headless compositor's launcher: sway, or cage for an app.
+fn launcher(id: &str, app: Option<&[String]>, renderer: Renderer) -> String {
+    let compositor = match app {
+        Some(argv) => format!("cage -- {}", argv.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")),
+        None => format!("sway -c {}/sway.conf", runtime(id)),
+    };
+    let env = format!("export WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_HEADLESS_OUTPUTS=1; {}", wlr_renderer(renderer));
+    launch_script(id, &env, &compositor)
+}
+
+/// A desktop's launcher: its compositor on the VM's display, as DRM master
+/// through seatd. Input comes only from virtual devices (there are no
+/// libinput ones in the machine).
+fn launcher_desktop(id: &str, desktop: install::Desktop, renderer: Renderer) -> String {
+    let seat = "export LIBSEAT_BACKEND=seatd; ";
+    match desktop.flavour {
+        Flavour::Sway => {
+            let env = format!("{seat}export WLR_BACKENDS=drm WLR_DRM_DEVICES={} WLR_LIBINPUT_NO_DEVICES=1; {}", install::CARD_NODE, wlr_renderer(renderer));
+            launch_script(id, &env, &format!("sway -c {}/sway.conf", runtime(id)))
+        }
+        Flavour::Hyprland => {
+            let software = if renderer == Renderer::Software { " LIBGL_ALWAYS_SOFTWARE=1" } else { "" };
+            let env = format!("{seat}export AQ_DRM_DEVICES={} XDG_CURRENT_DESKTOP=Hyprland{software}; ", install::CARD_NODE);
+            launch_script(id, &env, if desktop.uwsm { "uwsm start -- hyprland.desktop" } else { "Hyprland" })
+        }
+    }
+}
+
+/// The script that waits for a compositor: up when its Wayland socket and
+/// its IPC socket (sway's or Hyprland's; cage has none) are there, failed
+/// when it exits first or after `tries` tenths of a second.
+fn ready_script(id: &str, kind: Kind, tries: u32) -> String {
+    let ipc = match kind {
+        Kind::App => "true",
+        Kind::Agent | Kind::Desktop(Flavour::Sway) => "ls $RT/sway-ipc.*.sock >/dev/null 2>&1",
+        Kind::Desktop(Flavour::Hyprland) => "ls $RT/hypr/*/.socket.sock >/dev/null 2>&1",
+    };
+    format!(
+        "RT={}; for i in $(seq {tries}); do \
+           if ls $RT/wayland-[0-9] >/dev/null 2>&1 && {ipc}; then exit 0; fi; \
+           pid=$(cat $RT/compositor.pid 2>/dev/null); if [ -n \"$pid\" ] && ! kill -0 $pid 2>/dev/null; then break; fi; sleep 0.1; done; \
+         tail -n 5 $RT/compositor.log >&2; exit 1",
+        runtime(id)
     )
 }
 
@@ -447,9 +552,100 @@ fn missing_tools_message(missing: &str) -> String {
     format!(
         "GUI tools missing in this machine ({}). Install them with: berth machine create <name> --gui (new machines), \
          or in this one: sway cage grim wtype dbus at-spi2-core python3-gi (python-gobject on Arch, python3-gobject on Fedora) \
-         and the Atspi typelib (gir1.2-atspi-2.0 on Debian/Ubuntu)",
+         and the Atspi typelib (gir1.2-atspi-2.0 on Debian/Ubuntu); a desktop also needs seatd, and Mesa for the GPU",
         missing.trim()
     )
+}
+
+/// The VM's one desktop: who has card0, as "<machine> <session> <since>".
+const DESKTOP_CLAIM: &str = "/run/berth-gui-desktop";
+/// A claim this young counts even before its session is saved.
+const CLAIM_GRACE_S: u64 = 120;
+
+fn epoch_s() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+fn open_claim(path: &str) -> io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
+    unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
+    Ok(file)
+}
+
+/// Claim the VM's desktop for `machine`'s session `id`, unless another
+/// session that's still alive (`alive(machine, session)`) has it, across
+/// machines.
+fn claim_desktop(path: &str, machine: &str, id: &str, alive: impl Fn(&str, &str) -> bool) -> Result<(), String> {
+    use std::io::Seek;
+    let mut file = open_claim(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut held = String::new();
+    let _ = file.read_to_string(&mut held);
+    let mut words = held.split_whitespace();
+    if let (Some(m), Some(s)) = (words.next(), words.next()) {
+        let since: u64 = words.next().and_then(|t| t.parse().ok()).unwrap_or(0);
+        if (m, s) != (machine, id) && (epoch_s().saturating_sub(since) < CLAIM_GRACE_S || alive(m, s)) {
+            return Err(format!(
+                "this VM already has a desktop session: {s} in {m} (it drives the VM's display, so there's one at a time); end it first"
+            ));
+        }
+    }
+    file.set_len(0).and_then(|_| file.rewind()).and_then(|_| writeln!(file, "{machine} {id} {}", epoch_s())).map_err(|e| format!("{path}: {e}"))
+}
+
+/// Give the desktop back, if `machine`'s session `id` has it.
+fn release_desktop(path: &str, machine: &str, id: &str) {
+    let Ok(mut file) = open_claim(path) else { return };
+    let mut held = String::new();
+    let _ = file.read_to_string(&mut held);
+    let mut words = held.split_whitespace();
+    if words.next() == Some(machine) && words.next() == Some(id) {
+        let _ = file.set_len(0);
+    }
+}
+
+/// Whether `machine`'s session `id` still has a compositor (for a claim
+/// made from another machine).
+fn session_alive(machine: &str, id: &str) -> bool {
+    valid_session(id)
+        && load(machine, id).is_some()
+        && Machine::open(machine).is_ok_and(|m| {
+            m.run_text(&format!("p=$(cat {}/compositor.pid 2>/dev/null); [ -n \"$p\" ] && kill -0 $p 2>/dev/null && echo alive; true", runtime(id)), SHORT)
+                .is_ok_and(|o| o.trim() == "alive")
+        })
+}
+
+/// The session session.new asks for.
+#[derive(Debug, PartialEq)]
+enum Wanted {
+    Agent,
+    App(Vec<String>),
+    Desktop(Option<Flavour>),
+}
+
+/// `kind` (agent, app or desktop; by default app with an `app`, else agent),
+/// `app` and `flavour` (hyprland or sway; by default whichever is ready,
+/// Hyprland first).
+fn wanted(args: &Value) -> Result<Wanted, String> {
+    let app: Option<Vec<String>> = args.get("app").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect());
+    if app.as_ref().is_some_and(|a| a.is_empty()) {
+        return Err("session.new: app is an empty command".into());
+    }
+    let flavour = match args.get("flavour").and_then(Value::as_str) {
+        None | Some("" | "auto") => None,
+        Some(f) => Some(Flavour::parse(f).ok_or_else(|| format!("session.new: flavour {f:?}: hyprland or sway"))?),
+    };
+    let kind = args.get("kind").and_then(Value::as_str).filter(|k| !k.is_empty());
+    if flavour.is_some() && kind != Some("desktop") {
+        return Err("session.new: flavour is for desktop sessions".into());
+    }
+    match (kind, app) {
+        (None | Some("app"), Some(app)) => Ok(Wanted::App(app)),
+        (Some("app"), None) => Err("session.new: an app session needs app, its command".into()),
+        (None | Some("agent"), None) => Ok(Wanted::Agent),
+        (Some("desktop"), None) => Ok(Wanted::Desktop(flavour)),
+        (Some(k @ ("agent" | "desktop")), Some(_)) => Err(format!("session.new: app is for app sessions, not {k} ones (open apps in them)")),
+        (Some(other), _) => Err(format!("session.new: kind {other:?}: agent, app or desktop")),
+    }
 }
 
 /// PNG width and height, from its IHDR.
@@ -463,59 +659,131 @@ fn png_size(png: &[u8]) -> Option<[u32; 2]> {
 
 fn session_new(m: &Machine, args: &Value) -> Result<Done, String> {
     let agent = args.get("agent").and_then(Value::as_str).unwrap_or("").chars().take(200).collect::<String>();
-    let app: Option<Vec<String>> = args.get("app").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect());
-    if app.as_ref().is_some_and(|a| a.is_empty()) {
-        return Err("session.new: app is an empty command".into());
-    }
+    let wanted = wanted(args)?;
     let size = args
         .get("size")
         .and_then(Value::as_array)
         .and_then(|s| Some([s.first()?.as_u64()? as u32, s.get(1)?.as_u64()? as u32]))
         .filter(|[w, h]| (320..=7680).contains(w) && (240..=4320).contains(h))
         .unwrap_or(DEFAULT_SIZE);
-    let compositor = if app.is_some() { "cage" } else { "sway swaymsg" };
-    let missing = m
-        .run_text(&format!("for t in {compositor} grim wtype; do command -v $t >/dev/null || printf '%s ' $t; done"), SHORT)
+    // What the machine has, in one call: missing tools, the GPU nodes, and
+    // for a desktop what each flavour lacks.
+    let (compositor, desktop_probe) = match &wanted {
+        Wanted::Agent => ("sway swaymsg", String::new()),
+        Wanted::App(_) => ("cage", String::new()),
+        Wanted::Desktop(_) => ("", install::desktop_probe()),
+    };
+    let probe = m
+        .run_text(
+            &format!(
+                "for t in {compositor} grim wtype; do command -v $t >/dev/null || echo \"missing $t\"; done; \
+                 [ -e {} ] && echo render; [ -e {} ] && echo card0; {desktop_probe}; true",
+                install::RENDER_NODE,
+                install::CARD_NODE
+            ),
+            SHORT,
+        )
         .map_err(|e| e.to_string())?;
-    if !missing.trim().is_empty() {
-        return Err(missing_tools_message(&missing));
+    let missing: Vec<&str> = probe.lines().filter_map(|l| l.strip_prefix("missing ")).collect();
+    if !missing.is_empty() {
+        return Err(missing_tools_message(&missing.join(" ")));
     }
+    let has = |word: &str| probe.lines().any(|l| l.trim() == word);
+    let (kind, app, desktop) = match wanted {
+        Wanted::Agent => (Kind::Agent, None, None),
+        Wanted::App(app) => (Kind::App, Some(app), None),
+        Wanted::Desktop(flavour) => {
+            if !has("card0") {
+                return Err(format!(
+                    "a desktop session needs the VM's display, and {} has no {}: turn on \"gui\" and restart berth (the machine gets it when the agent starts)",
+                    m.name,
+                    install::CARD_NODE
+                ));
+            }
+            let desktop = install::desktop_ready(flavour, &probe)?;
+            (Kind::Desktop(desktop.flavour), None, Some(desktop))
+        }
+    };
+    // gles2 only on a GPU that does 3D and is bound into the machine.
+    let gles2 = has("render") && install::gpu_has_3d();
+    let mut renderer = match (gles2, kind) {
+        (true, _) => Renderer::Gles2,
+        (false, Kind::Desktop(Flavour::Hyprland)) => Renderer::Software,
+        (false, _) => Renderer::Pixman,
+    };
     let id = new_id();
     let rt = runtime(&id);
-    // The runtime folder, sway's config, and this binary for pointer input
-    // (fed over stdin: it's the user writing in their own folder).
-    let me = std::fs::read("/proc/self/exe").map_err(|e| e.to_string())?;
-    let setup = format!(
-        "set -e; umask 077; rm -rf {rt}; mkdir -m 700 {rt}; cat > {rt}/berth-gui-input; chmod 700 {rt}/berth-gui-input; \
-         printf '%s' {} > {rt}/sway.conf",
-        quote(&sway_config(size))
-    );
-    m.run(&setup, &me, SHORT).map_err(|e| format!("setting up the session: {e}"))?;
-    m.spawn(&format!("berth-gui-{id}"), &launcher(&id, app.as_deref(), install::gpu_has_3d())).map_err(|e| format!("starting the compositor: {e}"))?;
-    // Up when its Wayland socket (and sway's IPC) is there.
-    let ready = format!(
-        "RT={rt}; for i in $(seq 100); do \
-           if ls $RT/wayland-[0-9] >/dev/null 2>&1 && {{ [ ! -e $RT/sway.conf ] || [ {} = cage ] || ls $RT/sway-ipc.*.sock >/dev/null 2>&1; }}; then exit 0; fi; \
-           pid=$(cat $RT/compositor.pid 2>/dev/null); if [ -n \"$pid\" ] && ! kill -0 $pid 2>/dev/null; then break; fi; sleep 0.1; done; \
-         tail -n 5 $RT/compositor.log >&2; exit 1",
-        if app.is_some() { "cage" } else { "sway" }
-    );
-    let session = Session {
+    let mut session = Session {
         session: id.clone(),
         agent,
         since: now(),
-        kind: if app.is_some() { "app" } else { "agent" }.into(),
+        kind: kind.name().into(),
         size,
         apps: app.iter().map(|a| App { app: a[0].clone(), pid: 0 }).collect(),
         next_app: 0,
+        renderer: None,
+        flavour: desktop.map(|d| d.flavour.as_str().to_string()),
     };
-    if let Err(err) = m.run(&ready, &[], SHORT) {
-        let ctx = Ctx { m, s: session };
-        let _ = ctx.end();
-        return Err(format!("the compositor didn't start: {err}"));
-    }
-    let mut session = session;
     let ctx = Ctx { m, s: session.clone() };
+    let fail = |err: String| {
+        let _ = ctx.end();
+        Err(err)
+    };
+    // The runtime folder, sway's config (Hyprland reads its own), and this
+    // binary for pointer input (fed over stdin: it's the user writing in
+    // their own folder).
+    let me = std::fs::read("/proc/self/exe").map_err(|e| e.to_string())?;
+    if desktop.is_some() {
+        claim_desktop(DESKTOP_CLAIM, &m.name, &id, session_alive)?;
+        if let Err(e) = start_seatd(m) {
+            return fail(format!("starting seatd: {e}"));
+        }
+    }
+    let sway_conf = match kind {
+        Kind::Desktop(Flavour::Hyprland) => String::new(),
+        Kind::Desktop(Flavour::Sway) => format!("; printf '%s' {} > {rt}/sway.conf", quote(&sway_config(None))),
+        _ => format!("; printf '%s' {} > {rt}/sway.conf", quote(&sway_config(Some(size)))),
+    };
+    let setup = format!("set -e; umask 077; rm -rf {rt}; mkdir -m 700 {rt}; cat > {rt}/berth-gui-input; chmod 700 {rt}/berth-gui-input{sway_conf}");
+    if let Err(e) = m.run(&setup, &me, SHORT) {
+        return fail(format!("setting up the session: {e}"));
+    }
+    let launch = |renderer: Renderer| match desktop {
+        Some(desktop) => launcher_desktop(&id, desktop, renderer),
+        None => launcher(&id, app.as_deref(), renderer),
+    };
+    // A desktop takes longer: DRM, seatd, and Hyprland's own start.
+    let (tries, wait) = if desktop.is_some() { (250, Duration::from_secs(40)) } else { (100, SHORT) };
+    let mut unit = format!("berth-gui-{id}");
+    let mut started = m.spawn(&unit, &launch(renderer)).map_err(|e| format!("starting the compositor: {e}"));
+    if started.is_ok() {
+        started = m.run(&ready_script(&id, kind, tries), &[], wait).map(|_| ()).map_err(|e| e.to_string());
+    }
+    // GLES that doesn't come up (a GPU without 3D after all, a missing
+    // driver): once more on pixman, keeping the first log. Hyprland has no
+    // pixman renderer.
+    if let Err(err) = &started
+        && renderer == Renderer::Gles2
+        && kind != Kind::Desktop(Flavour::Hyprland)
+    {
+        eprintln!("berth-agent: gui: {}: {id}: the compositor didn't start on gles2 ({err}); trying pixman", m.name);
+        m.stop_units(&unit);
+        let reset = format!(
+            "RT={rt}; p=$(cat $RT/compositor.pid 2>/dev/null); [ -n \"$p\" ] && kill -9 $p 2>/dev/null; \
+             mv -f $RT/compositor.log $RT/compositor-gles2.log 2>/dev/null; rm -f $RT/wayland-* $RT/sway-ipc.* $RT/compositor.pid; true"
+        );
+        let _ = m.run(&reset, &[], SHORT);
+        renderer = Renderer::Pixman;
+        unit = format!("berth-gui-{id}-pixman");
+        started = m.spawn(&unit, &launch(renderer)).map_err(|e| format!("starting the compositor: {e}"));
+        if started.is_ok() {
+            started = m.run(&ready_script(&id, kind, tries), &[], wait).map(|_| ()).map_err(|e| e.to_string());
+        }
+    }
+    if let Err(err) = started {
+        return fail(format!("the compositor didn't start: {err}"));
+    }
+    session.renderer = Some(renderer.name().into());
     // The real screen size (cage takes the headless default), and a check
     // that capture works.
     if let Ok(png) = ctx.run(&format!("{}grim -t png -l 0 -", prelude(&id)), Duration::from_secs(30))
@@ -525,8 +793,39 @@ fn session_new(m: &Machine, args: &Value) -> Result<Done, String> {
     }
     // Toolkits that wait for a screen reader before exposing anything.
     let _ = ctx.atspi(&json!({"mode": "enable"}));
-    save(&m.name, &session).map_err(|e| e.to_string())?;
-    Ok(Done::of(json!({"session": id, "size": session.size, "kind": session.kind})))
+    if let Err(e) = save(&m.name, &session) {
+        return fail(e.to_string());
+    }
+    let mut reply = describe(&session);
+    reply["session"] = json!(id);
+    Ok(Done::of(reply))
+}
+
+/// What session.new and session.list say about a session's screen: its
+/// kind and renderer, and for a desktop its flavour and the host scanout it
+/// shows on.
+fn describe(s: &Session) -> Value {
+    let mut out = json!({"size": s.size, "kind": s.kind, "renderer": s.renderer});
+    if let Kind::Desktop(flavour) = Kind::of(s) {
+        out["flavour"] = json!(flavour.as_str());
+        out["scanout"] = json!(0);
+    }
+    out
+}
+
+/// The machine's seatd, which hands a desktop's compositor card0: the seat
+/// group set up, then seatd started unless one runs, and waited for.
+fn start_seatd(m: &Machine) -> Result<(), String> {
+    let state = m.run_root(&install::seat_script(&m.user), SHORT).map_err(|e| e.to_string())?;
+    if state.trim() != "running" {
+        m.spawn_root("berth-seatd", &install::seatd_script(&m.user)).map_err(|e| e.to_string())?;
+    }
+    m.run_text(
+        &format!("for i in $(seq 50); do [ -S {} ] && exit 0; sleep 0.1; done; echo 'seatd did not start' >&2; exit 1", install::SEATD_SOCK),
+        SHORT,
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 /// The machine's sessions whose compositor still runs; the others are
@@ -555,7 +854,11 @@ fn session_list(m: &Machine) -> Result<Done, String> {
     let mut out = Vec::new();
     for s in live(m)? {
         let apps: Vec<&str> = s.apps.iter().map(|a| a.app.as_str()).collect();
-        out.push(json!({"session": s.session, "agent": s.agent, "since": s.since, "apps": apps, "kind": s.kind, "size": s.size}));
+        let mut entry = describe(&s);
+        for (k, v) in [("session", json!(s.session)), ("agent", json!(s.agent)), ("since", json!(s.since)), ("apps", json!(apps))] {
+            entry[k] = v;
+        }
+        out.push(entry);
     }
     Ok(Done::of(json!({"sessions": out})))
 }
@@ -596,11 +899,12 @@ impl Ctx<'_> {
         self.sh(body, SHORT).map(|o| String::from_utf8_lossy(&o).into_owned())
     }
 
-    fn sway(&self) -> bool {
-        self.s.kind == "agent"
+    fn kind(&self) -> Kind {
+        Kind::of(&self.s)
     }
 
-    /// Stop everything the session started and forget it.
+    /// Stop everything the session started and forget it (a desktop also
+    /// gives the VM's display back; the machine's seatd stays).
     fn cleanup(&self) {
         let rt = runtime(self.id());
         self.m.stop_units(&format!("berth-gui-{}*", self.id()));
@@ -614,6 +918,9 @@ impl Ctx<'_> {
         );
         let _ = self.m.run(&kill, &[], SHORT);
         forget(&self.m.name, self.id());
+        if matches!(self.kind(), Kind::Desktop(_)) {
+            release_desktop(DESKTOP_CLAIM, &self.m.name, self.id());
+        }
     }
 
     fn end(&self) -> Result<Done, String> {
@@ -628,10 +935,20 @@ impl Ctx<'_> {
         Ok(sway::windows(&tree))
     }
 
+    /// The windows the compositor manages: sway's, or Hyprland's.
+    fn managed_windows(&self) -> Result<Vec<sway::Window>, String> {
+        if self.kind() != Kind::Desktop(Flavour::Hyprland) {
+            return self.sway_windows();
+        }
+        let out = self.sh_text("hyprctl -j clients")?;
+        let clients: Value = serde_json::from_str(&out).map_err(|e| format!("hyprctl: {e}"))?;
+        Ok(hypr::windows(&clients))
+    }
+
     /// The session's windows. An app session has one: its app, full screen.
     fn windows(&self) -> Result<Vec<sway::Window>, String> {
-        if self.sway() {
-            return self.sway_windows();
+        if self.kind() != Kind::App {
+            return self.managed_windows();
         }
         let [w, h] = self.s.size;
         Ok(self
@@ -670,7 +987,7 @@ impl Ctx<'_> {
     }
 
     fn open(&self, args: &Value) -> Result<Done, String> {
-        if !self.sway() {
+        if self.kind() == Kind::App {
             return Err("this is an app session (one app); start an agent session with session.new to open more".into());
         }
         let app = args.get("app").and_then(Value::as_str).filter(|a| !a.is_empty()).ok_or("open: give an app")?;
@@ -692,7 +1009,7 @@ impl Ctx<'_> {
             argv.insert(0, "--force-renderer-accessibility".into());
         }
         let appimage = path.to_lowercase().ends_with(".appimage");
-        let before: Vec<i64> = self.sway_windows()?.iter().map(|w| w.id).collect();
+        let before: Vec<i64> = self.managed_windows()?.iter().map(|w| w.id).collect();
         let n = {
             let _lock = lock(&self.m.name).map_err(|e| e.to_string())?;
             let mut s = load(&self.m.name, self.id()).ok_or("the session has ended")?;
@@ -715,7 +1032,7 @@ impl Ctx<'_> {
             if pid == 0 {
                 pid = self.sh_text(&format!("cat $RT/app-{n}.pid 2>/dev/null; true"))?.trim().parse().unwrap_or(0);
             }
-            let windows = self.sway_windows()?;
+            let windows = self.managed_windows()?;
             let new: Vec<&sway::Window> = windows.iter().filter(|w| !before.contains(&w.id)).collect();
             // Its own window, or (apps that hand off to a running instance or
             // a D-Bus-activated process) any new one.
@@ -886,21 +1203,33 @@ impl Ctx<'_> {
     }
 
     fn focus(&self, app: &str) -> Result<Done, String> {
-        if self.sway() {
-            let windows = self.sway_windows()?;
-            let w = sway::find(&windows, app)?;
-            self.sh(&format!("swaymsg -q '[con_id={}]' focus", w.id), SHORT)?;
-        } else {
-            sway::find(&self.windows()?, app)?;
+        match self.kind() {
+            Kind::App => {
+                sway::find(&self.windows()?, app)?;
+            }
+            Kind::Desktop(Flavour::Hyprland) => {
+                let windows = self.managed_windows()?;
+                let w = sway::find(&windows, app)?;
+                hypr::dispatch_result(&self.sh_text(&hypr::focus_cmd(w.id))?)?;
+            }
+            Kind::Agent | Kind::Desktop(Flavour::Sway) => {
+                let windows = self.sway_windows()?;
+                let w = sway::find(&windows, app)?;
+                self.sh(&format!("swaymsg -q '[con_id={}]' focus", w.id), SHORT)?;
+            }
         }
         Ok(Done::of(json!({})))
     }
 
     fn quit(&self, app: &str) -> Result<Done, String> {
-        if self.sway() {
-            let windows = self.sway_windows()?;
+        if self.kind() != Kind::App {
+            let windows = self.managed_windows()?;
             let w = sway::find(&windows, app)?;
-            self.sh(&format!("swaymsg -q '[con_id={}]' kill", w.id), SHORT)?;
+            if self.kind() == Kind::Desktop(Flavour::Hyprland) {
+                hypr::dispatch_result(&self.sh_text(&hypr::close_cmd(w.id))?)?;
+            } else {
+                self.sh(&format!("swaymsg -q '[con_id={}]' kill", w.id), SHORT)?;
+            }
             let _lock = lock(&self.m.name).map_err(|e| e.to_string())?;
             if let Some(mut s) = load(&self.m.name, self.id()) {
                 if let Some(i) = s.apps.iter().position(|a| a.pid == w.pid) {
@@ -1033,11 +1362,153 @@ mod tests {
 
     #[test]
     fn launchers_quote_apps() {
-        let l = launcher("s-1", Some(&["gnome-calculator".to_string(), "it's".to_string()]), false);
+        let l = launcher("s-1", Some(&["gnome-calculator".to_string(), "it's".to_string()]), Renderer::Pixman);
         assert!(l.contains("exec cage -- 'gnome-calculator' 'it'\\''s'"), "{l}");
-        assert!(l.contains("export WLR_RENDERER=pixman; ") && !l.contains("gles2"), "{l}");
-        let l = launcher("s-1", None, true);
+        assert!(l.contains("export WLR_RENDERER=pixman; ") && !l.contains("gles2") && !l.contains("WLR_RENDER_DRM_DEVICE"), "{l}");
+        assert!(l.contains("WLR_BACKENDS=headless"), "{l}");
+        let l = launcher("s-1", None, Renderer::Gles2);
         assert!(l.contains("sway -c /tmp/berth-gui-s-1/sway.conf"));
-        assert!(l.contains("WLR_RENDERER=gles2"), "{l}");
+        assert!(l.contains("WLR_RENDERER=gles2 WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128"), "{l}");
+        assert!(l.contains("dbus-daemon --session --address=unix:path=$RT/bus"), "{l}");
+    }
+
+    #[test]
+    fn desktop_launchers() {
+        let sway = install::Desktop { flavour: Flavour::Sway, uwsm: false };
+        let l = launcher_desktop("s-1", sway, Renderer::Gles2);
+        assert!(l.contains("WLR_BACKENDS=drm WLR_DRM_DEVICES=/dev/dri/card0 WLR_LIBINPUT_NO_DEVICES=1"), "{l}");
+        assert!(l.contains("WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128") && l.contains("LIBSEAT_BACKEND=seatd"), "{l}");
+        assert!(l.contains("exec sway -c /tmp/berth-gui-s-1/sway.conf") && !l.contains("headless"), "{l}");
+        let l = launcher_desktop("s-1", sway, Renderer::Pixman);
+        assert!(l.contains("WLR_RENDERER=pixman") && !l.contains("WLR_RENDER_DRM_DEVICE"), "{l}");
+
+        for uwsm in [false, true] {
+            let l = launcher_desktop("s-1", install::Desktop { flavour: Flavour::Hyprland, uwsm }, Renderer::Gles2);
+            assert!(l.contains("AQ_DRM_DEVICES=/dev/dri/card0") && l.contains("LIBSEAT_BACKEND=seatd"), "{l}");
+            assert!(l.contains("XDG_SESSION_TYPE=wayland") && l.contains("XDG_CURRENT_DESKTOP=Hyprland"), "{l}");
+            assert!(!l.contains("WLR_BACKENDS") && !l.contains("LIBGL_ALWAYS_SOFTWARE"), "{l}");
+            assert!(l.contains("dbus-daemon --session"), "{l}");
+            let exec = if uwsm { "exec uwsm start -- hyprland.desktop >" } else { "exec Hyprland >" };
+            assert!(l.contains(exec), "{l}");
+        }
+        let l = launcher_desktop("s-1", install::Desktop { flavour: Flavour::Hyprland, uwsm: false }, Renderer::Software);
+        assert!(l.contains("LIBGL_ALWAYS_SOFTWARE=1"), "{l}");
+    }
+
+    #[test]
+    fn sway_configs() {
+        assert!(sway_config(Some([1280, 800])).contains("output HEADLESS-1 resolution 1280x800"));
+        let desktop = sway_config(None);
+        assert!(desktop.contains("output * bg") && !desktop.contains("HEADLESS") && !desktop.contains("resolution"), "{desktop}");
+    }
+
+    #[test]
+    fn the_prelude_finds_hyprland() {
+        let p = prelude("s-1");
+        assert!(p.contains("$RT/hypr/*/.socket.sock") && p.contains("export HYPRLAND_INSTANCE_SIGNATURE=${d##*/}"), "{p}");
+        // The signature is the socket's folder name.
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", "s=/tmp/x/hypr/abc_123_456/.socket.sock; d=${s%/.socket.sock}; echo ${d##*/}"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "abc_123_456");
+    }
+
+    #[test]
+    fn session_kinds() {
+        let app = |a: &str| json!({"app": [a]});
+        assert_eq!(wanted(&json!({})), Ok(Wanted::Agent));
+        assert_eq!(wanted(&json!({"kind": "agent"})), Ok(Wanted::Agent));
+        assert_eq!(wanted(&app("foot")), Ok(Wanted::App(vec!["foot".into()])));
+        assert_eq!(wanted(&json!({"kind": "desktop"})), Ok(Wanted::Desktop(None)));
+        assert_eq!(wanted(&json!({"kind": "desktop", "flavour": "auto"})), Ok(Wanted::Desktop(None)));
+        assert_eq!(wanted(&json!({"kind": "desktop", "flavour": "sway"})), Ok(Wanted::Desktop(Some(Flavour::Sway))));
+        assert_eq!(wanted(&json!({"kind": "desktop", "flavour": "hyprland"})), Ok(Wanted::Desktop(Some(Flavour::Hyprland))));
+        assert!(wanted(&json!({"kind": "desktop", "flavour": "kde"})).unwrap_err().contains("hyprland or sway"));
+        assert!(wanted(&json!({"flavour": "sway"})).unwrap_err().contains("desktop sessions"));
+        assert!(wanted(&json!({"kind": "app"})).unwrap_err().contains("needs app"));
+        assert!(wanted(&json!({"kind": "desktop", "app": ["foot"]})).is_err());
+        assert!(wanted(&json!({"kind": "game"})).unwrap_err().contains("agent, app or desktop"));
+        assert!(wanted(&json!({"app": []})).is_err());
+    }
+
+    fn session(kind: &str, flavour: Option<&str>) -> Session {
+        Session {
+            session: "s-1".into(),
+            agent: String::new(),
+            since: String::new(),
+            kind: kind.into(),
+            size: [1920, 1080],
+            apps: Vec::new(),
+            next_app: 0,
+            renderer: Some("gles2".into()),
+            flavour: flavour.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn kinds_and_replies() {
+        assert_eq!(Kind::of(&session("agent", None)), Kind::Agent);
+        assert_eq!(Kind::of(&session("app", None)), Kind::App);
+        assert_eq!(Kind::of(&session("desktop", Some("hyprland"))), Kind::Desktop(Flavour::Hyprland));
+        assert_eq!(Kind::of(&session("desktop", Some("sway"))), Kind::Desktop(Flavour::Sway));
+        let d = describe(&session("desktop", Some("hyprland")));
+        assert_eq!(d, json!({"size": [1920, 1080], "kind": "desktop", "renderer": "gles2", "flavour": "hyprland", "scanout": 0}));
+        let a = describe(&session("agent", None));
+        assert!(a.get("scanout").is_none() && a["renderer"] == "gles2");
+        // Records from an older agent have no renderer.
+        let old: Session = serde_json::from_str(r#"{"session":"s-1","agent":"","since":"","kind":"agent","size":[1,1],"apps":[]}"#).unwrap();
+        assert_eq!((old.renderer, old.flavour), (None, None));
+    }
+
+    #[test]
+    fn one_desktop_per_vm() {
+        let path = std::env::temp_dir().join(format!("berth-desktop-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        claim_desktop(path, "dev", "s-1", |_, _| panic!("nothing to check")).unwrap();
+        // Another session, in this machine or another, is refused while the
+        // first lives (or is young enough to be starting).
+        let err = claim_desktop(path, "desk", "s-2", |_, _| false).unwrap_err();
+        assert!(err.contains("s-1 in dev"), "{err}");
+        // The same session again is fine.
+        claim_desktop(path, "dev", "s-1", |_, _| false).unwrap();
+        // An old claim whose session is gone is taken over.
+        std::fs::write(path, "dev s-1 100\n").unwrap();
+        assert!(claim_desktop(path, "desk", "s-2", |m, s| (m, s) == ("dev", "s-1")).is_err());
+        claim_desktop(path, "desk", "s-2", |_, _| false).unwrap();
+        assert!(std::fs::read_to_string(path).unwrap().starts_with("desk s-2 "));
+        // Only its holder gives it back.
+        release_desktop(path, "dev", "s-1");
+        assert!(std::fs::read_to_string(path).unwrap().starts_with("desk s-2 "));
+        release_desktop(path, "desk", "s-2");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "");
+        claim_desktop(path, "dev", "s-3", |_, _| panic!("no claim to check")).unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn readiness_per_kind() {
+        use std::os::unix::net::UnixListener;
+        let id = format!("s-{:x}", std::process::id());
+        let rt = runtime(&id);
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(format!("{rt}/hypr/sig")).unwrap();
+        let ready = |kind: Kind| std::process::Command::new("/bin/sh").args(["-c", &ready_script(&id, kind, 3)]).output().unwrap().status.success();
+        let kinds = [Kind::App, Kind::Agent, Kind::Desktop(Flavour::Sway), Kind::Desktop(Flavour::Hyprland)];
+        assert!(kinds.iter().all(|&k| !ready(k)), "nothing is up yet");
+        let _wayland = UnixListener::bind(format!("{rt}/wayland-1")).unwrap();
+        assert!(ready(Kind::App) && !ready(Kind::Agent) && !ready(Kind::Desktop(Flavour::Hyprland)));
+        let _sway = UnixListener::bind(format!("{rt}/sway-ipc.1000.42.sock")).unwrap();
+        assert!(ready(Kind::Agent) && ready(Kind::Desktop(Flavour::Sway)) && !ready(Kind::Desktop(Flavour::Hyprland)));
+        let _hypr = UnixListener::bind(format!("{rt}/hypr/sig/.socket.sock")).unwrap();
+        assert!(ready(Kind::Desktop(Flavour::Hyprland)));
+        // A compositor that exited fails at once, with its log.
+        std::fs::remove_file(format!("{rt}/wayland-1")).unwrap();
+        std::fs::write(format!("{rt}/compositor.pid"), "999999\n").unwrap();
+        std::fs::write(format!("{rt}/compositor.log"), "no GPU\n").unwrap();
+        let out = std::process::Command::new("/bin/sh").args(["-c", &ready_script(&id, Kind::App, 100)]).output().unwrap();
+        assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("no GPU"));
+        let _ = std::fs::remove_dir_all(&rt);
     }
 }
