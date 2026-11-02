@@ -553,8 +553,8 @@ fn now() -> String {
 
 /// Environment for programs in a session: toolkits on Wayland (X11 apps
 /// through Xwayland) with their accessibility exposed over AT-SPI, and a
-/// UTF-8 locale when the machine sets none.
-const APP_ENV: &str = "export LANG=${LANG:-C.UTF-8}; export XDG_SESSION_TYPE=wayland GDK_BACKEND=wayland,x11 QT_QPA_PLATFORM='wayland;xcb' MOZ_ENABLE_WAYLAND=1 \
+/// UTF-8 locale when the machine's is plain C (or unset).
+const APP_ENV: &str = "case \"${LANG:-C}\" in C|POSIX) export LANG=C.UTF-8;; esac; export XDG_SESSION_TYPE=wayland GDK_BACKEND=wayland,x11 QT_QPA_PLATFORM='wayland;xcb' MOZ_ENABLE_WAYLAND=1 \
      ELECTRON_OZONE_PLATFORM_HINT=auto SDL_VIDEODRIVER=wayland,x11 \
      GTK_A11Y=atspi NO_AT_BRIDGE=0 GNOME_ACCESSIBILITY=1 QT_ACCESSIBILITY=1 QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 ACCESSIBILITY_ENABLED=1; ";
 
