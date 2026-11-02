@@ -96,6 +96,45 @@ impl Machine {
             );
         }
     }
+
+    /// `command`, as the machine's root: for what a session needs from the
+    /// machine itself (seatd, the seat group).
+    fn root_command(&self, script: &str) -> io::Result<Command> {
+        let mut cmd;
+        if self.systemd {
+            cmd = Command::new("systemd-run");
+            cmd.args(["-M", &self.name, "--wait", "--pipe", "--quiet", "--collect"]);
+            cmd.args([&format!("--setenv=BERTH_SCRIPT={script}"), "/bin/sh", "-c", SCRIPT_FROM_ENV]);
+        } else {
+            let leader = sh_out(Command::new("machinectl").args(["show", &self.name, "-p", "Leader", "--value"]))?;
+            cmd = Command::new("nsenter");
+            cmd.args(["-t", leader.trim(), "-a", "--", "/bin/sh", "-c", script]);
+        }
+        Ok(cmd)
+    }
+
+    /// `run`, as the machine's root.
+    pub fn run_root(&self, script: &str, timeout: Duration) -> io::Result<String> {
+        run_with_timeout(self.root_command(script)?, &[], timeout).map(|out| String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// `spawn`, as the machine's root, for a daemon the machine keeps
+    /// (seatd): a unit that's already running is left as it is.
+    pub fn spawn_root(&self, unit: &str, script: &str) -> io::Result<()> {
+        if self.systemd {
+            let mut active = Command::new("systemctl");
+            active.args(["-M", &self.name, "is-active", "--quiet", unit]);
+            if run_with_timeout(active, &[], Duration::from_secs(10)).is_ok() {
+                return Ok(());
+            }
+            let mut cmd = Command::new("systemd-run");
+            cmd.args(["-M", &self.name, &format!("--unit={unit}"), "--quiet", "--collect"]);
+            cmd.args([&format!("--setenv=BERTH_SCRIPT={script}"), "/bin/sh", "-c", SCRIPT_FROM_ENV]);
+            return run_with_timeout(cmd, &[], Duration::from_secs(30)).map(|_| ());
+        }
+        let detached = format!("setsid /bin/sh -c {} </dev/null >/dev/null 2>&1 &", quote(script));
+        self.run_root(&detached, Duration::from_secs(30)).map(|_| ())
+    }
 }
 
 fn sh_out(cmd: &mut Command) -> io::Result<String> {
