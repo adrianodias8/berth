@@ -9,6 +9,7 @@
 //! Off unless ~/.berth/config.json has "mac": true (macOS targets) or
 //! "gui": true (Linux targets).
 
+pub mod display;
 pub mod macos;
 pub mod proto;
 pub mod sessions;
@@ -118,6 +119,21 @@ pub enum GuiCmd {
     Session {
         #[command(subcommand)]
         action: SessionCmd,
+    },
+    /// Follow a Linux machine's live display stream (a session's screen, or
+    /// --scanout N of the VM's GPU) and print its frame rate and damage
+    #[command(hide = true)]
+    Watch {
+        /// The machine (or linux:<machine>)
+        machine: String,
+        #[arg(long)]
+        scanout: Option<u32>,
+        /// Stop after this many frames
+        #[arg(long)]
+        frames: Option<u64>,
+        /// Frames a second to ask for (1-120)
+        #[arg(long)]
+        fps: Option<u32>,
     },
 }
 
@@ -245,6 +261,7 @@ pub fn action(cmd: GuiCmd) -> Result<Action> {
         GuiCmd::Session { action: SessionCmd::New { clone } } => Ok(Action::SessionNew { clone }),
         GuiCmd::Session { action: SessionCmd::End { session } } => Ok(Action::SessionEnd { session }),
         GuiCmd::Session { action: SessionCmd::List } => Ok(Action::SessionList),
+        GuiCmd::Watch { .. } => bail!("watch follows a display stream; it isn't something the guest does"),
     }
 }
 
@@ -287,6 +304,16 @@ pub fn run(paths: &Paths, args: GuiArgs) -> Result<()> {
     let env = |k| std::env::var(k).ok().filter(|v: &String| !v.is_empty());
     let target = args.target.or_else(|| env("BERTH_GUI_TARGET")).map(|t| Target::parse(&t)).transpose()?;
     let session = args.session.or_else(|| env("BERTH_GUI_SESSION"));
+    if let GuiCmd::Watch { machine, scanout, frames, fps } = args.cmd {
+        let machine = match Target::parse(&machine) {
+            Ok(Target::Linux(m)) => m,
+            Ok(Target::Mac(_)) => bail!("watch is for Linux machines (macOS VMs have their own window: berth mac start)"),
+            Err(_) => machine,
+        };
+        gate(paths, Some(&Target::Linux(machine.clone())))?;
+        let req = display::DisplayReq { machine, session, scanout, max_fps: fps, once: false };
+        return display::watch(paths, &req, frames);
+    }
     let out = match &args.cmd {
         GuiCmd::Screenshot { out, .. } => out.clone(),
         _ => None,
@@ -401,6 +428,33 @@ fn log(paths: &Paths, line: &Line) {
     if let Err(err) = gui_log::write(paths, line) {
         eprintln!("berth gui: couldn't write the activity log: {err:#}");
     }
+}
+
+/// Berth.app took (or gave back) control of a Linux session's input
+/// through the display stream: one line, so the log shows who was typing.
+pub fn log_control(paths: &Paths, machine: &str, session: Option<&str>, on: bool) {
+    let line = Line {
+        id: gui_log::new_id(),
+        phase: "end".into(),
+        time: gui_log::now(),
+        target: Some(Target::Linux(machine.into()).to_string()),
+        session: session.map(str::to_string),
+        verb: "control".into(),
+        args: json!({"on": on}),
+        ok: Some(true),
+        error: None,
+        duration_ms: None,
+        screenshot: None,
+        hit: None,
+        who: gui_log::Who { kind: gui_log::APP_KIND.into(), ..Default::default() },
+    };
+    log(paths, &line);
+}
+
+/// A PNG's size, from its IHDR.
+fn png_size(png: &[u8]) -> (u32, u32) {
+    let be = |at: usize| png.get(at..at + 4).map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap()));
+    (be(16), be(20))
 }
 
 /// End sessions idle past gui_idle_minutes; it's an error to go on in one.
@@ -538,7 +592,21 @@ fn act(ctx: &mut Ctx, id: &str, action: Action) -> Result<Outcome> {
         Action::Guest { verb: guest_verb, args } => {
             let target = need_target(ctx)?;
             let timeout = timeout_for(guest_verb, &args);
-            let (reply, bytes) = call(ctx.paths, &target, ctx.session.as_deref(), guest_verb, args, None, timeout)?;
+            // While something watches a Linux session, the daemon has its
+            // latest frame: no round trip to grim in the guest.
+            let live = match (&target, &ctx.session) {
+                (Target::Linux(machine), Some(session)) if guest_verb == "screenshot" && args["window"].is_null() => {
+                    display::screenshot(ctx.paths, machine, Some(session), None).ok().map(|png| {
+                        let (w, h) = png_size(&png);
+                        (proto::Reply { ok: true, result: json!({"width": w, "height": h, "source": "display"}), ..Default::default() }, png)
+                    })
+                }
+                _ => None,
+            };
+            let (reply, bytes) = match live {
+                Some(shot) => shot,
+                None => call(ctx.paths, &target, ctx.session.as_deref(), guest_verb, args, None, timeout)?,
+            };
             let mut outcome = Outcome { verb, result: reply.result, hit: reply.hit, ..Outcome::default() };
             if guest_verb == "screenshot" {
                 if bytes.is_empty() {

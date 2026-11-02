@@ -44,6 +44,20 @@ pub enum Request {
     /// `berth gui` for a Linux machine: after the GuiReply line, the
     /// connection is carried to the agent's `gui <machine>` (docs/gui-protocol.md).
     Gui { machine: String },
+    /// A live view of a surface (a GUI session's screen or a scanout) and
+    /// input back: after the reply line, doorbells one way and input lines
+    /// the other (docs/display-protocol.md, gui/display.rs).
+    Display {
+        machine: String,
+        #[serde(default)]
+        session: Option<String>,
+        #[serde(default)]
+        scanout: Option<u32>,
+        #[serde(default)]
+        max_fps: Option<u32>,
+        #[serde(default)]
+        once: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -363,6 +377,11 @@ pub fn run(paths: Paths) -> Result<()> {
         let _ = crate::virtiofs::FORCED.set(share);
     }
     let consumed = restore.as_ref().is_some_and(|r| r.consumed);
+    // Before the GPU device shows anything: its scanouts' rings go here.
+    let surfaces = paths.run().join("surfaces");
+    if let Err(err) = crate::gpu::frames::SURFACES.set_dir(&surfaces) {
+        eprintln!("display: can't use {} ({err}); frames stay in memory", surfaces.display());
+    }
     *RESTART_AFTER_BOOT.lock().unwrap() = restore.map(|r| r.start).unwrap_or_default();
     eprintln!(
         "{} VM: {} CPUs, {} MiB",
@@ -470,6 +489,10 @@ async fn handle_control(stream: UnixStream, cpus: usize, memory: u64) -> Result<
     read.read_line(&mut line).await?;
     let reply = match serde_json::from_str::<Request>(&line)? {
         Request::Gui { machine } => return gui(read, write, &machine).await,
+        Request::Display { machine, session, scanout, max_fps, once } => {
+            let req = crate::gui::display::DisplayReq { machine, session, scanout, max_fps, once };
+            return display(read, write, req).await;
+        }
         Request::Status => {
             let state = vm::state().await?;
             let running = vm::state_name(state) == "running";
@@ -552,6 +575,43 @@ async fn gui(client_read: BufReader<tokio::net::unix::OwnedReadHalf>, client_wri
         Err(format!("bad machine name {machine:?}"))
     };
     carry_gui(client_read, client_write, guest).await
+}
+
+/// Hand a `display` connection to gui/display.rs, which serves it on
+/// threads of its own (blocking reads, the frames condvar).
+async fn display(
+    read: BufReader<tokio::net::unix::OwnedReadHalf>,
+    mut write: tokio::net::unix::OwnedWriteHalf,
+    req: crate::gui::display::DisplayReq,
+) -> Result<()> {
+    if !crate::config::flag(&Paths::new(), "gui") {
+        let refusal = serde_json::json!({"ok": false, "error": "Linux GUI is off; turn it on with \"gui\": true in ~/.berth/config.json"});
+        write.write_all(format!("{refusal}\n").as_bytes()).await?;
+        return Ok(());
+    }
+    // Input lines the viewer sent right after its request are in here.
+    let leftover = read.buffer().to_vec();
+    let stream = read.into_inner().reunite(write)?.into_std()?;
+    stream.set_nonblocking(false)?;
+    let handle = tokio::runtime::Handle::current();
+    let hub = crate::gui::display::hub(move || {
+        let log = Box::new(|machine: &str, session: Option<&str>, on: bool| crate::gui::log_control(&Paths::new(), machine, session, on));
+        crate::gui::display::Hub::new(&crate::gpu::frames::SURFACES, Box::new(AgentConnector(handle)), log)
+    });
+    std::thread::spawn(move || crate::gui::display::serve(&hub, stream, leftover, req));
+    Ok(())
+}
+
+/// `gui <machine>` through the agent, for the display stream's threads.
+struct AgentConnector(tokio::runtime::Handle);
+
+impl crate::gui::display::GuestConnector for AgentConnector {
+    fn open(&self, machine: &str) -> std::io::Result<StdUnixStream> {
+        let stream = self.0.block_on(guest_stream(&format!("gui {machine}"))).map_err(std::io::Error::other)?;
+        let stream = stream.into_std()?;
+        stream.set_nonblocking(false)?;
+        Ok(stream)
+    }
 }
 
 /// The reply line, then the bytes both ways.
@@ -840,6 +900,22 @@ mod tests {
         assert_eq!(answer, b"{\"ok\":true}\nPNG");
         assert_eq!(agent.await.unwrap(), b"{\"verb\":\"hello\"}\nX");
         carry.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn display_requests_round_trip_with_defaults() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"display","machine":"dev","session":"s-1"}"#).unwrap();
+        let Request::Display { machine, session, scanout, max_fps, once } = &req else { panic!() };
+        assert_eq!((machine.as_str(), session.as_deref(), *scanout, *max_fps, *once), ("dev", Some("s-1"), None, None, false));
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"cmd":"display","machine":"dev","session":"s-1","scanout":null,"max_fps":null,"once":false}"#);
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Request::Display { scanout: None, once: false, .. }));
+        let again: Request = serde_json::from_str(r#"{"cmd":"display","machine":"dev","scanout":0,"max_fps":500,"once":true}"#).unwrap();
+        let Request::Display { scanout: Some(0), max_fps: Some(500), once: true, session: None, .. } = again else { panic!() };
+        let req = crate::gui::display::DisplayReq { machine: "dev".into(), max_fps: Some(500), scanout: Some(0), ..Default::default() };
+        assert_eq!(req.fps(), 120);
+        assert_eq!(crate::gui::display::DisplayReq { max_fps: Some(0), ..req }.fps(), 1);
     }
 
     #[tokio::test]
