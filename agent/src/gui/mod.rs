@@ -765,10 +765,23 @@ impl Ctx<'_> {
         };
         let count = args.get("count").and_then(Value::as_u64).unwrap_or(1) as u32;
         let (x, y, hit) = if let Some(label) = args.get("label").and_then(Value::as_str) {
-            let root = self.tree(None, 30)?;
-            let node = tree::find(&root, label)?;
-            let (x, y) = node.center();
-            (x, y, Some(node.summary()))
+            // A window that has just appeared (right after open, or a dialog)
+            // can show before its app has published its tree: look again for
+            // a moment before giving up.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let root = self.tree(None, 30)?;
+                match tree::find(&root, label) {
+                    Ok(node) => {
+                        let (x, y) = node.center();
+                        break (x, y, Some(node.summary()));
+                    }
+                    Err(e) if e.starts_with("no element") && Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         } else {
             let x = args.get("x").and_then(Value::as_f64).ok_or("click: give x and y, or a label")?.round() as i64;
             let y = args.get("y").and_then(Value::as_f64).ok_or("click: give x and y, or a label")?.round() as i64;
