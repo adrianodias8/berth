@@ -104,6 +104,43 @@ something here stops being true, fix it.
   `id_aa64mmfr0.ecv=1` (forces a timer feature the hypervisor hides; unknown
   on M1) and `isolcpus=11` (purpose unknown).
 
+## macOS VMs (berth mac)
+
+First real run 2026-11-02, macOS 27.2 (26B123) host and guest.
+
+- **The installer's VM holds a lock on the auxiliary storage** until it's
+  released, so the first boot (another process) failed with "Failed to lock
+  auxiliary storage" while `create` kept it alive. Release it on its queue
+  once `installWithCompletionHandler` returns. Install: ~150 s from a cached
+  IPSW.
+- **`VZMacGuestProvisioningOptions` works:** the account exists, is logged
+  in at the console and Remote Login is on ~30 s after the first boot
+  starts; Setup Assistant never shows.
+- **`requestStop` is a power-button press,** which macOS answers with a
+  dialog, not a shutdown: every stop ended in the hard stop after 60 s.
+  `sudo shutdown -h now` over SSH stops it cleanly in ~6 s.
+- **TCC grants (spike S5): clones keep them.** A clone with its own
+  `VZMacMachineIdentifier` and MAC, made by clonefile from a base where
+  Accessibility and Screen Recording were granted, could screenshot and read
+  the AX tree with no prompt. A clone answers on vsock ~10 s after `start`.
+- **A grant follows the binary's designated requirement.** An ad-hoc
+  signature's default requirement is its cdhash, so every rebuild lost the
+  grants (and a hand-copied binary, linker-signed with another identifier,
+  too). Signing with `-r='designated => identifier "dev.berth.gui-mac"'`
+  keeps them across rebuilds; checked by installing two newer builds.
+- **berth-gui-mac only appeared in Screen & System Audio Recording after it
+  tried a capture;** `CGRequestScreenCaptureAccess` at start didn't list it
+  there. So screenshots always try the capture and name the grant only when
+  it fails.
+- **System Settings ignores `NSRunningApplication.terminate()`** from the
+  LaunchAgent (a quit Apple Event, without the Automation grant); ⌘Q through
+  the Accessibility grant quits it.
+- **The VM is reachable from the whole NAT subnet,** Linux containers
+  included, so a well-known password is only safe once SSH stops taking
+  passwords: `create` adds berth's key and writes
+  `/etc/ssh/sshd_config.d/000-berth.conf` (sshd takes the first value; macOS's
+  own file is 100-macos.conf).
+
 ## Snapshots
 
 - **What works:** `VZVirtualMachineConfiguration.validateSaveRestoreSupport`

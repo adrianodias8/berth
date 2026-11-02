@@ -1,6 +1,9 @@
 # Feature plan: GUI VMs and agent-driven app testing
 
-Status: in progress on `feat/gui-vms-agent-testing`. The host ↔ guest
+Status: in progress on `feat/gui-vms-agent-testing`. Spikes S1 and S5 pass,
+and Phases 1 and 2 met their done-when on 2026-11-02 (`docs/LEARNINGS.md`,
+macOS VMs), with the MCP server driven over stdio, not yet loaded natively
+by an agent. The host ↔ guest
 contract is `docs/gui-protocol.md`.
 
 ## Summary

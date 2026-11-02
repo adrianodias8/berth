@@ -42,6 +42,8 @@ public enum AppMatch {
             { $0.bundleID?.lowercased() == lower },
             { $0.name?.lowercased() == stripped },
             { $0.bundleName?.lowercased() == stripped },
+            // "Berth Hello" (a window title) for "BerthHello".
+            { squeezed($0.name) == squeezed(stripped) || squeezed($0.bundleName) == squeezed(stripped) },
         ]
         for test in tests {
             let hits = apps.filter(test)
@@ -49,6 +51,11 @@ public enum AppMatch {
                 return best
             }
         }
-        throw GuiError("no running app '\(query)'")
+        let names = Set(apps.compactMap(\.name)).sorted().prefix(20)
+        throw GuiError("no running app '\(query)' (running: \(names.joined(separator: ", ")))")
+    }
+
+    static func squeezed(_ s: String?) -> String? {
+        s.map { $0.lowercased().filter { !" -_.".contains($0) } }
     }
 }

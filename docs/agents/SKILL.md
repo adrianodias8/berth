@@ -104,7 +104,30 @@ Berth.app's Agents section. Say what you're doing with `berth gui note`.
 
 `berth mcp` is an MCP server on stdin/stdout. Add it to the agent's MCP
 config as the command `berth` with the argument `mcp` (optionally with
-`BERTH_GUI_TARGET` in its environment). The tools take the same arguments
-as the commands above, plus optional `target` and `session`; after
-`gui_session_new` the server remembers the session for later calls.
-`gui_screenshot` returns the image itself.
+`BERTH_GUI_TARGET` in its environment). `gui_screenshot` returns the image
+itself.
+
+| Tool | Arguments (all also take `target`, `session`) |
+|---|---|
+| `gui_session_new` | `clone` (macOS: your own throwaway copy) |
+| `gui_session_end`, `gui_session_list`, `gui_windows` | – |
+| `gui_note` | `text` |
+| `gui_push` | `path` (on this Mac), `to` |
+| `gui_open` | `app` (a path, name or bundle ID), `args`, `wait_s` |
+| `gui_screenshot` | `window` (an app name) |
+| `gui_click` | `label`, or `x` and `y`; `button` (`left`/`right`), `count` |
+| `gui_type` | `text` |
+| `gui_key` | `combo` (`cmd+s`) |
+| `gui_scroll` | `x`, `y`, `dx`, `dy` |
+| `gui_drag` | `from`, `to` (`[x, y]`) |
+| `gui_tree` | `app`, `depth` |
+| `gui_wait` | `label` or `idle`, `timeout_s` |
+| `gui_focus`, `gui_quit` | `app` |
+
+- The server remembers the session after `gui_session_new` only while it
+  keeps running. If your client starts it per call, pass `session` on every
+  call. The session decides where a call goes, so passing the `target` you
+  started from along with it is fine: the call still goes to your clone.
+- `app` is the name `gui_open` reports (`opened BerthHello (window "Berth
+  Hello", …)`), the bundle ID or the path; spaces are ignored, and a name
+  that matches nothing gets the running apps listed.

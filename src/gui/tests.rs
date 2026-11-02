@@ -352,3 +352,34 @@ fn a_target_is_needed() {
     let err = perform(&mut fake.ctx(None), Action::Guest { verb: "windows", args: json!({}) }).unwrap_err();
     assert!(err.to_string().contains("no target"), "{err}");
 }
+
+/// Found by two agents testing in parallel: a call with the base's target
+/// and a clone's session went to the base, not the clone.
+#[test]
+fn a_clone_session_wins_over_its_base_target() {
+    let fake = Fake::new(json!({"mac": true}));
+    // Only the clone answers: anything sent to the base fails.
+    fake.mac_guest("gui-c1");
+    std::fs::write(proto::mac_dir(&fake.paths, "gui-c1").join("vm.json"), r#"{"cpus":4,"memory_mib":8192,"base":"test","created":1}"#).unwrap();
+    let record = sessions::Record {
+        session: "s-c1".into(),
+        target: "mac:gui-c1".into(),
+        agent: Who::default(),
+        clone: true,
+        started: gui_log::now(),
+        last_used: gui_log::now(),
+        note: None,
+    };
+    {
+        let lock = sessions::lock(&fake.paths).unwrap();
+        sessions::save_sessions(&fake.paths, &lock, &[record]).unwrap();
+    }
+    let mut ctx = Ctx { session: Some("s-c1".into()), ..fake.ctx(Some("mac:test")) };
+    perform(&mut ctx, Action::Guest { verb: "windows", args: json!({}) }).unwrap();
+    assert_eq!(ctx.target, Some(Target::Mac("gui-c1".into())));
+    assert_eq!(fake.requests().last().unwrap()["verb"], "windows");
+    // Any other target is a mistake, not something to guess around.
+    let mut ctx = Ctx { session: Some("s-c1".into()), ..fake.ctx(Some("mac:other")) };
+    let err = perform(&mut ctx, Action::Guest { verb: "windows", args: json!({}) }).unwrap_err();
+    assert!(err.to_string().contains("session s-c1 is on mac:gui-c1, not mac:other"), "{err}");
+}

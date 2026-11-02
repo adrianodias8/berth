@@ -180,6 +180,12 @@ pub fn default_base(paths: &Paths) -> Option<String> {
     store::valid_name(&name).is_ok().then_some(name)
 }
 
+/// The VM a clone was made from, if `name` is a clone.
+pub fn base_of(paths: &Paths, name: &str) -> Option<String> {
+    store::valid_name(name).ok()?;
+    Vm::new(&store::root(paths), name).load_meta().ok()?.base
+}
+
 fn default_base_file(root: &Path) -> PathBuf {
     root.join("default-base")
 }

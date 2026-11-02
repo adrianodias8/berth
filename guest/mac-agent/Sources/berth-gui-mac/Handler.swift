@@ -155,7 +155,9 @@ final class Handler {
         let (pid, title, name) = try Apps.open(app, args: args, wait: wait)
         sessions.noteApp(name, session: session)
         let window = (title?.isEmpty == false) ? title! : name
-        return .success(["pid": .int(Int(pid)), "window": .string(window)])
+        // "app" is the name later calls (tree, quit, screenshot --window)
+        // find it by; the window title can differ ("Berth Hello").
+        return .success(["pid": .int(Int(pid)), "window": .string(window), "app": .string(name)])
     }
 
     private func screenshot(_ a: JSON) throws -> Reply {

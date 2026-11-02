@@ -317,11 +317,21 @@ pub fn perform(ctx: &mut Ctx, action: Action) -> Result<Outcome> {
     // Before anything touches ~/.berth: with both flags off, nothing does.
     gate(ctx.paths, None)?;
     end_idle(ctx)?;
-    if ctx.target.is_none()
-        && let Some(session) = &ctx.session
+    // A session's own target wins: with --clone it's a throwaway VM, and an
+    // agent passing the target it started from (the base) along with the
+    // session must still land in its clone, never in the shared base.
+    if let Some(session) = &ctx.session
         && let Some(record) = sessions::find(ctx.paths, session)?
     {
-        ctx.target = Some(Target::parse(&record.target)?);
+        let own = Target::parse(&record.target)?;
+        if let Some(given) = &ctx.target
+            && *given != own
+            && !matches!((given, &own), (Target::Mac(base), Target::Mac(clone))
+                if record.clone && crate::macvm::base_of(ctx.paths, clone).as_deref() == Some(base.as_str()))
+        {
+            bail!("session {session} is on {own}, not {given}: pass only the session (or its own target)");
+        }
+        ctx.target = Some(own);
     }
     gate(ctx.paths, ctx.target.as_ref())?;
     let verb = action.verb();
@@ -687,7 +697,10 @@ pub fn render(o: &Outcome) -> String {
     let s = |v: &Value| v.as_str().map(printable).unwrap_or_else(|| if v.is_null() { String::new() } else { v.to_string() });
     match o.verb.as_str() {
         "push" => format!("pushed to {}", s(&r["path"])),
-        "open" => format!("opened {} (pid {})", s(&r["window"]), s(&r["pid"])),
+        "open" => match r["app"].as_str() {
+            Some(app) if app != r["window"] => format!("opened {} (window \"{}\", pid {})", printable(app), s(&r["window"]), s(&r["pid"])),
+            _ => format!("opened {} (pid {})", s(&r["window"]), s(&r["pid"])),
+        },
         "screenshot" => o.screenshot.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
         "tree" => {
             let mut out = String::new();

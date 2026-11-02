@@ -9,7 +9,8 @@ Experimental, off unless turned on in `~/.berth/config.json`
 
 - **macOS VMs** (`"mac": true`): `berth mac create|list|start|stop|reset|clone|set-base|delete|shell|info`
   installs macOS from the newest or a given IPSW with its account set up
-  (no Setup Assistant), runs each VM in its own process with an optional
+  (no Setup Assistant; user and password `berth`, and SSH then takes only
+  berth's key), runs each VM in its own process with an optional
   window, and gives clean-state clones and a one-second `reset` through APFS
   copies. At most 2 run at once (Apple's license). `docs/mac-vms.md`.
 - **berth-gui-mac** (`guest/mac-agent`): the GUI agent for macOS guests, in

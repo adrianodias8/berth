@@ -286,8 +286,17 @@ final class AppMatchTests: XCTestCase {
     }
 
     func testMissing() {
-        XCTAssertThrowsError(try AppMatch.find("Safari", in: apps))
+        XCTAssertThrowsError(try AppMatch.find("Safari", in: apps)) { error in
+            XCTAssertTrue("\(error)".contains("running: Finder, My App, TextEdit"), "\(error)")
+        }
         XCTAssertThrowsError(try AppMatch.find("", in: apps))
+    }
+
+    /// An agent used the window title "Berth Hello" for the app BerthHello.
+    func testSpacesDontMatter() throws {
+        let hello = [AppInfo(pid: 704, name: "BerthHello", bundleID: "dev.berth.hello", path: "/Users/berth/Pushed/BerthHello.app")]
+        XCTAssertEqual(try AppMatch.find("Berth Hello", in: hello).pid, 704)
+        XCTAssertEqual(try AppMatch.find("text-edit", in: apps).pid, 900)
     }
 }
 

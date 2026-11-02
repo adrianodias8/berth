@@ -19,7 +19,14 @@ enum Apps {
 
     static func find(_ query: String) throws -> NSRunningApplication {
         let apps = running()
-        let match = try AppMatch.find(query, in: apps.map(info))
+        let match: AppInfo
+        do {
+            match = try AppMatch.find(query, in: apps.map(info))
+        } catch {
+            // Only apps with a Dock icon: the full list is mostly agents.
+            let names = Set(apps.filter { $0.activationPolicy == .regular }.compactMap(\.localizedName)).sorted()
+            throw GuiError("no running app '\(query)' (running: \(names.joined(separator: ", ")))")
+        }
         guard let a = apps.first(where: { $0.processIdentifier == match.pid }) else {
             throw GuiError("no running app '\(query)'")
         }
@@ -185,13 +192,26 @@ enum Apps {
 
     static func quit(_ query: String) throws {
         let a = try find(query)
-        guard a.terminate() else { throw GuiError("quit: \(a.localizedName ?? query) refused to quit") }
-        let deadline = Date().addingTimeInterval(10)
+        let asked = a.terminate()
+        if wait(for: a, seconds: asked ? 3 : 0) { return }
+        // terminate() is a quit Apple Event, which some apps (System
+        // Settings, seen in a macOS 27 guest) ignore from a background agent
+        // without the Automation grant. ⌘Q in the app itself, through the
+        // Accessibility grant, quits them.
+        if AX.trusted {
+            try focus(query)
+            Input.key(try KeyCombo.parse("cmd+q"))
+            if wait(for: a, seconds: 7) { return }
+        }
+        throw GuiError("quit: \(a.localizedName ?? query) is still running after 10 s (an unsaved-changes sheet?)")
+    }
+
+    private static func wait(for a: NSRunningApplication, seconds: Double) -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
         while !a.isTerminated {
-            if Date() >= deadline {
-                throw GuiError("quit: \(a.localizedName ?? query) is still running after 10 s (an unsaved-changes sheet?)")
-            }
+            if Date() >= deadline { return false }
             usleep(100_000)
         }
+        return true
     }
 }
