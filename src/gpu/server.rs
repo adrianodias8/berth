@@ -62,8 +62,6 @@ const GPU_LIMIT_FACTOR: u64 = 4;
 pub const MAP_ALIGN: u64 = 16 << 10;
 /// `target` of a buffer in RESOURCE_CREATE_3D (gallium's PIPE_BUFFER).
 const PIPE_BUFFER: u32 = 0;
-/// `flags` of RESOURCE_CREATE_3D: row 0 is the top (else GL's bottom-up).
-const Y_0_TOP: u32 = 1;
 
 /// Guest RAM as the device sees it.
 pub trait GuestMemory {
@@ -195,7 +193,7 @@ enum Kind {
     /// The host copy (`pixels`) is filled by TRANSFER_TO_HOST_2D.
     TwoD,
     /// In the renderer; `pixels` is a read-back copy, made when shown.
-    ThreeD { args: Create3d, gpu_bytes: u64 },
+    ThreeD { gpu_bytes: u64 },
     Blob { mem: u32, flags: u32, size: u64, mapped: Option<Mapped>, layout: Option<BlobLayout> },
 }
 
@@ -207,8 +205,9 @@ struct Resource {
     width: u32,
     height: u32,
     /// The host copy, in the guest's format, rows of `width * 4` bytes.
-    /// For 3D and blob resources, rows as the renderer stores them (GL's
-    /// bottom-up unless Y_0_TOP), empty until the resource is shown.
+    /// For 3D and blob resources, the renderer's rows as a transfer reads
+    /// them back, top-down whatever Y_0_TOP says (virglrenderer flips those
+    /// on readback), empty until the resource is shown.
     pixels: Vec<u8>,
     backing: Option<Backing>,
     /// Backing from a restored snapshot that couldn't be mapped yet:
@@ -223,14 +222,6 @@ impl Resource {
     }
     fn bytes(&self) -> u64 {
         self.stride() * self.height as u64
-    }
-    /// Rows in `pixels` are bottom-up.
-    fn flipped(&self) -> bool {
-        matches!(self.kind, Kind::ThreeD { args, .. } if args.flags & Y_0_TOP == 0)
-    }
-    /// The row of `pixels` holding row `y` of the image.
-    fn row(&self, y: u32) -> usize {
-        (if self.flipped() { self.height - 1 - y } else { y }) as usize
     }
     fn in_renderer(&self) -> bool {
         !matches!(self.kind, Kind::TwoD)
@@ -797,13 +788,9 @@ impl Server {
                 Ok(())
             }
             _ => {
-                // The renderer's rows: the rectangle's last image row is
-                // its first stored one when they're bottom-up.
-                let first = res.row(if res.flipped() { rect.y + rect.height - 1 } else { rect.y });
-                let stored = Rect::new(rect.x, first as u32, rect.width, rect.height);
-                let at = first * stride + rect.x as usize * 4;
+                let at = rect.y as usize * stride + rect.x as usize * 4;
                 let backend = self.backend.as_mut().ok_or(cmd::RESP_ERR_UNSPEC)?;
-                backend.read_back(id, stored, &mut res.pixels[at..], stride).map_err(|_| cmd::RESP_ERR_UNSPEC)
+                backend.read_back(id, rect, &mut res.pixels[at..], stride).map_err(|_| cmd::RESP_ERR_UNSPEC)
             }
         }
     }
@@ -894,7 +881,7 @@ impl Server {
         // Only 2D textures are ever shown.
         let format = (c.target != PIPE_BUFFER).then(|| Format::from_u32(c.format)).flatten();
         let (width, height) = (c.width, c.height);
-        let kind = Kind::ThreeD { args: c, gpu_bytes };
+        let kind = Kind::ThreeD { gpu_bytes };
         self.resources.insert(c.resource_id, Resource { kind, format, width, height, pixels: Vec::new(), backing: None, pending: None, uuid: None });
         Ok(())
     }
@@ -1168,7 +1155,7 @@ struct Saved {
 fn copy_rows(res: &Resource, rect: Rect, dst: &mut [u8], stride: usize) {
     let (n, src_stride, format) = (rect.width as usize * 4, res.stride() as usize, res.format.unwrap());
     for r in 0..rect.height as usize {
-        let s = res.row(rect.y + r as u32) * src_stride + rect.x as usize * 4;
+        let s = (rect.y as usize + r) * src_stride + rect.x as usize * 4;
         convert(&res.pixels[s..s + n], &mut dst[r * stride..r * stride + n], format);
     }
 }
@@ -1877,19 +1864,19 @@ mod tests {
             // What the renderer holds: its pixel (x, y) in its own rows, RGBA.
             shared.lock().unwrap().pixel = Some(|x, y| [x as u8, y as u8, 0x10, 0x20]);
             ctx(&mut s, &ram, 1);
-            // Bottom-up (no Y_0_TOP), as GL renders.
+            // No Y_0_TOP: the readback is top-down all the same.
             now(&mut s, &ram, on(1), texture(7, R8G8B8A8, 64, 32, 0));
             calls(&shared);
             ok(&mut s, &ram, Command::SetScanout { rect: Rect::new(0, 0, 64, 32), scanout_id: 0, resource_id: 7 });
             assert_eq!(calls(&shared), vec![Call::ReadBack(7, Rect::new(0, 0, 64, 32), 256)]);
             let frame = f.latest(0).unwrap();
             let at = |fr: &frames::Frame, x: u32, y: u32| fr.pixels[((y * fr.width + x) * 4) as usize..][..4].to_vec();
-            // Image row 2 is stored row 29; RGBA comes out BGRA.
-            assert_eq!(at(&frame, 3, 2), [0x10, 29, 3, 0x20]);
-            assert_eq!(at(&frame, 63, 31), [0x10, 0, 63, 0x20]);
-            // A flush reads back only what it covers, in stored rows.
+            // RGBA comes out BGRA.
+            assert_eq!(at(&frame, 3, 2), [0x10, 2, 3, 0x20]);
+            assert_eq!(at(&frame, 63, 31), [0x10, 31, 63, 0x20]);
+            // A flush reads back only what it covers.
             ok(&mut s, &ram, Command::ResourceFlush { rect: Rect::new(10, 4, 8, 6), resource_id: 7 });
-            assert_eq!(calls(&shared), vec![Call::ReadBack(7, Rect::new(10, 22, 8, 6), 256)]);
+            assert_eq!(calls(&shared), vec![Call::ReadBack(7, Rect::new(10, 4, 8, 6), 256)]);
             assert!(f.latest(0).unwrap().sequence > frame.sequence);
 
             // Top-down, without alpha, shown in part: the flush is cut to it.
@@ -1911,7 +1898,7 @@ mod tests {
             // The stream of resources gets top-down BGRA.
             let mut px = vec![0u8; 2 * 8];
             s.read_resource(7, Rect::new(4, 30, 2, 2), &mut px, 8).unwrap();
-            assert_eq!(&px, &[0x10, 1, 4, 0x20, 0x10, 1, 5, 0x20, 0x10, 0, 4, 0x20, 0x10, 0, 5, 0x20]);
+            assert_eq!(&px, &[0x10, 30, 4, 0x20, 0x10, 30, 5, 0x20, 0x10, 31, 4, 0x20, 0x10, 31, 5, 0x20]);
             assert_eq!(s.read_resource(7, Rect::new(63, 0, 2, 1), &mut px, 8), Err(cmd::RESP_ERR_INVALID_PARAMETER));
         }
 
