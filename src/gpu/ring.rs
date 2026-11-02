@@ -41,33 +41,39 @@ pub const CURSOR_BYTES: usize = (CURSOR_SIDE * CURSOR_SIDE * 4) as usize;
 /// The largest surface side a ring holds (8K is 7680).
 pub const MAX_SIDE: u32 = 16384;
 
-/// Byte offsets in the header; every field little-endian.
+/// Byte offsets in the header; every field little-endian. Up to the cursor
+/// seq, the fields come in the order the build plan lists them, each
+/// naturally aligned, and the app (SurfaceStream.swift's RingLayout) reads
+/// exactly these. The sizes after them only let `open_read` check a ring
+/// against its file; the app works them out from width and height.
 pub mod off {
     pub const MAGIC: usize = 0;
     pub const VERSION: usize = 8;
-    pub const HEADER_BYTES: usize = 12;
-    pub const GEN: usize = 16;
-    pub const WIDTH: usize = 24;
-    pub const HEIGHT: usize = 28;
-    pub const STRIDE: usize = 32;
-    pub const FORMAT: usize = 36;
-    pub const SLOTS: usize = 40;
-    pub const SLOT_BYTES: usize = 44;
+    /// `u32`.
+    pub const GEN: usize = 12;
+    pub const WIDTH: usize = 16;
+    pub const HEIGHT: usize = 20;
+    pub const STRIDE: usize = 24;
+    pub const FORMAT: usize = 28;
+    pub const SLOTS: usize = 32;
     /// `u64[3]`.
-    pub const SLOT_OFFSET: usize = 48;
+    pub const SLOT_OFFSET: usize = 40;
     /// `u64[3]`, the seqlocks.
-    pub const SLOT_SEQ: usize = 72;
-    pub const LATEST: usize = 96;
-    pub const CURSOR_OFFSET: usize = 104;
-    pub const CURSOR_X: usize = 112;
-    pub const CURSOR_Y: usize = 116;
-    pub const CURSOR_HOT_X: usize = 120;
-    pub const CURSOR_HOT_Y: usize = 124;
-    pub const CURSOR_WIDTH: usize = 128;
-    pub const CURSOR_HEIGHT: usize = 132;
-    pub const CURSOR_VISIBLE: usize = 136;
+    pub const SLOT_SEQ: usize = 64;
+    pub const LATEST: usize = 88;
+    pub const CURSOR_X: usize = 96;
+    pub const CURSOR_Y: usize = 100;
+    pub const CURSOR_HOT_X: usize = 104;
+    pub const CURSOR_HOT_Y: usize = 108;
+    pub const CURSOR_WIDTH: usize = 112;
+    pub const CURSOR_HEIGHT: usize = 116;
+    pub const CURSOR_VISIBLE: usize = 120;
     /// The cursor's seqlock, the same rule as a slot's.
-    pub const CURSOR_SEQ: usize = 144;
+    pub const CURSOR_SEQ: usize = 128;
+    pub const HEADER_BYTES: usize = 136;
+    pub const SLOT_BYTES: usize = 140;
+    /// `u64`.
+    pub const CURSOR_OFFSET: usize = 144;
 }
 
 pub const fn align_up(n: usize, to: usize) -> usize {
@@ -217,7 +223,7 @@ impl Ring {
         {
             return Err(bad("layout doesn't match its size"));
         }
-        Ok(Ring { map, layout, generation: u64_at(off::GEN), path: None, writable: false })
+        Ok(Ring { map, layout, generation: u32_at(off::GEN) as u64, path: None, writable: false })
     }
 
     fn write_header(&self) {
@@ -227,7 +233,7 @@ impl Ring {
         put(off::MAGIC, MAGIC);
         put(off::VERSION, &VERSION.to_le_bytes());
         put(off::HEADER_BYTES, &(HEADER_BYTES as u32).to_le_bytes());
-        put(off::GEN, &self.generation.to_le_bytes());
+        put(off::GEN, &(self.generation as u32).to_le_bytes());
         put(off::WIDTH, &l.width.to_le_bytes());
         put(off::HEIGHT, &l.height.to_le_bytes());
         put(off::STRIDE, &(l.stride as u32).to_le_bytes());
@@ -468,10 +474,13 @@ mod tests {
         assert_eq!(&bytes[..8], b"BRTHSURF");
         let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
         let u64_at = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
-        assert_eq!((u32_at(8), u32_at(12), u64_at(16)), (1, 16384, 7));
-        assert_eq!((u32_at(24), u32_at(28), u32_at(32), u32_at(36), u32_at(40)), (1366, 768, 5632, 1, 3));
-        assert_eq!(u64_at(48), 16384);
-        assert_eq!(u32_at(96), NO_SLOT);
+        // The offsets the app's RingLayout reads.
+        assert_eq!((u32_at(8), u32_at(12)), (1, 7));
+        assert_eq!((u32_at(16), u32_at(20), u32_at(24), u32_at(28), u32_at(32)), (1366, 768, 5632, 1, 3));
+        let slot_bytes = 5632 * 768;
+        assert_eq!((u64_at(40), u64_at(48), u64_at(56)), (16384, 16384 + slot_bytes, 16384 + 2 * slot_bytes));
+        assert_eq!((u64_at(64), u32_at(88)), (0, NO_SLOT));
+        assert_eq!((u32_at(136), u32_at(140), u64_at(144)), (16384, slot_bytes as u32, 16384 + 3 * slot_bytes));
         let read = Ring::open_read(&path).unwrap();
         assert_eq!((read.generation(), read.width(), read.height(), read.latest()), (7, 1366, 768, None));
 
@@ -480,7 +489,7 @@ mod tests {
         std::fs::write(dir.join("bad-magic"), &bad).unwrap();
         assert!(Ring::open_read(&dir.join("bad-magic")).is_err());
         let mut bad = bytes.clone();
-        bad[8] = 2;
+        bad[off::VERSION] = 2;
         std::fs::write(dir.join("bad-version"), &bad).unwrap();
         assert!(Ring::open_read(&dir.join("bad-version")).err().unwrap().to_string().contains("version 2"));
         std::fs::write(dir.join("short"), &bytes[..HEADER_BYTES + 10]).unwrap();

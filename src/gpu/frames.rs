@@ -182,7 +182,8 @@ struct Inner {
     map: BTreeMap<SurfaceKey, Surface>,
     /// Frame and cursor sequence numbers, shared by all surfaces.
     sequence: u64,
-    /// Ring generations, unique across daemon runs (seeded from the clock).
+    /// Ring generations, 1..=u32::MAX, unique across daemon runs (seeded
+    /// from the clock).
     generation: u64,
 }
 
@@ -267,10 +268,14 @@ impl Surfaces {
         let s = inner.map.entry(key.clone()).or_default();
         let resized = s.ring.as_ref().is_none_or(|r| r.width() != width || r.height() != height);
         if resized {
+            // The header holds a u32 gen (so does the app's reply parser):
+            // seconds since 1970 fit, and a later daemon starts above
+            // whatever this one reached unless it resized more than once a
+            // second.
             if inner.generation == 0 {
-                inner.generation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_secs() << 20);
+                inner.generation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_secs() & u32::MAX as u64);
             }
-            inner.generation += 1;
+            inner.generation = inner.generation % u32::MAX as u64 + 1;
             let ring = Ring::create(inner.dir.as_deref(), &key.stem(), inner.generation, width, height).or_else(|err| {
                 eprintln!("display: can't share {key}'s frames ({err}); keeping them in memory");
                 Ring::create(None, &key.stem(), inner.generation, width, height)

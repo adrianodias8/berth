@@ -249,6 +249,31 @@ fn the_feeder_stops_after_the_last_viewer() {
     assert!(hub.feeders.lock().unwrap().is_empty());
 }
 
+/// A viewer of a feeder that ended leaving late doesn't count against
+/// the feeder a newer viewer started meanwhile.
+#[test]
+fn a_late_leaver_of_an_ended_feeder_keeps_the_new_one() {
+    let surfaces = leak();
+    let (hub, rx, _) = hub(surfaces);
+    let key = SurfaceKey::Session { machine: "dev".into(), session: "s-5".into() };
+    let first = hub.subscribe(&key);
+    let (agent_r, _) = agent(&rx);
+    agent_r.get_ref().write_all(b"{\"ok\":false,\"error\":\"no such session\"}\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !hub.feeders.lock().unwrap().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(hub.feeders.lock().unwrap().is_empty(), "the failed feeder is gone");
+    let second = hub.subscribe(&key);
+    assert_ne!(first, second);
+    let _agent2 = agent(&rx);
+    hub.unsubscribe(&key, first);
+    std::thread::sleep(Duration::from_millis(150));
+    let feeders = hub.feeders.lock().unwrap();
+    let f = feeders.get(&key).expect("the new feeder outlives the linger");
+    assert_eq!((Some(f.id), f.viewers), (second, 1));
+}
+
 #[test]
 fn doorbells_are_paced_to_max_fps() {
     let surfaces = leak();

@@ -149,13 +149,15 @@ impl Hub {
         self
     }
 
-    /// A viewer of `key`: a session's first starts its feeder.
-    fn subscribe(self: &Arc<Self>, key: &SurfaceKey) {
-        let SurfaceKey::Session { .. } = key else { return };
+    /// A viewer of `key`: a session's first starts its feeder. The feeder's
+    /// id goes back to `unsubscribe`, so a viewer of a feeder that already
+    /// ended doesn't count against the one that replaced it.
+    fn subscribe(self: &Arc<Self>, key: &SurfaceKey) -> Option<u64> {
+        let SurfaceKey::Session { .. } = key else { return None };
         let mut feeders = self.feeders.lock().unwrap();
         if let Some(f) = feeders.get_mut(key) {
             f.viewers += 1;
-            return;
+            return Some(f.id);
         }
         self.surfaces.begin(key);
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
@@ -164,12 +166,17 @@ impl Hub {
         feeders.insert(key.clone(), Feeder { id, viewers: 1, conn: conn.clone(), stop: stop.clone() });
         let (hub, key) = (self.clone(), key.clone());
         std::thread::spawn(move || hub.run_feeder(key, id, conn, stop));
+        Some(id)
     }
 
-    /// A viewer left: after the linger with none back, the feeder stops.
-    fn unsubscribe(self: &Arc<Self>, key: &SurfaceKey) {
+    /// A viewer of feeder `id` left: after the linger with none back, the
+    /// feeder stops.
+    fn unsubscribe(self: &Arc<Self>, key: &SurfaceKey, id: Option<u64>) {
         let mut feeders = self.feeders.lock().unwrap();
         let Some(f) = feeders.get_mut(key) else { return };
+        if Some(f.id) != id {
+            return;
+        }
         f.viewers = f.viewers.saturating_sub(1);
         if f.viewers > 0 {
             return;
@@ -186,8 +193,9 @@ impl Hub {
                 if let Some(conn) = f.conn.lock().unwrap().as_ref() {
                     let _ = conn.shutdown(std::net::Shutdown::Both);
                 }
+                // The feeder forgets the surface as it exits: it may be
+                // writing one last frame right now.
                 feeders.remove(&key);
-                hub.surfaces.forget(&key);
             }
         });
     }
@@ -211,7 +219,13 @@ impl Hub {
         if feeders.get(&key).is_some_and(|f| f.id == id) {
             feeders.remove(&key);
         }
-        if !stop.load(Ordering::SeqCst) && !feeders.contains_key(&key) {
+        if feeders.contains_key(&key) {
+            return;
+        }
+        if stop.load(Ordering::SeqCst) {
+            // Stopped with nobody watching: the surface and its ring go.
+            self.surfaces.forget(&key);
+        } else {
             let error = result.err().unwrap_or_else(|| "the session's screen stream ended".into());
             eprintln!("display: {key}: {error}");
             self.surfaces.end(&key, &error);
@@ -271,6 +285,9 @@ impl Hub {
     fn open_input(&self, machine: &str, session: &str) -> Result<UnixStream, String> {
         let stream = self.connector.open(machine).map_err(|e| format!("can't reach the VM's agent: {e}"))?;
         stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+        // Writes happen under the inputs lock: an agent that stops reading
+        // must break the pipe, not wedge every viewer's input.
+        stream.set_write_timeout(Some(Duration::from_secs(2))).map_err(|e| e.to_string())?;
         open_stream(&mut BufReader::new(&stream), &stream, session, "input.stream", json!({}))?;
         Ok(stream)
     }
@@ -497,7 +514,7 @@ pub fn serve(hub: &Arc<Hub>, stream: UnixStream, leftover: Vec<u8>, req: Display
         }
         return;
     }
-    hub.subscribe(&key);
+    let feeder = hub.subscribe(&key);
     let info = hub.surfaces.info(&key);
     let mut reply = ring_fields(info.as_ref());
     reply.insert("ok".into(), json!(true));
@@ -518,7 +535,7 @@ pub fn serve(hub: &Arc<Hub>, stream: UnixStream, leftover: Vec<u8>, req: Display
             let _ = t.join();
         }
     }
-    hub.unsubscribe(&key);
+    hub.unsubscribe(&key, feeder);
 }
 
 /// Tell the viewer about every change, at most `fps` a second: frames and

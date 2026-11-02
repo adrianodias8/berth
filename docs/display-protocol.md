@@ -45,29 +45,33 @@ Header fields:
 |---|---|---|
 | 0 | `u8[8]` | magic `BRTHSURF` |
 | 8 | `u32` | version, 1 |
-| 12 | `u32` | header size, 16384 |
-| 16 | `u64` | gen (the same as in the file name) |
-| 24 | `u32` | width (pixels) |
-| 28 | `u32` | height |
-| 32 | `u32` | stride (bytes per row) |
-| 36 | `u32` | format: 1 = bgra8 (bytes B, G, R, A in memory: Metal's `bgra8Unorm`) |
-| 40 | `u32` | slots, 3 |
-| 44 | `u32` | slot_bytes |
-| 48 | `u64[3]` | slot_offset (16384-aligned) |
-| 72 | `u64[3]` | slot_seq: each slot's seqlock |
-| 96 | `u32` | latest: the slot with the newest frame, `0xFFFFFFFF` before the first |
-| 100 | `u32` | reserved (0) |
-| 104 | `u64` | cursor_offset (where the cursor image is) |
-| 112 | `i32` | cursor x: where the hot spot is on the surface |
-| 116 | `i32` | cursor y |
-| 120 | `u32` | cursor hot_x (in the image) |
-| 124 | `u32` | cursor hot_y |
-| 128 | `u32` | cursor w (≤ 256) |
-| 132 | `u32` | cursor h (≤ 256) |
-| 136 | `u32` | cursor visible (0 or 1) |
-| 140 | `u32` | reserved (0) |
-| 144 | `u64` | cursor seq: the cursor's seqlock |
+| 12 | `u32` | gen (the same as in the file name; 1 to 2^32-1) |
+| 16 | `u32` | width (pixels) |
+| 20 | `u32` | height |
+| 24 | `u32` | stride (bytes per row) |
+| 28 | `u32` | format: 1 = bgra8 (bytes B, G, R, A in memory: Metal's `bgra8Unorm`) |
+| 32 | `u32` | slots, 3 |
+| 36 | `u32` | reserved (0) |
+| 40 | `u64[3]` | slot_offset (16384-aligned) |
+| 64 | `u64[3]` | slot_seq: each slot's seqlock |
+| 88 | `u32` | latest: the slot with the newest frame, `0xFFFFFFFF` before the first |
+| 92 | `u32` | reserved (0) |
+| 96 | `i32` | cursor x: where the hot spot is on the surface |
+| 100 | `i32` | cursor y |
+| 104 | `u32` | cursor hot_x (in the image) |
+| 108 | `u32` | cursor hot_y |
+| 112 | `u32` | cursor w (≤ 256) |
+| 116 | `u32` | cursor h (≤ 256) |
+| 120 | `u32` | cursor visible (0 or 1) |
+| 124 | `u32` | reserved (0) |
+| 128 | `u64` | cursor seq: the cursor's seqlock |
+| 136 | `u32` | header size, 16384 |
+| 140 | `u32` | slot_bytes |
+| 144 | `u64` | cursor_offset (where the cursor image is) |
 | 152 to 16383 | | reserved (0) |
+
+The last three repeat what width and height already give (the formulas
+above); a reader may check them or work them out itself.
 
 The cursor image's top-left corner goes at `(x - hot_x, y - hot_y)`.
 Scanouts have a cursor (from the GPU's cursor commands); session surfaces
