@@ -110,6 +110,26 @@ pane, viewport) loses to any other match, and a match inside another match
 is the same element (a GTK button "Save" holds a label "Save"): the outer
 one is clicked, at its frame's centre.
 
+Details both guests follow:
+
+- **push payload.** The tar stream follows the request line. The host puts
+  its length in the request as a top-level `"payload_len"` (next to `verb`)
+  and the guest reads exactly that many bytes; without it the guest reads
+  until the host half-closes (older hosts). `name` is one path
+  component; an existing `dest/name` is replaced whole.
+- **scroll.** `dx`/`dy` are points; positive `dy` scrolls down (content moves
+  up), as a browser's `deltaY`. `x`/`y` default to the screen's centre.
+- **Optional extras** a host may use and must not require: `hello` also
+  returns `"permissions":{"accessibility":bool,"screen_recording":bool}`
+  (macOS); `tree` also returns `"truncated":bool` (depth or the guest's
+  element cap cut it); `click {"label"}` and `wait {"label"}` take an optional
+  `"app"` (default: the frontmost app); a label click on an element with no
+  on-screen frame presses it through accessibility and returns
+  `{"pressed":true}`; `screenshot` `format` is `png` or `jpeg`.
+- **macOS label search** looks in the app's windows first and the menu bar
+  only when nothing there matches, so "Save" finds a dialog's button rather
+  than File > Save.
+
 `note` never reaches a guest: the host logs it.
 
 `push`'s tar (the request's payload) holds `name` at its top level (a
