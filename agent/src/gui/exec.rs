@@ -234,7 +234,16 @@ impl Piped {
 
 impl Drop for Piped {
     fn drop(&mut self) {
-        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+        // Reaped under the lock, as in wait: a Stopper elsewhere must not
+        // signal a group whose pid may have been handed out again.
+        let exited = {
+            let mut done = self.stop.done.lock().unwrap_or_else(|e| e.into_inner());
+            if !*done && matches!(self.child.try_wait(), Ok(Some(_))) {
+                *done = true;
+            }
+            *done
+        };
+        if !exited {
             self.stop.stop();
             let _ = self.child.kill();
         }
