@@ -604,10 +604,10 @@ fn release_desktop(path: &str, machine: &str, id: &str) {
 }
 
 /// Whether `machine`'s session `id` still has a compositor (for a claim
-/// made from another machine).
+/// made from another machine). Its record isn't asked for: a desktop that's
+/// still starting has none yet, and holds card0 all the same.
 fn session_alive(machine: &str, id: &str) -> bool {
     valid_session(id)
-        && load(machine, id).is_some()
         && Machine::open(machine).is_ok_and(|m| {
             m.run_text(&format!("p=$(cat {}/compositor.pid 2>/dev/null); [ -n \"$p\" ] && kill -0 $p 2>/dev/null && echo alive; true", runtime(id)), SHORT)
                 .is_ok_and(|o| o.trim() == "alive")
@@ -648,6 +648,23 @@ fn wanted(args: &Value) -> Result<Wanted, String> {
     }
 }
 
+/// What the machine has, in one call: a `missing <tool>` line for each
+/// tool the session needs and lacks, `render` and `card0` for the GPU nodes
+/// it has, and for a desktop what each flavour lacks (`desktop_probe`).
+fn probe_script(wanted: &Wanted) -> String {
+    let (compositor, desktop) = match wanted {
+        Wanted::Agent => ("sway swaymsg ", String::new()),
+        Wanted::App(_) => ("cage ", String::new()),
+        Wanted::Desktop(_) => ("", format!("{}; ", install::desktop_probe())),
+    };
+    format!(
+        "for t in {compositor}grim wtype; do command -v $t >/dev/null || echo \"missing $t\"; done; \
+         [ -e {} ] && echo render; [ -e {} ] && echo card0; {desktop}true",
+        install::RENDER_NODE,
+        install::CARD_NODE
+    )
+}
+
 /// PNG width and height, from its IHDR.
 fn png_size(png: &[u8]) -> Option<[u32; 2]> {
     if png.len() < 24 || &png[..8] != b"\x89PNG\r\n\x1a\n" {
@@ -666,24 +683,7 @@ fn session_new(m: &Machine, args: &Value) -> Result<Done, String> {
         .and_then(|s| Some([s.first()?.as_u64()? as u32, s.get(1)?.as_u64()? as u32]))
         .filter(|[w, h]| (320..=7680).contains(w) && (240..=4320).contains(h))
         .unwrap_or(DEFAULT_SIZE);
-    // What the machine has, in one call: missing tools, the GPU nodes, and
-    // for a desktop what each flavour lacks.
-    let (compositor, desktop_probe) = match &wanted {
-        Wanted::Agent => ("sway swaymsg", String::new()),
-        Wanted::App(_) => ("cage", String::new()),
-        Wanted::Desktop(_) => ("", install::desktop_probe()),
-    };
-    let probe = m
-        .run_text(
-            &format!(
-                "for t in {compositor} grim wtype; do command -v $t >/dev/null || echo \"missing $t\"; done; \
-                 [ -e {} ] && echo render; [ -e {} ] && echo card0; {desktop_probe}; true",
-                install::RENDER_NODE,
-                install::CARD_NODE
-            ),
-            SHORT,
-        )
-        .map_err(|e| e.to_string())?;
+    let probe = m.run_text(&probe_script(&wanted), SHORT).map_err(|e| e.to_string())?;
     let missing: Vec<&str> = probe.lines().filter_map(|l| l.strip_prefix("missing ")).collect();
     if !missing.is_empty() {
         return Err(missing_tools_message(&missing.join(" ")));
@@ -769,7 +769,7 @@ fn session_new(m: &Machine, args: &Value) -> Result<Done, String> {
         eprintln!("berth-agent: gui: {}: {id}: the compositor didn't start on gles2 ({err}); trying pixman", m.name);
         m.stop_units(&unit);
         let reset = format!(
-            "RT={rt}; p=$(cat $RT/compositor.pid 2>/dev/null); [ -n \"$p\" ] && kill -9 $p 2>/dev/null; \
+            "RT={rt}; for f in compositor dbus; do p=$(cat $RT/$f.pid 2>/dev/null); [ -n \"$p\" ] && kill -9 $p 2>/dev/null; done; \
              mv -f $RT/compositor.log $RT/compositor-gles2.log 2>/dev/null; rm -f $RT/wayland-* $RT/sway-ipc.* $RT/compositor.pid; true"
         );
         let _ = m.run(&reset, &[], SHORT);
@@ -1430,6 +1430,22 @@ mod tests {
         assert!(wanted(&json!({"kind": "desktop", "app": ["foot"]})).is_err());
         assert!(wanted(&json!({"kind": "game"})).unwrap_err().contains("agent, app or desktop"));
         assert!(wanted(&json!({"app": []})).is_err());
+    }
+
+    #[test]
+    fn probes_run_for_every_kind() {
+        // An empty PATH: every tool is missing, and the script still runs.
+        let run = |w: &Wanted| {
+            let out = std::process::Command::new("/bin/sh").args(["-c", &probe_script(w)]).env("PATH", "/nonexistent").output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let agent = run(&Wanted::Agent);
+        assert!(agent.contains("missing sway\nmissing swaymsg\nmissing grim\nmissing wtype\n"), "{agent}");
+        let app = run(&Wanted::App(vec!["foot".into()]));
+        assert!(app.starts_with("missing cage\nmissing grim\n") && !app.contains("desktop"), "{app}");
+        let desktop = run(&Wanted::Desktop(None));
+        assert!(desktop.starts_with("missing grim\n") && desktop.contains("desktop sway missing sway swaymsg seatd"), "{desktop}");
     }
 
     fn session(kind: &str, flavour: Option<&str>) -> Session {

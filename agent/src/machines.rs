@@ -396,7 +396,8 @@ fn with_gpu_binds(config: &str, binds: &str) -> String {
 }
 
 /// `ensure_gpu_binds`, then what applies it: systemd reloads the drop-in,
-/// and a running machine restarts to get the new binds.
+/// and a running machine restarts to get the new binds. One that failed to
+/// start at boot over a bind whose node is gone is started again.
 fn refresh_gpu_binds(name: &str) -> io::Result<()> {
     if !ensure_gpu_binds(name)? {
         return Ok(());
@@ -405,6 +406,9 @@ fn refresh_gpu_binds(name: &str) -> io::Result<()> {
     if running(name) {
         eprintln!("berth-agent: gui: {name}: GPU nodes bound, restarting");
         stop(name)?;
+        start(name)?;
+    } else if sh(&format!("systemctl is-failed --quiet systemd-nspawn@{name}.service")).is_ok() {
+        eprintln!("berth-agent: gui: {name}: GPU nodes rebound, starting it again");
         start(name)?;
     }
     Ok(())
