@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use crate::paths::Paths;
 
 /// Name, what it takes, and its default (as `berth config list` shows it).
-const KEYS: [(&str, &str, &str); 16] = [
+const KEYS: [(&str, &str, &str); 18] = [
     ("cpus", "a number of CPUs", "every core"),
     ("memory_mib", "MiB, at least 1024", "half the Mac's memory, 2-16 GiB"),
     ("file_sharing", "berth or apple", "berth (macOS 27)"),
@@ -22,6 +22,8 @@ const KEYS: [(&str, &str, &str); 16] = [
     ("gui", "true or false (experimental: Linux GUI machines and the VM's display)", "false"),
     ("gpu_memory_mib", "MiB, 16-16384 (the display's shared memory)", "256"),
     ("gpu_display", "WIDTHxHEIGHT, 640x480 to 7680x4320", "1920x1080"),
+    ("gpu_virgl", "true or false (3D in the display, when berth is built with it)", "true"),
+    ("gpu_blob", "true or false (experimental: blob resources and CONTEXT_INIT, for Venus)", "false"),
     ("gui_idle_minutes", "minutes, 0 for never (berth gui sessions)", "30"),
     ("gui_titles", "true or false (show Claude Code chat titles in the activity log)", "false"),
 ];
@@ -61,7 +63,7 @@ fn parse(key: &str, value: &str) -> Result<Value> {
             Ok(n) => Value::from(n),
             _ => bail!("gui_idle_minutes is a number of minutes (0: never)"),
         },
-        "ipv6" | "finder" | "mac" | "gui" | "gui_titles" => boolean()?,
+        "ipv6" | "finder" | "mac" | "gui" | "gui_titles" | "gpu_virgl" | "gpu_blob" => boolean()?,
         _ => match KEYS.iter().find(|(k, _, _)| *k == key) {
             Some((_, takes, _)) => bail!("{key} takes {takes}"),
             None => bail!("unknown key {key}; keys: {}", KEYS.map(|k| k.0).join(", ")),
@@ -175,6 +177,8 @@ mod tests {
         assert!(parse("gpu_display", "100x100").is_err());
         assert_eq!(parse("gui_idle_minutes", "0").unwrap(), Value::from(0));
         assert!(parse("gui_titles", "maybe").is_err());
+        assert_eq!(parse("gpu_virgl", "off").unwrap(), Value::Bool(false));
+        assert_eq!(parse("gpu_blob", "true").unwrap(), Value::Bool(true));
     }
 
     #[test]

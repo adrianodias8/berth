@@ -4,27 +4,38 @@
 //! Plan: docs/plans/gui-vms-agent-testing.md, "Linux display foundation".
 //!
 //! - protocol.rs: the virtio-gpu wire format;
-//! - server.rs: the resource table and the 2D commands;
+//! - server.rs: the resource table, the 2D commands, and the routing of
+//!   3D ones to the renderer;
+//! - backend.rs: the 3D renderer as the server sees it (and a fake one for
+//!   tests); fence.rs: fenced requests waiting for it;
 //! - frames.rs: the latest frame of each scanout, and a PNG encoder. Only
 //!   the debug dump (device.rs) reads them for now: a host-side display
 //!   window and screenshots are still to come (`berth gui screenshot` on
 //!   Linux uses grim inside the session);
 //! - device.rs: the Virtualization.framework side (queues, guest memory,
 //!   the shared memory region, snapshots);
-//! - virgl.rs: where virglrenderer (3D through ANGLE on Metal) plugs in,
-//!   behind the `virgl` cargo feature.
+//! - virgl.rs: virglrenderer (3D through ANGLE on Metal), behind the
+//!   `virgl` cargo feature; virgl_thread.rs: the berth-virgl worker thread
+//!   every EGL and virgl call runs on.
 //!
 //! Off unless ~/.berth/config.json has `"gui": true`: then `attach` adds
 //! the device to the VM (macOS 27 only; not in safe mode). With the flag
 //! off nothing here runs and the VM's configuration is exactly as before.
 //! `"gpu_memory_mib"` (default 256) sizes the host-visible shared memory
-//! region; `"gpu_display": "WxH"` (default 1920x1080) the display mode.
+//! region; `"gpu_display": "WxH"` (default 1920x1080) the display mode;
+//! `"gpu_virgl"` (default true; `BERTH_GPU_VIRGL=0` too) turns 3D off in a
+//! build that has it; `"gpu_blob"` (default false) offers blob resources and
+//! CONTEXT_INIT, for Venus later.
 
+pub mod backend;
 pub mod device;
+pub mod fence;
 pub mod frames;
 pub mod protocol;
 pub mod server;
 pub mod virgl;
+#[cfg(feature = "virgl")]
+pub mod virgl_thread;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, NSObject};
@@ -43,6 +54,10 @@ pub struct Settings {
     pub gui: bool,
     pub memory_mib: u64,
     pub display: (u32, u32),
+    /// 3D through virglrenderer, when built with it.
+    pub virgl: bool,
+    /// Blob resources and CONTEXT_INIT (only with 3D).
+    pub blob: bool,
 }
 
 impl Settings {
@@ -53,6 +68,8 @@ impl Settings {
             display: crate::config::value(paths, "gpu_display")
                 .and_then(|v| v.as_str().and_then(parse_display))
                 .unwrap_or(DEFAULT_DISPLAY),
+            virgl: crate::config::value(paths, "gpu_virgl").and_then(|v| v.as_bool()).unwrap_or(true),
+            blob: crate::config::flag(paths, "gpu_blob"),
         }
     }
 
@@ -87,7 +104,10 @@ pub fn attach(config: &objc2_virtualization::VZVirtualMachineConfiguration, path
         eprintln!("gpu: safe mode, no display device");
         return;
     }
-    let device = device::configuration(&settings, paths);
+    // The renderer starts here, before the device exists: if it fails the
+    // device is the 2D one.
+    let backend = virgl::backend(&settings);
+    let device = device::configuration(&settings, paths, backend);
     unsafe {
         let existing: Retained<NSArray<NSObject>> = msg_send![config, customVirtioDevices];
         let mut devices = existing.to_vec();
@@ -110,17 +130,20 @@ mod tests {
             std::fs::write(paths.config(), json).unwrap();
             Settings::load(&paths)
         };
-        assert_eq!(Settings::load(&paths), Settings { gui: false, memory_mib: 256, display: (1920, 1080) });
+        let base = Settings { gui: false, memory_mib: 256, display: (1920, 1080), virgl: true, blob: false };
+        assert_eq!(Settings::load(&paths), base);
         assert!(!with("{\"cpus\": 4}").gui);
         let s = with(r#"{"gui": true, "gpu_memory_mib": 512, "gpu_display": "2560x1600"}"#);
-        assert_eq!(s, Settings { gui: true, memory_mib: 512, display: (2560, 1600) });
+        assert_eq!(s, Settings { gui: true, memory_mib: 512, display: (2560, 1600), ..base });
         assert_eq!(with(r#"{"gui": true, "gpu_display": "huge"}"#).display, (1920, 1080));
+        let s = with(r#"{"gui": true, "gpu_virgl": false, "gpu_blob": true}"#);
+        assert_eq!((s.virgl, s.blob), (false, true));
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn region_sizes_are_powers_of_two() {
-        let at = |mib| Settings { gui: true, memory_mib: mib, display: DEFAULT_DISPLAY }.region_bytes();
+        let at = |mib| Settings { gui: true, memory_mib: mib, display: DEFAULT_DISPLAY, virgl: false, blob: false }.region_bytes();
         assert_eq!(at(256), 256 << 20);
         assert_eq!(at(300), 512 << 20);
         assert_eq!(at(0), 16 << 20);
