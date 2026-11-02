@@ -8,6 +8,8 @@ enum Section: String, CaseIterable, Identifiable {
     case kubernetes = "Kubernetes"
     case machine = "Machines"
     case snapshots = "Snapshots"
+    case macVMs = "macOS VMs"
+    case agents = "Agents"
     var id: String { rawValue }
 
     var icon: String {
@@ -19,6 +21,18 @@ enum Section: String, CaseIterable, Identifiable {
         case .kubernetes: "helm"
         case .machine: "terminal"
         case .snapshots: "clock.arrow.circlepath"
+        case .macVMs: "macwindow"
+        case .agents: "eye"
+        }
+    }
+
+    /// The GUI sections only with their flag on in config.json (MacVMs.swift).
+    @MainActor
+    func isShown(_ flags: FeatureFlags) -> Bool {
+        switch self {
+        case .macVMs: flags.mac
+        case .agents: flags.agents
+        default: true
         }
     }
 }
@@ -31,6 +45,7 @@ struct MainWindow: View {
     // line (NSArgumentDomain) overrides it, for scripted screenshots.
     @AppStorage("selectedSection") private var section: Section = .containers
     @Environment(\.openSettings) private var openSettings
+    @ObservedObject private var flags = FeatureFlags.shared
 
     var body: some View {
         NavigationSplitView {
@@ -49,12 +64,23 @@ struct MainWindow: View {
                 SwiftUI.Section("VM") {
                     Label(Section.snapshots.rawValue, systemImage: Section.snapshots.icon).tag(Section.snapshots)
                 }
+                if flags.mac {
+                    SwiftUI.Section("macOS") {
+                        Label(Section.macVMs.rawValue, systemImage: Section.macVMs.icon).tag(Section.macVMs)
+                    }
+                }
+                if flags.agents {
+                    SwiftUI.Section("Agents") {
+                        Label(Section.agents.rawValue, systemImage: Section.agents.icon).tag(Section.agents)
+                    }
+                }
             }
             .navigationSplitViewColumnWidth(min: 170, ideal: 190)
             .safeAreaInset(edge: .bottom) { EngineBadge().padding(10) }
         } detail: {
             Group {
-                if engine.isRunning || section == .machine || section == .snapshots {
+                // macOS VMs and the agents' log don't need the Linux VM.
+                if engine.isRunning || [.machine, .snapshots, .macVMs, .agents].contains(section) {
                     switch section {
                     case .containers: ContainersView()
                     case .images: ImagesView()
@@ -63,6 +89,8 @@ struct MainWindow: View {
                     case .kubernetes: KubernetesView()
                     case .machine: MachinesView()
                     case .snapshots: SnapshotsView()
+                    case .macVMs: MacVMsView()
+                    case .agents: AgentsView()
                     }
                 } else {
                     NotRunningView()
@@ -81,10 +109,12 @@ struct MainWindow: View {
         .onAppear {
             if !onboarded { showOnboarding = true }
             if let s = Section(rawValue: UserDefaults.standard.string(forKey: "openSection") ?? "") { section = s }
+            if !section.isShown(flags) { section = .containers }
             // `-openSettings YES`, with the launch arguments above.
             if UserDefaults.standard.bool(forKey: "openSettings") { openSettings() }
         }
         .onChange(of: onboarded) { if !onboarded { showOnboarding = true } }
+        .onChange(of: [flags.mac, flags.agents]) { if !section.isShown(flags) { section = .containers } }
     }
 }
 

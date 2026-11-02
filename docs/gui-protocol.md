@@ -94,6 +94,12 @@ same `id`:
 
 Targets are written `mac:<vm>` or `linux:<machine>`.
 
+Berth.app's Display window refreshes a Linux session with
+`berth gui screenshot … --json` every 2 s, run with `BERTH_GUI_WHO=berth-app`
+in its environment. The CLI logs those with `"who":{"kind":"berth-app"}` (or
+skips logging them); the app's Agents view hides that kind. `--json` prints
+one object with the PNG's `"path"`.
+
 ## Sessions
 
 Host-side state in `~/.berth/gui/sessions.json`:
