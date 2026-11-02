@@ -88,6 +88,16 @@ enum Control {
             return try JSONDecoder().decode(T.self, from: data)
         }
     }
+
+    /// A request whose connection stays open (`{"cmd":"display",…}`): the
+    /// whole JSON object goes out as one line, and the reply line and what
+    /// follows arrive on the stream's `lines`. Blocks while connecting, so
+    /// call it off the main thread.
+    static func open(_ obj: [String: Any], socketPath: String = BerthPaths.controlSocket) throws -> LineStream {
+        let sock = try UnixSocket(path: socketPath)
+        try sock.writeLine(obj)
+        return LineStream(sock)
+    }
 }
 
 struct BerthConfig: Codable, Equatable {
