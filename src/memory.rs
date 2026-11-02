@@ -8,8 +8,10 @@
 //! Every couple of seconds we read the guest's MemTotal/MemAvailable via the
 //! agent. MemAvailable counts reclaimable page cache, so shrinking towards
 //! "used + headroom" also squeezes out stale cache. We shrink gently and grow
-//! at once; when the agent's PSI trigger reports memory stalls, we hand back
-//! the full allowance immediately and hold off shrinking for a while.
+//! at once; when the agent's PSI trigger reports memory stalls, we grow in
+//! proportion to use (everything only when the guest is nearly out of room,
+//! since what it touches meanwhile stays with the VM) and hold off shrinking
+//! for a while. Deflate-on-OOM is the backstop if that isn't enough.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,6 +39,9 @@ const STEADY_TICK: Duration = Duration::from_secs(10);
 const STEADY_AFTER: u32 = 5;
 /// After a pressure event, don't shrink again for this long.
 const HOLD_OFF: Duration = Duration::from_secs(30);
+/// Stalls this soon after our own shrink are the guest dropping cache for it,
+/// not demand: they don't make us grow.
+const SHRINK_SETTLE: Duration = Duration::from_secs(5);
 
 /// Guest memory as reported by the agent. `total` still includes balloon
 /// pages (VZ negotiates deflate-on-OOM, so the guest keeps counting them), so
@@ -70,15 +75,37 @@ pub static GUEST_USED: AtomicU64 = AtomicU64::new(0);
 /// Current balloon target, i.e. memory the VM may hold.
 pub static TARGET: AtomicU64 = AtomicU64::new(0);
 static HOLD_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+static LAST_SHRINK: Mutex<Option<Instant>> = Mutex::new(None);
+/// Held across load-decide-set-store of TARGET, so on_pressure and the tick
+/// don't undo each other.
+static CONTROL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn holding() -> bool {
+    HOLD_UNTIL.lock().unwrap().is_some_and(|t| Instant::now() < t)
+}
+
+/// Where to grow on memory stalls: everything only when the guest is nearly
+/// out of room, otherwise a couple of GiB or half again its use.
+pub fn grow_target(max: u64, current: u64, s: &Sample) -> u64 {
+    if s.available < s.usable() / 8 {
+        return max;
+    }
+    let used = s.used();
+    let next = (current + 2 * GIB).max(used + used / 2 + GIB).min(max);
+    if next == max { max } else { next / MIB * MIB }
+}
 
 /// Where the balloon should go next. `max` is the configured VM size,
 /// `current` the present target.
 pub fn next_target(max: u64, current: u64, s: &Sample) -> u64 {
-    let used = s.used();
-    // Under pressure or nearly out of room: everything back, now.
-    if s.pressure > 2.0 || s.available < s.usable() / 8 {
+    // Nearly out of room: everything back, now.
+    if s.available < s.usable() / 8 {
         return max;
     }
+    if s.pressure > 2.0 {
+        return grow_target(max, current, s).max(current);
+    }
+    let used = s.used();
     let headroom = GIB.max(used / 2);
     let want = (used + headroom).clamp(FLOOR.min(max), max);
     let next = if want > current {
@@ -93,10 +120,23 @@ pub fn next_target(max: u64, current: u64, s: &Sample) -> u64 {
 
 /// Called when the agent reports memory stalls.
 pub async fn on_pressure(max: u64) {
+    // Before the lock, so a tick about to shrink sees it.
     *HOLD_UNTIL.lock().unwrap() = Some(Instant::now() + HOLD_OFF);
-    if TARGET.load(Ordering::Relaxed) < max && vm::set_balloon_target(max).await.is_ok() {
-        TARGET.store(max, Ordering::Relaxed);
-        eprintln!("memory: pressure in guest, returned full {} MiB", max / MIB);
+    let _control = CONTROL.lock().await;
+    if LAST_SHRINK.lock().unwrap().is_some_and(|t| t.elapsed() < SHRINK_SETTLE) {
+        return;
+    }
+    let current = TARGET.load(Ordering::Relaxed);
+    if current >= max {
+        return;
+    }
+    let next = match sample().await {
+        Ok(s) => grow_target(max, current, &s),
+        Err(_) => max,
+    };
+    if vm::set_balloon_target(next).await.is_ok() {
+        TARGET.store(next, Ordering::Relaxed);
+        eprintln!("memory: pressure in guest, grew to {} of {} MiB", next / MIB, max / MIB);
     }
 }
 
@@ -110,15 +150,19 @@ pub async fn run(max: u64) {
         GUEST_USED.store(sample.used(), Ordering::Relaxed);
         let moved = sample.used().abs_diff(last_used) >= HYSTERESIS;
         last_used = sample.used();
+        let _control = CONTROL.lock().await;
         let current = TARGET.load(Ordering::Relaxed);
         // Inflating while the guest zeroes allocated pages would make macOS
         // back every ballooned page (see agent/src/memory.rs).
         let mut next = if sample.balloon_safe { next_target(max, current, &sample) } else { max };
-        if next < current && HOLD_UNTIL.lock().unwrap().is_some_and(|t| Instant::now() < t) {
+        if next < current && holding() {
             next = current;
         }
         if next != current && vm::set_balloon_target(next).await.is_ok() {
             TARGET.store(next, Ordering::Relaxed);
+            if next < current {
+                *LAST_SHRINK.lock().unwrap() = Some(Instant::now());
+            }
         }
         steady = if next != current || moved { 0 } else { steady + 1 };
     }
@@ -163,11 +207,26 @@ mod tests {
     }
 
     #[test]
-    fn pressure_returns_everything() {
+    fn nearly_out_of_room_returns_everything() {
+        assert_eq!(next_target(MAX, 2 * GIB, &s(2 * GIB, 100 * MIB)), MAX);
+        assert_eq!(grow_target(MAX, 2 * GIB, &s(2 * GIB, 100 * MIB)), MAX);
+    }
+
+    #[test]
+    fn pressure_grows_in_proportion() {
+        // 2 GiB allowed, 1 GiB used: current + 2 GiB beats 1.5 + 1.
         let mut sample = s(2 * GIB, GIB);
         sample.pressure = 10.0;
-        assert_eq!(next_target(MAX, 2 * GIB, &sample), MAX);
-        assert_eq!(next_target(MAX, 2 * GIB, &s(2 * GIB, 100 * MIB)), MAX);
+        assert_eq!(next_target(MAX, 2 * GIB, &sample), 4 * GIB);
+        assert_eq!(grow_target(MAX, 2 * GIB, &sample), 4 * GIB);
+        // 6 GiB allowed, 5 used: half again plus 1 GiB, 8.5, beats 6 + 2.
+        assert_eq!(grow_target(MAX, 6 * GIB, &s(6 * GIB, GIB)), 8 * GIB + 512 * MIB);
+    }
+
+    #[test]
+    fn pressure_growth_is_capped_at_max() {
+        assert_eq!(grow_target(MAX, 15 * GIB, &s(15 * GIB, 5 * GIB)), MAX);
+        assert_eq!(grow_target(MAX, 15 * GIB, &s(15 * GIB, 14 * GIB)), MAX);
     }
 
     #[test]

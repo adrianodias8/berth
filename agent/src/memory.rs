@@ -13,8 +13,9 @@ use serde::Serialize;
 
 use crate::hostnet::{HOST_VSOCK_PORT, VMADDR_CID_HOST, vsock_connect};
 
-/// 50 ms of memory stall within any 1 s window.
-const PSI_TRIGGER: &[u8] = b"some 50000 1000000\0";
+/// 150 ms of memory stall within any 1 s window: shorter stalls are the guest
+/// dropping cache (after a shrink, or as containers stop), not demand.
+const PSI_TRIGGER: &[u8] = b"some 150000 1000000\0";
 
 #[derive(Serialize, Default, Debug, PartialEq)]
 pub struct MemInfo {
