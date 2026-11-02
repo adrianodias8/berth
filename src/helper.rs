@@ -104,6 +104,60 @@ impl std::fmt::Display for Cidr {
     }
 }
 
+/// A development build with the `virgl` feature finds virglrenderer and
+/// ANGLE through an rpath into the user's build tree (build.rs), which root
+/// mustn't load from. The helper never uses them, and they're weakly
+/// linked, so the copy loses its absolute rpaths and is signed again.
+fn unpin_rpaths(bin: &str) -> Result<()> {
+    let rpaths = absolute_rpaths(&std::fs::read(bin)?);
+    if rpaths.is_empty() {
+        return Ok(());
+    }
+    for rpath in &rpaths {
+        let out = Command::new("install_name_tool").args(["-delete_rpath", rpath, bin]).output()?;
+        if !out.status.success() {
+            bail!("install_name_tool -delete_rpath {rpath}: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+    }
+    let out = Command::new("codesign").args(["--force", "--sign", "-", bin]).output()?;
+    if !out.status.success() {
+        bail!("codesign {bin}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+/// The LC_RPATHs of a thin 64-bit Mach-O that are absolute paths, not
+/// `@executable_path/…` or `@loader_path/…`.
+fn absolute_rpaths(bin: &[u8]) -> Vec<String> {
+    const MH_MAGIC_64: u32 = 0xfeed_facf;
+    const LC_RPATH: u32 = 0x8000_001c;
+    let u32_at = |at: usize| bin.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    if u32_at(0) != Some(MH_MAGIC_64) {
+        return Vec::new();
+    }
+    let ncmds = u32_at(16).unwrap_or(0);
+    let mut paths = Vec::new();
+    let mut at = 32;
+    for _ in 0..ncmds {
+        let (Some(cmd), Some(size)) = (u32_at(at), u32_at(at + 4)) else { break };
+        let size = size as usize;
+        if size < 8 {
+            break;
+        }
+        if cmd == LC_RPATH
+            && let (Some(off), Some(body)) = (u32_at(at + 8), bin.get(at..at + size))
+            && let Some(raw) = body.get(off as usize..)
+        {
+            let path = raw.split(|&b| b == 0).next().unwrap_or_default();
+            if path.first() == Some(&b'/') {
+                paths.push(String::from_utf8_lossy(path).into_owned());
+            }
+        }
+        at += size;
+    }
+    paths
+}
+
 fn mask(len: u8) -> u32 {
     if len == 0 { 0 } else { u32::MAX << (32 - u32::from(len)) }
 }
@@ -125,6 +179,7 @@ pub fn install() -> Result<()> {
     // to a root-owned location rather than pointing launchd at the build tree.
     let tmp = format!("{BINARY}.tmp");
     std::fs::copy(std::env::current_exe()?, &tmp)?;
+    unpin_rpaths(&tmp)?;
     std::os::unix::fs::chown(&tmp, Some(0), Some(0))?;
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
     std::fs::rename(&tmp, BINARY)?;
@@ -628,6 +683,38 @@ pub fn set_routes(routes: Vec<Route>, docker_socket: Option<String>, cli_dir: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absolute_rpaths_only() {
+        let words = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        let rpath = |path: &str| {
+            let size = (12 + path.len() + 1).next_multiple_of(8);
+            let mut cmd = words(&[0x8000_001c, size as u32, 12]);
+            cmd.extend(path.as_bytes());
+            cmd.resize(size, 0);
+            cmd
+        };
+        let cmds = [
+            rpath("@executable_path/../Frameworks"),
+            words(&[0x19, 16, 0, 0]),
+            rpath("/Users/me/berth/target/spikes/gpu/prefix/lib"),
+        ];
+        let mut bin = words(&[0xfeed_facf, 0x0100_000c, 0, 2, cmds.len() as u32, 0, 0, 0]);
+        bin.extend(cmds.concat());
+        assert_eq!(absolute_rpaths(&bin), ["/Users/me/berth/target/spikes/gpu/prefix/lib"]);
+        assert!(absolute_rpaths(b"#!/bin/sh\n").is_empty());
+        // Cut short: stops rather than reading past the end.
+        assert!(absolute_rpaths(&bin[..60]).is_empty());
+    }
+
+    /// What ld wrote for this test binary: build.rs's rpath to the prefix.
+    #[test]
+    #[cfg(feature = "virgl")]
+    fn rpath_to_the_virgl_prefix() {
+        let bin = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let rpaths = absolute_rpaths(&bin);
+        assert!(rpaths.iter().any(|p| p.ends_with("/lib")), "{rpaths:?}");
+    }
 
     #[test]
     fn vm_bridges_only() {

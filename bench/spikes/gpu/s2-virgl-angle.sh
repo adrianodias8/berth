@@ -7,6 +7,7 @@
 #
 #   bench/spikes/gpu/s2-virgl-angle.sh          build what's missing, then probe
 #   bench/spikes/gpu/s2-virgl-angle.sh probe    only the probe
+#   bench/spikes/gpu/s2-virgl-angle.sh names    only name the libraries @rpath/…
 #
 # Needs Xcode, ~10 GB of disk and an hour for ANGLE's first build. Versions
 # are pinned; record what had to change in docs/LEARNINGS.md.
@@ -80,16 +81,6 @@ PC
         done
     fi
 
-    # ANGLE names its dylibs ./libEGL.dylib: @rpath instead, so whatever
-    # links or dlopens them finds them through its own rpath (DYLD_* is
-    # dropped through scripts/sign.sh, a shell script). Re-sign after.
-    for lib in libEGL libGLESv2; do
-        if [ "$(otool -D "$prefix/lib/$lib.dylib" | tail -1)" != "@rpath/$lib.dylib" ]; then
-            install_name_tool -id "@rpath/$lib.dylib" "$prefix/lib/$lib.dylib"
-            codesign -f -s - "$prefix/lib/$lib.dylib"
-        fi
-    done
-
     # libepoxy with EGL (Homebrew's has only CGL).
     if [ ! -f "$prefix/lib/libepoxy.dylib" ]; then
         [ -d "$out/libepoxy" ] || git clone --depth 1 --branch "$EPOXY_TAG" https://github.com/anholt/libepoxy.git "$out/libepoxy"
@@ -117,11 +108,50 @@ s/#define GLES2_LIB "libGLESv2.so"/#define GLES2_LIB "@rpath\/libGLESv2.dylib"\
             -Dplatforms=egl -Dminigbm_allocation=false -Dvenus=false -Dtests=false --wipe
         ninja -C "$out/virglrenderer/build" install
     fi
+    names
 }
 
-[ "${1:-}" = probe ] || build
-# The probe: berth's own FFI, linked against what was just built.
+# Every library named @rpath/<file>, so berth links them that way and finds
+# them through its own rpaths: the prefix for a development build, the
+# app's Frameworks folder once scripts/build-app.sh copies them there
+# (DYLD_* is dropped through scripts/sign.sh, a shell script). ANGLE names
+# its dylibs ./libEGL.dylib and meson installs the others under absolute
+# paths. @loader_path lets libepoxy dlopen ANGLE, and virglrenderer find
+# libepoxy, from the folder they're in. Re-sign after.
+names() {
+    local lib file dep changed
+    for lib in libEGL.dylib libGLESv2.dylib libepoxy.0.dylib libvirglrenderer.1.dylib; do
+        file="$prefix/lib/$lib"
+        changed=
+        if [ "$(otool -D "$file" | tail -1)" != "@rpath/$lib" ]; then
+            install_name_tool -id "@rpath/$lib" "$file"
+            changed=1
+        fi
+        # Anything absolute that isn't the system's is one of these (also
+        # when the prefix was copied from another checkout).
+        for dep in $(otool -L "$file" | tail -n +2 | awk '$1 ~ /^\// && $1 !~ /^\/(System|usr\/lib)\// {print $1}'); do
+            install_name_tool -change "$dep" "@rpath/$(basename "$dep")" "$file"
+            changed=1
+        done
+        case "$lib" in
+            libepoxy* | libvirglrenderer*)
+                if [ -z "$(otool -l "$file" | awk '$1 == "path" && $2 == "@loader_path"')" ]; then
+                    install_name_tool -add_rpath @loader_path "$file"
+                    changed=1
+                fi
+                ;;
+        esac
+        [ -z "$changed" ] || codesign -f -s - "$file"
+    done
+}
+
+case "${1:-}" in
+    probe) ;;
+    names) names; exit 0 ;;
+    *) build ;;
+esac
+# The probe: berth's own FFI, linked against what was just built (build.rs
+# finds the prefix and sets the rpaths).
 cd "$root"
-RUSTFLAGS="-L $prefix/lib -C link-arg=-Wl,-rpath,$prefix/lib" \
-    cargo test --release -p berth --features virgl -- --ignored --nocapture gpu::virgl::tests::probe_renderer
+cargo test --release -p berth --features virgl -- --ignored --nocapture gpu::virgl::tests::probe_renderer
 echo "S2 PASS: virglrenderer started on ANGLE (Metal) and offers VIRGL2"

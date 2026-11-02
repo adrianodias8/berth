@@ -193,6 +193,13 @@ enum Cmd {
     /// Run the VM in the foreground (used internally by `start`)
     #[command(hide = true)]
     Daemon,
+    /// Start virglrenderer on ANGLE (Metal) in this process and print what
+    /// it offers the guest; exits 2 when berth was built without virgl
+    #[command(hide = true)]
+    GpuProbe {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -373,6 +380,10 @@ fn main() -> Result<()> {
             HelperCmd::Serve { uid } => helper::serve(uid),
         };
     }
+    // Needs no daemon and no ~/.berth: scripts/check-bundle.sh runs it.
+    if let Cmd::GpuProbe { json } = command {
+        return gpu_probe(json);
+    }
     let paths = Paths::new();
     match command {
         Cmd::Start => start(&paths),
@@ -533,6 +544,7 @@ fn main() -> Result<()> {
         Cmd::Gui(args) => gui::run(&paths, args),
         Cmd::Mcp => mcp::serve(&paths),
         Cmd::Daemon => daemon::run(paths),
+        Cmd::GpuProbe { .. } => unreachable!(),
         Cmd::Helper { .. } => unreachable!(),
     }
 }
@@ -836,6 +848,80 @@ fn info(paths: &Paths) -> Result<()> {
     println!("Data:     {}", paths.root.display());
     println!("Settings ({}):", paths.config().display());
     config::list(paths)
+}
+
+/// `berth gpu-probe`: whether this binary's virglrenderer and ANGLE start,
+/// and from where (scripts/check-bundle.sh runs it with
+/// DYLD_PRINT_LIBRARIES). Exits 0 with the capsets, 1 if the renderer
+/// didn't start, 2 if berth was built without the `virgl` feature.
+fn gpu_probe(json: bool) -> Result<()> {
+    #[cfg(not(feature = "virgl"))]
+    {
+        if json {
+            println!("{}", serde_json::json!({ "virgl": false, "error": "not built" }));
+        } else {
+            println!("virgl: not built");
+        }
+        std::process::exit(2);
+    }
+    #[cfg(feature = "virgl")]
+    {
+        use gpu::protocol::capset;
+        let Some(renderer) = gpu::virgl::ffi::Renderer::get() else {
+            if json {
+                println!("{}", serde_json::json!({ "virgl": false, "error": "renderer didn't start" }));
+            } else {
+                println!("virgl: renderer didn't start");
+            }
+            std::process::exit(1);
+        };
+        let caps = renderer.capsets();
+        let name = |id| match id {
+            capset::VIRGL => "VIRGL",
+            capset::VIRGL2 => "VIRGL2",
+            _ => "?",
+        };
+        let gl = gl_renderer();
+        if json {
+            let caps: Vec<_> = caps
+                .iter()
+                .map(|c| serde_json::json!({ "id": c.id, "name": name(c.id), "max_version": c.max_version, "size": c.data.len() }))
+                .collect();
+            println!("{}", serde_json::json!({ "virgl": true, "capsets": caps, "gl_renderer": gl }));
+        } else {
+            for c in &caps {
+                println!("capset {} {} v{} {}", c.id, name(c.id), c.max_version, c.data.len());
+            }
+            if let Some(gl) = gl {
+                println!("gl {gl}");
+            }
+        }
+        if caps.is_empty() {
+            std::process::exit(1);
+        }
+        Ok(())
+    }
+}
+
+/// GL_RENDERER of the context virglrenderer left current on this thread.
+/// libepoxy has already loaded ANGLE's libGLESv2, so this looks it up
+/// rather than linking it.
+#[cfg(feature = "virgl")]
+fn gl_renderer() -> Option<String> {
+    const GL_RENDERER: u32 = 0x1F01;
+    unsafe {
+        let lib = libc::dlopen(c"@rpath/libGLESv2.dylib".as_ptr(), libc::RTLD_NOLOAD | libc::RTLD_LAZY);
+        if lib.is_null() {
+            return None;
+        }
+        let sym = libc::dlsym(lib, c"glGetString".as_ptr());
+        if sym.is_null() {
+            return None;
+        }
+        let get_string: unsafe extern "C" fn(u32) -> *const std::ffi::c_char = std::mem::transmute(sym);
+        let s = get_string(GL_RENDERER);
+        (!s.is_null()).then(|| std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned())
+    }
 }
 
 fn status(paths: &Paths) -> Result<()> {

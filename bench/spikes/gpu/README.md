@@ -76,6 +76,15 @@ and reads its capsets.
 
 **Pass:** the test passes and prints `capset 2 max_version >= 1` (VIRGL2).
 virglrenderer isn't built for macOS upstream; note every patch it needs.
+Passed on 2026-11-02 (`docs/LEARNINGS.md`).
+
+The script ends by naming all four libraries `@rpath/…` (also on its own:
+`s2-virgl-angle.sh names`, for a prefix built before that step). Since
+then the prefix is what berth's 3D builds use: `scripts/build.sh` turns
+the `virgl` feature on when it's there, build.rs links it and sets the
+rpaths (so the probe needs no `RUSTFLAGS`), `scripts/build-app.sh`
+bundles the libraries, and `berth gpu-probe` runs the same probe from any
+build (`docs/configuration.md`, 3D).
 
 ## S3: headless dma-buf capture
 

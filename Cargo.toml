@@ -26,8 +26,11 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "io-util", "
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 [features]
-# 3D for the Linux display through virglrenderer and ANGLE (src/gpu/virgl.rs);
-# needs both libraries on the linker path (bench/spikes/gpu, S2).
+# 3D for the Linux display through virglrenderer and ANGLE (src/gpu/virgl.rs).
+# build.rs links them from BERTH_VIRGL_PREFIX, else target/spikes/gpu/prefix
+# (bench/spikes/gpu/s2-virgl-angle.sh builds it), and sets the rpaths;
+# scripts/build.sh turns it on when that prefix exists (BERTH_VIRGL), and
+# scripts/build-app.sh bundles the libraries.
 virgl = []
 
 [workspace]

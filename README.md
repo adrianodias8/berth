@@ -327,6 +327,10 @@ If `cargo` isn't found, put the toolchain on your `PATH`
 The binary needs the `com.apple.security.virtualization` entitlement, which the
 script adds. `cargo run -- <args>` also signs before running.
 
+With virglrenderer and ANGLE built (`bench/spikes/gpu/s2-virgl-angle.sh`),
+the script builds with 3D for Linux GUI machines and prints `berth: virgl
+on`; `BERTH_VIRGL=0` leaves it out (`docs/configuration.md`, 3D).
+
 The app (needs Xcode):
 
 ```sh

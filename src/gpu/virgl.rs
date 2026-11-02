@@ -560,6 +560,13 @@ pub mod ffi {
         /// thread that does is where vrend's contexts are current.
         pub(in crate::gpu) fn start() -> Result<(), String> {
             unsafe {
+                // Both are weakly linked (build.rs), so a copy of berth away
+                // from them (the route helper's) still runs; here their
+                // symbols are null and must not be called.
+                let loaded = |sym: &std::ffi::CStr| !libc::dlsym(libc::RTLD_DEFAULT, sym.as_ptr()).is_null();
+                if !loaded(c"virgl_renderer_init") || !loaded(c"eglGetPlatformDisplay") {
+                    return Err("virglrenderer and ANGLE aren't loaded".into());
+                }
                 let attribs = [EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE, EGL_NONE];
                 let display = eglGetPlatformDisplay(EGL_PLATFORM_ANGLE_ANGLE, std::ptr::null_mut(), attribs.as_ptr());
                 if display.is_null() || eglInitialize(display, std::ptr::null_mut(), std::ptr::null_mut()) == 0 {
