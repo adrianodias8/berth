@@ -59,8 +59,55 @@ final class UnixSocket {
         }
     }
 
-    /// Returns nil at EOF.
+    /// Returns nil at EOF. Bytes `readLine` read past its newline come first.
     func read(max: Int = 65536) throws -> Data? {
+        if !buffered.isEmpty {
+            let chunk = buffered.prefix(max)
+            buffered.removeFirst(chunk.count)
+            return Data(chunk)
+        }
+        return try readRaw(max: max)
+    }
+
+    /// One line without its newline (a trailing "\r" stays), or nil at EOF.
+    /// A last line with no newline is returned as is.
+    func readLine() throws -> String? {
+        while true {
+            if let newline = buffered.firstIndex(of: 0x0a) {
+                let line = buffered[buffered.startIndex..<newline]
+                buffered.removeSubrange(buffered.startIndex...newline)
+                return String(decoding: line, as: UTF8.self)
+            }
+            guard let chunk = try readRaw() else {
+                if buffered.isEmpty { return nil }
+                defer { buffered.removeAll() }
+                return String(decoding: buffered, as: UTF8.self)
+            }
+            buffered.append(chunk)
+        }
+    }
+
+    /// Exactly `n` bytes, or nil if the peer closes first.
+    func readExactly(_ n: Int) throws -> Data? {
+        while buffered.count < n {
+            guard let chunk = try readRaw(max: max(65536, n - buffered.count)) else { return nil }
+            buffered.append(chunk)
+        }
+        let out = Data(buffered.prefix(n))
+        buffered.removeFirst(n)
+        return out
+    }
+
+    /// `json` serialised (sorted keys, so it's reproducible) plus a newline.
+    func writeLine(_ json: Any) throws {
+        var data = try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys])
+        data.append(0x0a)
+        try write(data)
+    }
+
+    private var buffered = Data()
+
+    private func readRaw(max: Int = 65536) throws -> Data? {
         var buf = [UInt8](repeating: 0, count: max)
         while true {
             let n = Darwin.read(fd, &buf, max)
@@ -277,6 +324,55 @@ final class SocketBox: @unchecked Sendable {
             return socket
         }
         sock?.shutdownBoth()
+    }
+}
+
+/// A newline-delimited connection kept open both ways: berth's control
+/// socket after a request that streams (`display`, docs/display-protocol.md).
+/// A thread of its own reads lines into `lines`, as `UnixHTTP.stream` does
+/// for bodies; writes go out in order on a serial queue, so a caller on the
+/// main thread never waits on the socket.
+final class LineStream: @unchecked Sendable {
+    let lines: AsyncThrowingStream<String, Error>
+    private let sock: UnixSocket
+    private let writes = DispatchQueue(label: "dev.berth.linestream.write")
+    private let lock = NSLock()
+    private var cancelled = false
+
+    /// Takes over `sock`, which has already sent its request.
+    init(_ sock: UnixSocket) {
+        self.sock = sock
+        var continuation: AsyncThrowingStream<String, Error>.Continuation!
+        lines = AsyncThrowingStream { continuation = $0 }
+        let cont = continuation!
+        cont.onTermination = { [weak self] _ in self?.cancel() }
+        Thread.detachNewThread {
+            do {
+                while let line = try sock.readLine() { cont.yield(line) }
+                cont.finish()
+            } catch {
+                // A read failing because we shut the socket down is a close.
+                cont.finish(throwing: self.isCancelled ? nil : error)
+            }
+        }
+    }
+
+    private var isCancelled: Bool { lock.withLock { cancelled } }
+
+    /// Queues one line; errors (a closed peer) surface on `lines` instead.
+    func send(_ line: String) {
+        let data = Data((line + "\n").utf8)
+        writes.async { [sock] in try? sock.write(data) }
+    }
+
+    /// Waits for the queued writes, then closes both ways; the reader ends.
+    func cancel() {
+        let first = lock.withLock {
+            defer { cancelled = true }
+            return !cancelled
+        }
+        guard first else { return }
+        writes.async { [sock] in sock.shutdownBoth() }
     }
 }
 

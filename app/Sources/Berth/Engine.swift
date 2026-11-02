@@ -88,6 +88,21 @@ enum Control {
             return try JSONDecoder().decode(T.self, from: data)
         }
     }
+
+    /// A request whose connection stays open (`{"cmd":"display",…}`): the
+    /// whole JSON object goes out as one line, and the reply line and what
+    /// follows arrive on the stream's `lines`. Blocks while connecting, so
+    /// call it off the main thread. The daemon sends a keepalive after a
+    /// second with nothing else, so 10 s of silence is a hung daemon: the
+    /// read fails and `lines` ends. The same bound on writes keeps a daemon
+    /// that stops reading input from holding the stream's writer (and its
+    /// close, queued behind it) forever.
+    static func open(_ obj: [String: Any], socketPath: String = BerthPaths.controlSocket,
+                     timeout: TimeInterval = 10) throws -> LineStream {
+        let sock = try UnixSocket(path: socketPath, timeout: timeout)
+        try sock.writeLine(obj)
+        return LineStream(sock)
+    }
 }
 
 struct BerthConfig: Codable, Equatable {
