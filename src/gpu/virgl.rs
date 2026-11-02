@@ -34,8 +34,9 @@
 //!   `create_fence` / `context_create_fence`, reported by `write_fence` /
 //!   `write_context_fence` from `virgl_renderer_poll` on the worker.
 //! - **Scanout.** A 3D resource on a scanout is a GL texture in ANGLE, read
-//!   back with `transfer_read_iov` on SET_SCANOUT and RESOURCE_FLUSH
-//!   (server.rs). Later, without a copy: ANGLE's
+//!   back on SET_SCANOUT and RESOURCE_FLUSH (server.rs), through a pixel
+//!   buffer on the GPU (virgl_readback.rs), else `transfer_read_iov`.
+//!   Later, without a copy: ANGLE's
 //!   `EGL_ANGLE_iosurface_client_buffer` wraps an IOSurface as a pbuffer,
 //!   and blitting the texture into it gives an IOSurface a CAMetalLayer
 //!   shows directly.
@@ -137,6 +138,9 @@ mod proxy {
             self.0
         }
     }
+
+    /// `BERTH_GPU_PBO=0` reads scanouts back with `transfer_read_iov` only.
+    static FAST_READBACK: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("BERTH_GPU_PBO").map_or(true, |v| v != "0"));
 
     pub struct VirglBackend {
         worker: &'static VirglWorker,
@@ -306,6 +310,10 @@ mod proxy {
         fn read_back(&mut self, res: u32, rect: Rect, dst: &mut [u8], stride: usize) -> Result<(), i32> {
             let (p, len) = (Ptr(dst.as_mut_ptr()), dst.len());
             self.on(move |_| unsafe {
+                // On the GPU through a pixel buffer when it can (virgl_readback.rs).
+                if *FAST_READBACK && crate::gpu::virgl_readback::read_back(res, rect, std::slice::from_raw_parts_mut(p.get(), len), stride) {
+                    return Ok(());
+                }
                 let mut iov = libc::iovec { iov_base: p.get().cast(), iov_len: len };
                 let mut b = ffi::virgl_box { x: rect.x, y: rect.y, z: 0, w: rect.width, h: rect.height, d: 1 };
                 check(ffi::virgl_renderer_transfer_read_iov(res, 0, 0, stride as u32, 0, &mut b, 0, &mut iov, 1))
@@ -741,6 +749,45 @@ mod tests {
             backing.fill(0);
             b.transfer_from_host_3d(ctx, &t).unwrap();
             assert!(backing == pattern, "the texture came back changed");
+            b.detach_iov(res);
+            b.resource_unref(res);
+            b.ctx_destroy(ctx);
+        }
+
+        /// The scanout readback through a pixel buffer gives what vrend's
+        /// transfer does, whole or in part, for a bottom-up texture.
+        #[test]
+        #[ignore = "needs ANGLE and virglrenderer built (bench/spikes/gpu, S2)"]
+        fn pbo_readback_matches_the_transfer() {
+            use std::sync::atomic::Ordering;
+            let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            let (mut b, _rx) = backend();
+            let (ctx, res) = (104, 1004);
+            b.ctx_create(ctx, capset::VIRGL2, b"pbo").unwrap();
+            b.resource_create_3d(&Create3d { flags: 0, ..texture(res) }).unwrap();
+            b.ctx_attach_resource(ctx, res);
+            let mut backing: Vec<u8> = (0..64 * 64 * 4).map(|i| (i * 7 % 251) as u8).collect();
+            b.attach_iov(res, &[(backing.as_mut_ptr(), backing.len())]).unwrap();
+            let all = Transfer3d { box_: Box3d { x: 0, y: 0, z: 0, w: 64, h: 64, d: 1 }, resource_id: res, stride: 256, ..Default::default() };
+            b.transfer_to_host_3d(ctx, &all).unwrap();
+            for rect in [Rect::new(0, 0, 64, 64), Rect::new(5, 7, 20, 9)] {
+                backing.fill(0);
+                let t = Transfer3d {
+                    box_: Box3d { x: rect.x, y: rect.y, z: 0, w: rect.width, h: rect.height, d: 1 },
+                    offset: (rect.y * 256 + rect.x * 4) as u64,
+                    ..all
+                };
+                b.transfer_from_host_3d(ctx, &t).unwrap();
+                let at = (rect.y * 256 + rect.x * 4) as usize;
+                let before = crate::gpu::virgl_readback::READS.load(Ordering::Relaxed);
+                let mut px = vec![0u8; backing.len() - at];
+                b.read_back(res, rect, &mut px, 256).unwrap();
+                assert_eq!(crate::gpu::virgl_readback::READS.load(Ordering::Relaxed), before + 1, "through the pixel buffer");
+                for y in 0..rect.height as usize {
+                    let n = rect.width as usize * 4;
+                    assert_eq!(&px[y * 256..][..n], &backing[at + y * 256..][..n], "{rect:?}, row {y}");
+                }
+            }
             b.detach_iov(res);
             b.resource_unref(res);
             b.ctx_destroy(ctx);

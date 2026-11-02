@@ -35,6 +35,8 @@ pub mod protocol;
 pub mod server;
 pub mod virgl;
 #[cfg(feature = "virgl")]
+pub mod virgl_readback;
+#[cfg(feature = "virgl")]
 pub mod virgl_thread;
 
 use objc2::rc::Retained;
