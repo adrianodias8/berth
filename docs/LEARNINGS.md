@@ -133,9 +133,15 @@ something here stops being true, fix it.
     0.57 wants `start-hyprland`; Omarchy v4's lua config finds itself
     through `OMARCHY_PATH` (default `/usr/share/omarchy`, where its own
     installer puts it) and its scripts on PATH. With those, Omarchy's bar
-    comes up. Its terminal binding needs Alacritty or Ghostty, which
-    berth's partial install doesn't add, and its launcher (walker) can
-    grab the keyboard from `berth gui` input (open question).
+    comes up. Its terminal binding runs `uwsm-app -- xdg-terminal-exec`:
+    xdg-terminal-exec has to be installed (it picks foot from
+    `~/.config/xdg-terminals.list`), and uwsm-app needs a systemd user
+    manager on `$XDG_RUNTIME_DIR/bus`, which berth's private session runtime
+    folder doesn't have, so it fails silently (berth puts a stand-in that
+    runs the app on the session's PATH). Omarchy's configs (foot's, the
+    wallpaper) include `~/.local/state/omarchy/current/theme`, which only
+    `omarchy-theme-set` makes. Its launcher (walker) can grab the keyboard
+    from `berth gui` input (open question).
 
 - **Rosetta's translation cache isn't worth it here (measured 2026-10-24).**
   `VZLinuxRosettaUnixSocketCachingOptions` plus `rosettad daemon` in the

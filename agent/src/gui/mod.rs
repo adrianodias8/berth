@@ -552,8 +552,9 @@ fn now() -> String {
 // ---- Scripts run in the machine ----
 
 /// Environment for programs in a session: toolkits on Wayland (X11 apps
-/// through Xwayland) with their accessibility exposed over AT-SPI.
-const APP_ENV: &str = "export XDG_SESSION_TYPE=wayland GDK_BACKEND=wayland,x11 QT_QPA_PLATFORM='wayland;xcb' MOZ_ENABLE_WAYLAND=1 \
+/// through Xwayland) with their accessibility exposed over AT-SPI, and a
+/// UTF-8 locale when the machine sets none.
+const APP_ENV: &str = "export LANG=${LANG:-C.UTF-8}; export XDG_SESSION_TYPE=wayland GDK_BACKEND=wayland,x11 QT_QPA_PLATFORM='wayland;xcb' MOZ_ENABLE_WAYLAND=1 \
      ELECTRON_OZONE_PLATFORM_HINT=auto SDL_VIDEODRIVER=wayland,x11 \
      GTK_A11Y=atspi NO_AT_BRIDGE=0 GNOME_ACCESSIBILITY=1 QT_ACCESSIBILITY=1 QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 ACCESSIBILITY_ENABLED=1; ";
 
@@ -639,11 +640,24 @@ fn launcher_desktop(id: &str, desktop: install::Desktop, renderer: Renderer) -> 
             let omarchy = "[ -d \"$HOME/.local/share/omarchy\" ] && export OMARCHY_PATH=\"$HOME/.local/share/omarchy\" PATH=\"$HOME/.local/share/omarchy/bin:$PATH\"; ";
             let env = format!("{seat}export AQ_DRM_DEVICES={} XDG_CURRENT_DESKTOP=Hyprland{software}; {omarchy}", install::CARD_NODE);
             // start-hyprland (Hyprland 0.57+) is its supported way in.
-            let run = if desktop.uwsm { "uwsm start -- hyprland.desktop" } else { "$(command -v start-hyprland || echo Hyprland)" };
+            // Without uwsm there's no systemd user manager for Omarchy's
+            // `uwsm-app -- app` launches (its terminal, its menus' apps), so
+            // a stand-in first on PATH runs the app itself.
+            let (env, run) = if desktop.uwsm {
+                (env, "uwsm start -- hyprland.desktop")
+            } else {
+                (format!("{env}{UWSM_APP_SHIM}"), "$(command -v start-hyprland || echo Hyprland)")
+            };
             launch_script(id, &env, run)
         }
     }
 }
+
+/// `uwsm-app [options] -- cmd…` as `cmd…` (`$RT` is the session's runtime
+/// folder); without `--`, the arguments run as they are.
+const UWSM_APP_SHIM: &str = "mkdir -p $RT/bin; printf '%s\\n' '#!/bin/sh' \
+     'for a; do if [ \"$a\" = -- ]; then while [ \"$1\" != -- ]; do shift; done; shift; break; fi; done' \
+     'exec \"$@\"' > $RT/bin/uwsm-app; chmod +x $RT/bin/uwsm-app; export PATH=\"$RT/bin:$PATH\"; ";
 
 /// The script that waits for a compositor: up when its Wayland socket and
 /// its IPC socket (sway's or Hyprland's; cage has none) are there, failed
@@ -1505,6 +1519,21 @@ mod tests {
     }
 
     #[test]
+    fn uwsm_app_shim_runs_the_app() {
+        let rt = std::env::temp_dir().join(format!("berth-uwsm-shim-{}", std::process::id()));
+        std::fs::create_dir_all(&rt).unwrap();
+        let run = |args: &str| {
+            let script = format!("RT={}; {UWSM_APP_SHIM} uwsm-app {args}", rt.display());
+            let out = std::process::Command::new("sh").arg("-c").arg(script).output().unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(run("-- echo a -- 'b c'"), "a -- b c\n");
+        assert_eq!(run("-s a -t scope -- echo hi"), "hi\n");
+        assert_eq!(run("echo plain"), "plain\n");
+        let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    #[test]
     fn desktop_launchers() {
         let sway = install::Desktop { flavour: Flavour::Sway, uwsm: false };
         let l = launcher_desktop("s-1", sway, Renderer::Gles2);
@@ -1520,11 +1549,14 @@ mod tests {
             assert!(l.contains("XDG_SESSION_TYPE=wayland") && l.contains("XDG_CURRENT_DESKTOP=Hyprland"), "{l}");
             assert!(!l.contains("WLR_BACKENDS") && !l.contains("LIBGL_ALWAYS_SOFTWARE"), "{l}");
             assert!(l.contains("dbus-daemon --session"), "{l}");
-            let exec = if uwsm { "exec uwsm start -- hyprland.desktop >" } else { "exec Hyprland >" };
+            let exec = if uwsm { "exec uwsm start -- hyprland.desktop >" } else { "exec $(command -v start-hyprland || echo Hyprland) >" };
             assert!(l.contains(exec), "{l}");
         }
         let l = launcher_desktop("s-1", install::Desktop { flavour: Flavour::Hyprland, uwsm: false }, Renderer::Software);
         assert!(l.contains("LIBGL_ALWAYS_SOFTWARE=1"), "{l}");
+        assert!(l.contains("$RT/bin/uwsm-app") && l.find("uwsm-app").unwrap() > l.find("omarchy/bin").unwrap(), "the stand-in comes first on PATH: {l}");
+        let l = launcher_desktop("s-1", install::Desktop { flavour: Flavour::Hyprland, uwsm: true }, Renderer::Gles2);
+        assert!(!l.contains("$RT/bin/uwsm-app"), "uwsm's own: {l}");
     }
 
     #[test]

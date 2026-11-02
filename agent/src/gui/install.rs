@@ -23,6 +23,9 @@ pub const OMARCHY_VERSION: &str = "v4.0.6";
 /// the Omarchy step instead of installing something unreviewed.
 pub const OMARCHY_COMMIT: &str = "237f1b4071a0bff2296c6d740ba2b9fd695ebfa0";
 const OMARCHY_REPO: &str = "https://github.com/basecamp/omarchy.git";
+/// The theme its installer starts with: its configs (foot's, Hyprland's,
+/// the bar's) include the current theme's files, and the wallpaper is one.
+const OMARCHY_THEME: &str = "Tokyo Night";
 
 /// The render node a GPU-backed VM has; machines get it bound in when it
 /// exists in the VM.
@@ -168,6 +171,8 @@ const OMARCHY_CORE: &[&str] = &[
     "hyprpicker",
     "hyprsunset",
     "uwsm",
+    // Omarchy's terminal binding (Super+Return) goes through it.
+    "xdg-terminal-exec",
     "quickshell",
     "xdg-desktop-portal-hyprland",
     "xdg-desktop-portal-gtk",
@@ -216,7 +221,9 @@ pub fn omarchy_script(user: &str) -> String {
            su {user} -c 'git -c advice.detachedHead=false clone -q --depth 1 --branch {OMARCHY_VERSION} {OMARCHY_REPO} ~/.local/share/omarchy && \
              {{ [ \"$(git -C ~/.local/share/omarchy rev-parse HEAD)\" = {OMARCHY_COMMIT} ] || \
                {{ echo \"omarchy {OMARCHY_VERSION} is not commit {OMARCHY_COMMIT}\"; rm -rf ~/.local/share/omarchy; false; }}; }} && \
-             mkdir -p ~/.config && cp -rn ~/.local/share/omarchy/config/. ~/.config/' && \
+             mkdir -p ~/.config && cp -rn ~/.local/share/omarchy/config/. ~/.config/ && \
+             {{ [ -e ~/.local/state/omarchy/current/theme ] || OMARCHY_PATH=~/.local/share/omarchy PATH=~/.local/share/omarchy/bin:$PATH \
+               timeout 120 omarchy-theme-set \"{OMARCHY_THEME}\" || true; }}' && \
            echo \"omarchy {OMARCHY_VERSION} configured for {user}\"; }} >>/var/log/berth-omarchy.log 2>&1 || \
          echo 'berth: Omarchy setup failed; see /var/log/berth-omarchy.log in the machine' >&2; true",
         install_script(Family::Arch, OMARCHY_CORE).replacen("set -e; ", "", 1)
@@ -418,6 +425,8 @@ mod tests {
         assert!(scripts("ID=fedora", "kde", "dev").is_err());
         assert!(omarchy_script("dev").contains("--branch v4.0.6"));
         assert!(omarchy_script("dev").contains("'seatd'"));
+        assert!(omarchy_script("dev").contains("'xdg-terminal-exec'"));
+        assert!(omarchy_script("dev").contains("omarchy-theme-set \"Tokyo Night\""));
     }
 
     #[test]
