@@ -150,6 +150,19 @@ something here stops being true, fix it.
     guest's commands up: 41 fps, berth at 97% CPU. Reading into a PBO from
     a context in vrend's share group (src/gpu/virgl_readback.rs) has the GPU
     copy it: 95 fps at 24%.
+  - Games in the guest (measured 2026-11-02, Arch ARM machine, Mesa 26.2
+    virgl on ANGLE): OpenGL 2.1 compatibility (no core profile), GLES 2.0
+    (3.0 with `MESA_GLES_VERSION_OVERRIDE`), no Vulkan device (Venus isn't
+    there). glmark2-es2 fullscreen 1080p scores 1259. SuperTux runs;
+    Luanti runs on its `opengl` (GL 2) driver, not its default `opengl3`;
+    SuperTuxKart's `--benchmark` race holds 49-51 fps on ES 2.0 (reduced
+    graphics) and on its ES 3.0 path with the override. Games that need GL
+    3.3+ core or Vulkan won't start. No sound device either.
+  - Hyprland advertises only XR24 through linux-dmabuf (Mesa imports 63
+    formats, AR24 included; sway advertises them all), so Mesa's Wayland
+    EGL offers no config with alpha: glmark2's default and Luanti's SDL
+    window fail with EGL_BAD_MATCH there. Through XWayland
+    (`SDL_VIDEODRIVER=x11`) they run on the Omarchy desktop.
 
 - **Rosetta's translation cache isn't worth it here (measured 2026-10-24).**
   `VZLinuxRosettaUnixSocketCachingOptions` plus `rosettad daemon` in the
