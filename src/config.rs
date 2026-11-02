@@ -98,7 +98,7 @@ pub fn set(paths: &Paths, key: &str, value: &str) -> Result<()> {
     let mut config = load(paths)?;
     config.insert(key.to_string(), parsed);
     save(paths, &config)?;
-    println!("{key} = {value}; applies on the next start (berth restart)");
+    println!("{key} = {value}; {}", applies(key));
     Ok(())
 }
 
@@ -106,9 +106,17 @@ pub fn unset(paths: &Paths, key: &str) -> Result<()> {
     let mut config = load(paths)?;
     if config.remove(key).is_some() {
         save(paths, &config)?;
-        println!("{key} is back to its default; applies on the next start (berth restart)");
+        println!("{key} is back to its default; {}", applies(key));
     }
     Ok(())
+}
+
+/// ports.rs reads `ports` each time it opens a forward, so it needs no restart.
+fn applies(key: &str) -> &'static str {
+    match key {
+        "ports" => "applies to new forwards right away",
+        _ => "applies on the next start (berth restart)",
+    }
 }
 
 #[cfg(test)]

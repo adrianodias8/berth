@@ -118,30 +118,34 @@ pub fn nerdctl_enabled() -> bool {
 }
 
 fn nerdctl_json(args: &[&str]) -> Vec<serde_json::Value> {
+    try_nerdctl_json(args).unwrap_or_default()
+}
+
+fn try_nerdctl_json(args: &[&str]) -> Option<Vec<serde_json::Value>> {
     Command::new("/usr/local/bin/nerdctl")
         .args(args)
         .output()
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| serde_json::from_slice(&o.stdout).ok())
-        .unwrap_or_default()
 }
 
 /// Running nerdctl containers in the shape of Docker's `/containers/json`, so
 /// domains, routes and port forwarding treat them like Docker's. nerdctl has
-/// no API socket, but its `inspect` output is Docker-compatible.
-pub fn nerdctl_containers() -> Vec<serde_json::Value> {
+/// no API socket, but its `inspect` output is Docker-compatible. None when
+/// asking failed (sent as `null`, so the host keeps the ports it had).
+pub fn nerdctl_containers() -> Option<Vec<serde_json::Value>> {
     if !nerdctl_enabled() {
-        return Vec::new();
+        return Some(Vec::new());
     }
-    let ids = sh("/usr/local/bin/nerdctl ps -q").unwrap_or_default();
+    let ids = sh("/usr/local/bin/nerdctl ps -q").ok()?;
     let ids: Vec<&str> = ids.split_whitespace().collect();
     if ids.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
     let mut args = vec!["inspect"];
     args.extend(ids);
-    nerdctl_json(&args).iter().map(as_list_entry).collect()
+    Some(try_nerdctl_json(&args)?.iter().map(as_list_entry).collect())
 }
 
 fn as_list_entry(d: &serde_json::Value) -> serde_json::Value {

@@ -23,6 +23,12 @@ struct BerthApp: App {
                 .keyboardShortcut("s", modifiers: [.command, .shift])
                 Button("Check for Updates…") { updater.checkInteractively(engine: engine) }
             }
+            SectionCommands()
+            CommandGroup(after: .toolbar) {
+                Button("Refresh") { Task { await engine.refreshAll() } }
+                    .keyboardShortcut("r")
+                    .disabled(!engine.isRunning)
+            }
         }
 
         MenuBarExtra {
@@ -38,6 +44,26 @@ struct BerthApp: App {
             SettingsView()
                 .environmentObject(engine)
                 .environmentObject(updater)
+        }
+    }
+}
+
+/// View > Containers… with ⌘1, ⌘2, …, from anywhere (the menu bar panel too).
+struct SectionCommands: Commands {
+    @AppStorage("selectedSection") private var section: Section = .containers
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandGroup(before: .sidebar) {
+            ForEach(Array(Section.allCases.enumerated()), id: \.element) { i, s in
+                Button(s.rawValue) {
+                    section = s
+                    openWindow(id: "main")
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+                .keyboardShortcut(KeyEquivalent(Character("\(i + 1)")))
+            }
+            Divider()
         }
     }
 }
@@ -166,23 +192,23 @@ struct MenuContainerRow: View {
 
     var body: some View {
         HStack {
-            Circle().fill(container.isRunning ? .green : .gray).frame(width: 6, height: 6)
+            StatusDot(running: container.isRunning, size: 6)
             Text(container.name).lineLimit(1)
             Spacer()
             if container.isRunning {
                 if let url = webURL(for: container) {
                     Button { NSWorkspace.shared.open(url) } label: { Image(systemName: "safari") }
-                        .buttonStyle(.borderless).help("Open \(url.absoluteString)")
+                        .buttonStyle(.borderless).help("Open \(url.absoluteString)").accessibilityLabel("Open in Browser")
                 }
                 Button { engine.perform("Stop") { try await Docker.stop(container.id) } } label: {
                     Image(systemName: "stop.fill")
                 }
-                .buttonStyle(.borderless).help("Stop")
+                .buttonStyle(.borderless).help("Stop").accessibilityLabel("Stop")
             } else {
                 Button { engine.perform("Start") { try await Docker.start(container.id) } } label: {
                     Image(systemName: "play.fill")
                 }
-                .buttonStyle(.borderless).help("Start")
+                .buttonStyle(.borderless).help("Start").accessibilityLabel("Start")
             }
         }
         .font(.callout)

@@ -123,7 +123,8 @@ pub fn get_from(socket: &str, path: &str) -> io::Result<BufReader<UnixStream>> {
 }
 
 /// Podman's running containers as its Docker-compatible API lists them,
-/// for the host's port forwarding; `[]` without asking when it has none.
+/// for the host's port forwarding; `[]` without asking when it has none,
+/// `null` when asking failed (so the host keeps the ports it had).
 pub fn podman_containers() -> String {
     if !crate::engines::podman_running() {
         return "[]".into();
@@ -131,7 +132,7 @@ pub fn podman_containers() -> String {
     let mut body = String::new();
     match get_bounded(crate::engines::PODMAN_SOCKET, "/containers/json").and_then(|mut r| r.read_to_string(&mut body)) {
         Ok(_) => body,
-        Err(_) => "[]".into(),
+        Err(_) => "null".into(),
     }
 }
 
@@ -163,7 +164,7 @@ fn list<T: serde::de::DeserializeOwned>(path: &str) -> io::Result<Vec<T>> {
 
 pub fn containers() -> io::Result<Vec<Container>> {
     let mut all: Vec<Container> = list("/containers/json")?;
-    all.extend(crate::engines::nerdctl_containers().into_iter().filter_map(|c| serde_json::from_value(c).ok()));
+    all.extend(crate::engines::nerdctl_containers().into_iter().flatten().filter_map(|c| serde_json::from_value(c).ok()));
     Ok(all)
 }
 

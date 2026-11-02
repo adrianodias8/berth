@@ -60,7 +60,7 @@ struct MachinesView: View {
                 SwiftUI.Section("Machines") {
                     ForEach(machines) { m in
                         HStack {
-                            Circle().fill(m.isRunning ? .green : .gray).frame(width: 7, height: 7)
+                            StatusDot(running: m.isRunning, size: 7)
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(m.name).fontWeight(.medium)
                                 Text(m.os).font(.caption).foregroundStyle(.secondary).lineLimit(1)

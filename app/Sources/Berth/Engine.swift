@@ -224,9 +224,12 @@ final class Engine: ObservableObject {
     private var startInFlight = false
     private var stopInFlight = false
     private var stopFailed = false
+    /// `berth restart` hasn't exited: the daemon going away and coming back
+    /// is part of it, not a stop.
+    private var restartInFlight = false
 
     func start() {
-        guard state != .starting, state != .running else { return }
+        guard !restartInFlight, state != .starting, state != .running else { return }
         state = .starting
         lastError = nil
         startInFlight = true
@@ -267,11 +270,11 @@ final class Engine: ObservableObject {
         guard state == .running || state == .starting else { return }
         state = .starting
         lastError = nil
-        startInFlight = true
+        restartInFlight = true
         Task.detached {
             let result = await offPool { Engine.run([BerthPaths.cli, "restart"]) }
             await MainActor.run {
-                self.startInFlight = false
+                self.restartInFlight = false
                 if result.code != 0 {
                     self.state = .failed(result.output.trimmingCharacters(in: .whitespacesAndNewlines))
                     self.lastError = result.output
@@ -301,6 +304,11 @@ final class Engine: ObservableObject {
         let new: BerthStatus? = try? await Control.request("status")
         if new != status { status = new }
         switch (new, state) {
+        case (_, _) where restartInFlight:
+            // Stay "Starting…" through the stop half (and don't promote the
+            // old daemon before it goes); the poll after it returns does.
+            state = .starting
+            if new == nil, eventsTask != nil { clearLists() }
         case (nil, .stopping), (nil, .running):
             state = .stopped
             clearLists()
@@ -342,7 +350,11 @@ final class Engine: ObservableObject {
     private func startEvents() {
         eventsTask?.cancel()
         eventsTask = Task { [weak self] in
+            var reconnect = false
             while !Task.isCancelled {
+                // Changes made while the stream was down came with no event.
+                if reconnect { self?.scheduleRefresh() }
+                reconnect = true
                 do {
                     for try await _ in Docker.events() { self?.scheduleRefresh() }
                 } catch {}

@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/images/icon.png" alt="Berth app icon" width="128"></p>
+
 # berth
 
 A free, open-source way to run Docker containers on Apple Silicon Macs, in the
@@ -90,8 +92,6 @@ ddev composer create-project drupal/cms
 ddev drush site:install --yes
 open http://drupal-cms.ddev.site
 ```
-
-![Drupal CMS served by DDEV on berth](docs/images/drupal-site.png)
 
 The project's containers show up in the app, grouped by project (see
 [In pictures](#in-pictures)). How fast this runs next to OrbStack is under
@@ -461,7 +461,9 @@ connects there and splices bytes. The daemon follows Docker's event stream to
 open and close host listeners as containers with published ports start and stop.
 
 Host-network containers publish nothing, so the agent watches the guest's own
-socket tables (`/proc/net/tcp*`, `udp*`) every 2 s and keeps the listening
+socket tables (`/proc/net/tcp*`, `udp*`) every 2 s while a host-network
+container runs (every 10 s otherwise, so the first one's servers can take up
+to 10 s) and keeps the listening
 sockets owned by processes in a container cgroup (`docker-<id>.scope` and the
 like), which leaves out sshd, dockerd, k3s and the agent itself. When that set
 changes it asks the daemon to re-sync (a `sync` header on vsock 2401), and the

@@ -96,6 +96,10 @@ final class ExecSession: NSObject, TerminalViewDelegate, @unchecked Sendable {
     private var finished = false
     private weak var view: TerminalView?
     private let writeQueue = DispatchQueue(label: "berth.exec.write")
+    /// Output chunks queued on the main thread but not yet drawn. Bounding
+    /// them makes a flood (`yes`) wait on the socket instead of burying the
+    /// main queue and freezing the app.
+    private let inFlight = DispatchSemaphore(value: 4)
     private var size = (cols: 80, rows: 24)
 
     /// The shell is gone (or never started): show a new one next time.
@@ -157,9 +161,17 @@ final class ExecSession: NSObject, TerminalViewDelegate, @unchecked Sendable {
 
     private func finish() { lock.withLock { finished = true } }
 
+    /// Blocks while too much output is queued, so call it only off the main
+    /// thread. Every queued block signals, view or no view, so the wait always
+    /// ends; after close() the socket is shut and the reader stops.
     private func feed(_ data: Data) {
         let bytes = [UInt8](data)
-        DispatchQueue.main.async { self.view?.feed(byteArray: bytes[...]) }
+        let gate = inFlight
+        gate.wait()
+        DispatchQueue.main.async {
+            self.view?.feed(byteArray: bytes[...])
+            gate.signal()
+        }
     }
 
     private func show(_ text: String) {

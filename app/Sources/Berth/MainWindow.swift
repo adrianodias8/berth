@@ -27,9 +27,9 @@ struct MainWindow: View {
     @EnvironmentObject var engine: Engine
     @AppStorage("onboarded") private var onboarded = false
     @State private var showOnboarding = false
-    // `-openSection Images` etc. on the command line (NSArgumentDomain) picks
-    // the starting screen; handy for scripted screenshots.
-    @State private var section = Section(rawValue: UserDefaults.standard.string(forKey: "openSection") ?? "") ?? .containers
+    // Remembered across launches; `-openSection Images` etc. on the command
+    // line (NSArgumentDomain) overrides it, for scripted screenshots.
+    @AppStorage("selectedSection") private var section: Section = .containers
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
@@ -80,6 +80,7 @@ struct MainWindow: View {
         .sheet(isPresented: $showOnboarding) { OnboardingView() }
         .onAppear {
             if !onboarded { showOnboarding = true }
+            if let s = Section(rawValue: UserDefaults.standard.string(forKey: "openSection") ?? "") { section = s }
             // `-openSettings YES`, with the launch arguments above.
             if UserDefaults.standard.bool(forKey: "openSettings") { openSettings() }
         }
@@ -108,6 +109,7 @@ struct EngineBadge: View {
             .buttonStyle(.borderless)
             .disabled(engine.state == .starting || engine.state == .stopping)
             .help(engine.isRunning ? "Stop Berth" : "Start Berth")
+            .accessibilityLabel(engine.isRunning ? "Stop Berth" : "Start Berth")
         }
         .padding(8)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
@@ -183,7 +185,8 @@ struct FileSharingBanner: View {
                 if note.contains("restart berth to use it") {
                     Button("Restart") { engine.restart() }
                 }
-                Button { dismissed = note } label: { Image(systemName: "xmark") }.buttonStyle(.borderless)
+                Button { dismissed = note } label: { Image(systemName: "xmark") }
+                    .buttonStyle(.borderless).help("Dismiss").accessibilityLabel("Dismiss")
             }
             .padding(10)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
@@ -236,7 +239,8 @@ struct ErrorBanner: View {
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
                 Text(error).lineLimit(2).textSelection(.enabled)
                 Spacer()
-                Button { engine.lastError = nil } label: { Image(systemName: "xmark") }.buttonStyle(.borderless)
+                Button { engine.lastError = nil } label: { Image(systemName: "xmark") }
+                    .buttonStyle(.borderless).help("Dismiss").accessibilityLabel("Dismiss")
             }
             .padding(10)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
@@ -271,9 +275,6 @@ struct ContainersView: View {
         // children's ideal widths, and a long log line pushed it past the window.
         HStack(spacing: 0) {
             List(selection: $selection) {
-                if engine.containers.isEmpty {
-                    EmptyHint(icon: "shippingbox", text: "No containers yet.\nTry: docker run -d -p 8080:80 nginx")
-                }
                 ForEach(groups, id: \.project) { group in
                     if let project = group.project {
                         SwiftUI.Section {
@@ -286,6 +287,14 @@ struct ContainersView: View {
                             ForEach(group.containers) { ContainerRow(container: $0).tag($0.id) }
                         }
                     }
+                }
+            }
+            .overlay {
+                if engine.containers.isEmpty {
+                    ContentUnavailableView("No Containers", systemImage: "shippingbox",
+                                           description: Text("Try: docker run -d -p 8080:80 nginx"))
+                } else if groups.isEmpty {
+                    ContentUnavailableView.search(text: filter)
                 }
             }
             .searchable(text: $filter, placement: .toolbar, prompt: "Filter containers")
@@ -337,6 +346,7 @@ struct ProjectHeader: View {
             }
             .buttonStyle(.borderless)
             .help(anyRunning ? "Stop all in \(project)" : "Start all in \(project)")
+            .accessibilityLabel(anyRunning ? "Stop all in \(project)" : "Start all in \(project)")
         }
     }
 }
@@ -347,7 +357,7 @@ struct ContainerRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Circle().fill(container.isRunning ? .green : .gray.opacity(0.6)).frame(width: 8, height: 8)
+            StatusDot(running: container.isRunning)
             VStack(alignment: .leading, spacing: 2) {
                 Text(container.composeService ?? container.name).fontWeight(.medium).lineLimit(1)
                 Text(container.image).font(.caption).foregroundStyle(.secondary).lineLimit(1)
@@ -372,17 +382,17 @@ struct ContainerActions: View {
             if container.isRunning {
                 if let url = webURL(for: container) {
                     Button { NSWorkspace.shared.open(url) } label: { Image(systemName: "safari") }
-                        .help("Open \(url.absoluteString)")
+                        .help("Open \(url.absoluteString)").accessibilityLabel("Open in Browser")
                 }
                 Button { engine.perform("Stop") { try await Docker.stop(container.id) } } label: {
                     Image(systemName: "stop.fill")
                 }
-                .help("Stop")
+                .help("Stop").accessibilityLabel("Stop")
             } else {
                 Button { engine.perform("Start") { try await Docker.start(container.id) } } label: {
                     Image(systemName: "play.fill")
                 }
-                .help("Start")
+                .help("Start").accessibilityLabel("Start")
             }
         }
         .buttonStyle(.borderless)
@@ -448,5 +458,18 @@ struct EmptyHint: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()
+    }
+}
+
+/// A container's running/stopped dot, named for VoiceOver.
+struct StatusDot: View {
+    let running: Bool
+    var size: CGFloat = 8
+
+    var body: some View {
+        Circle()
+            .fill(running ? Color.green : Color.secondary.opacity(0.5))
+            .frame(width: size, height: size)
+            .accessibilityLabel(running ? "Running" : "Stopped")
     }
 }

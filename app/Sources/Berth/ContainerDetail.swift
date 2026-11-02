@@ -17,7 +17,7 @@ struct ContainerDetail: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(alignment: .firstTextBaseline) {
-                Circle().fill(container.isRunning ? .green : .gray).frame(width: 10, height: 10)
+                StatusDot(running: container.isRunning, size: 10)
                 Text(container.name).font(.title2.weight(.semibold)).textSelection(.enabled)
                 Text(container.status).foregroundStyle(.secondary)
                 Spacer()
@@ -172,10 +172,19 @@ struct LogsView: View {
             let buffer = LogBuffer()
             await withTaskGroup(of: Void.self) { group in
                 group.addTask { @MainActor in
-                    do {
-                        for try await chunk in Docker.logs(containerID) { buffer.pending += chunk }
-                    } catch {
-                        self.error = error.localizedDescription
+                    var since: Date?
+                    while !Task.isCancelled {
+                        do {
+                            for try await chunk in Docker.logs(containerID, since: since) { buffer.pending += chunk }
+                        } catch {
+                            self.error = error.localizedDescription
+                        }
+                        // A quick restart can slip between two list refreshes, so
+                        // `running` never changes and this task isn't re-run:
+                        // re-attach from where the stream ended, keeping the text.
+                        guard running, !Task.isCancelled else { break }
+                        since = Date()
+                        try? await Task.sleep(for: .seconds(1))
                     }
                     buffer.done = true
                 }

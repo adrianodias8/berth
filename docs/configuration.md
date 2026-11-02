@@ -13,7 +13,8 @@ berth config unset cpus         # back to the default
 `berth config set` checks the value (`ipv6` and `finder` also take
 on/off/yes/no). `berth config` keeps keys it doesn't know; the app writes only
 the settings you change. A missing file or key
-means the default. Changes apply on the next start (`berth restart`, or Restart in the app).
+means the default. Changes apply on the next start (`berth restart`, or Restart in the app),
+except `ports`, which applies to new forwards right away.
 
 ```json
 {

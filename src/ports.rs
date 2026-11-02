@@ -9,8 +9,10 @@
 //! loopback only (as OrbStack does): a container server on all interfaces
 //! shouldn't appear on the Mac's LAN unless it's published.
 //!
-//! Syncs run one at a time, coalesced, and failed binds (a port held on the
-//! Mac) are retried every few seconds.
+//! Syncs run one at a time, coalesced (a burst of events, `ddev poweroff`
+//! say, gets one), and failed binds (a port held on the Mac) are retried
+//! every few seconds. So are failed Podman, nerdctl and listener queries,
+//! which keep that source's last answer meanwhile.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -57,6 +59,12 @@ static SYNC: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static PENDING: AtomicBool = AtomicBool::new(false);
 /// The last sync couldn't bind everything.
 static FAILED: AtomicBool = AtomicBool::new(false);
+/// The last sync used a source's previous answer: asking it failed.
+static STALE: AtomicBool = AtomicBool::new(false);
+/// Each guest source's last good answer.
+static LAST_PODMAN: Mutex<Vec<Container>> = Mutex::new(Vec::new());
+static LAST_NERDCTL: Mutex<Vec<Container>> = Mutex::new(Vec::new());
+static LAST_LISTENERS: Mutex<Vec<Listener>> = Mutex::new(Vec::new());
 /// What the last sync couldn't bind, and why.
 static UNAVAILABLE: Mutex<BTreeMap<Key, Unavailable>> = Mutex::new(BTreeMap::new());
 
@@ -66,9 +74,15 @@ struct Unavailable {
     needs_helper: bool,
 }
 const RETRY: Duration = Duration::from_secs(5);
+/// Events this close together are one burst, synced once.
+const SETTLE: Duration = Duration::from_millis(100);
+/// But a steady stream still syncs this often.
+const MAX_SETTLE: Duration = Duration::from_secs(1);
+/// A guest query that takes longer has failed.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A listening socket of a host-network container, as the agent reports it.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Clone, Debug)]
 struct Listener {
     proto: String,
     port: u16,
@@ -110,7 +124,7 @@ fn plan(published: Vec<Key>, listeners: &[Listener]) -> BTreeMap<Key, Route> {
 /// container start/die/pause/unpause and any network event.
 const EVENTS_PATH: &str = "/events?filters=%7B%22type%22%3A%5B%22container%22%2C%22network%22%5D%2C%22event%22%3A%5B%22start%22%2C%22die%22%2C%22pause%22%2C%22unpause%22%2C%22create%22%2C%22destroy%22%2C%22connect%22%2C%22disconnect%22%5D%7D";
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Container {
     #[serde(rename = "Ports", default)]
     ports: Vec<Port>,
@@ -118,7 +132,7 @@ struct Container {
     mounts: Vec<Mount>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Mount {
     #[serde(rename = "Type", default)]
     kind: String,
@@ -126,7 +140,7 @@ struct Mount {
     source: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Port {
     #[serde(rename = "IP", default)]
     ip: String,
@@ -171,7 +185,7 @@ pub async fn run() {
     tokio::spawn(async {
         loop {
             tokio::time::sleep(RETRY).await;
-            if FAILED.load(Ordering::SeqCst) {
+            if FAILED.load(Ordering::SeqCst) || STALE.load(Ordering::SeqCst) {
                 let _ = sync().await;
             }
         }
@@ -194,9 +208,28 @@ async fn watch(synced: &mut bool) -> Result<()> {
     sync().await?;
     *synced = true;
     while events.next_line().await?.is_some() {
+        let ended = settle(&mut events).await?;
         sync().await?;
+        if ended {
+            break;
+        }
     }
     bail!("docker event stream ended");
+}
+
+/// Read the rest of a burst: events until SETTLE passes without one (or
+/// MAX_SETTLE in all). True if the stream ended.
+async fn settle<R: tokio::io::AsyncBufRead + Unpin>(events: &mut tokio::io::Lines<R>) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + MAX_SETTLE;
+    loop {
+        let wait = SETTLE.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        match tokio::time::timeout(wait, events.next_line()).await {
+            Ok(Ok(Some(_))) => continue,
+            Ok(Ok(None)) => return Ok(true),
+            Ok(Err(err)) => return Err(err.into()),
+            Err(_) => return Ok(false),
+        }
+    }
 }
 
 /// Re-sync now (the agent asks when nerdctl containers change).
@@ -222,36 +255,28 @@ async fn sync_now() -> Result<()> {
     let mut body = String::new();
     docker_get("/containers/json").await?.read_to_string(&mut body).await?;
     let mut containers: Vec<Container> = serde_json::from_str(&body)?;
+    // A guest source that can't be asked keeps its last answer, retried
+    // soon, rather than counting as nothing (which would drop its ports).
+    let mut stale = Vec::new();
     // Podman's Docker-compatible list has the same shape. Through the agent,
     // which asks Podman only when it has containers running (asking starts
     // its service).
-    let mut podman = String::new();
-    if let Ok(mut guest) = guest_stream("info podman").await
-        && guest.read_to_string(&mut podman).await.is_ok()
-        && let Ok(more) = serde_json::from_str::<Vec<Container>>(&podman)
-    {
-        containers.extend(more);
-    }
+    containers.extend(or_last(&LAST_PODMAN, parse_answer(query("info podman").await, false), "podman", &mut stale));
     // nerdctl has no API socket; the agent lists its containers in this shape.
-    let mut nerdctl = String::new();
-    if let Ok(mut guest) = guest_stream("info nerdctl").await
-        && guest.read_to_string(&mut nerdctl).await.is_ok()
-        && let Ok(more) = serde_json::from_str::<Vec<Container>>(&nerdctl)
-    {
-        containers.extend(more);
-    }
+    containers.extend(or_last(&LAST_NERDCTL, parse_answer(query("info nerdctl").await, false), "nerdctl", &mut stale));
 
     // Same event stream drives file-change forwarding for bind mounts.
     let home = crate::paths::Paths::new().home;
     let sources = containers.iter().flat_map(|c| &c.mounts).filter(|m| m.kind == "bind").map(|m| m.source.as_str());
     crate::watch::set_roots(crate::watch::bind_roots(sources, &home));
 
-    // Host-network containers' servers; absent from an older agent.
-    let mut listeners = String::new();
-    if let Ok(mut guest) = guest_stream("info listeners").await {
-        let _ = guest.read_to_string(&mut listeners).await;
+    // Host-network containers' servers; an older agent answers nothing.
+    let listeners = or_last(&LAST_LISTENERS, parse_answer(query("info listeners").await, true), "listeners", &mut stale);
+    // Logged once per streak, like failed binds.
+    if !stale.is_empty() && !STALE.load(Ordering::SeqCst) {
+        eprintln!("ports: couldn't list {} containers; keeping their ports (retrying)", stale.join(", "));
     }
-    let listeners: Vec<Listener> = serde_json::from_str(&listeners).unwrap_or_default();
+    STALE.store(!stale.is_empty(), Ordering::SeqCst);
 
     let mut published: Vec<Key> = containers
         .iter()
@@ -339,6 +364,39 @@ async fn sync_now() -> Result<()> {
     FAILED.store(!unavailable.is_empty(), Ordering::SeqCst);
     *UNAVAILABLE.lock().unwrap() = unavailable;
     Ok(())
+}
+
+/// Ask the agent; None if that failed or timed out.
+async fn query(target: &str) -> Option<String> {
+    let ask = async {
+        let mut body = String::new();
+        guest_stream(target).await?.read_to_string(&mut body).await?;
+        anyhow::Ok(body)
+    };
+    tokio::time::timeout(QUERY_TIMEOUT, ask).await.ok()?.ok()
+}
+
+/// A guest source's list, or None if it couldn't say: no answer, `null`
+/// (the agent couldn't ask the engine) or garbage. An older agent sends
+/// `[]` on failure too, which counts as empty; one without the query at all
+/// answers nothing (`empty_ok`: that means empty).
+fn parse_answer<T: serde::de::DeserializeOwned>(body: Option<String>, empty_ok: bool) -> Option<Vec<T>> {
+    let body = body?;
+    if empty_ok && body.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    serde_json::from_str::<Option<Vec<T>>>(&body).ok().flatten()
+}
+
+/// A fresh answer replaces the source's last one; otherwise the last one
+/// stands, and the source is noted as stale.
+fn or_last<T: Clone>(last: &Mutex<Vec<T>>, fresh: Option<Vec<T>>, source: &'static str, stale: &mut Vec<&'static str>) -> Vec<T> {
+    let mut last = last.lock().unwrap();
+    match fresh {
+        Some(fresh) => *last = fresh,
+        None => stale.push(source),
+    }
+    last.clone()
 }
 
 enum Bound {
@@ -634,5 +692,49 @@ mod tests {
         assert_eq!(published_route("::1").guest, "[::1]");
         // The host-network server on 80 still gets ::1; 8080 is all taken.
         assert_eq!(plan[&("::1", 80, Proto::Tcp)], Route { direct: true, guest: "127.0.0.1" });
+    }
+
+    #[test]
+    fn failed_queries_keep_the_last_answer() {
+        let ok = |body: &str| parse_answer::<Listener>(Some(body.into()), false);
+        assert_eq!(ok("[]").map(|v| v.len()), Some(0));
+        assert_eq!(ok(r#"[{"proto":"tcp","port":80,"bind":"::"}]"#).map(|v| v.len()), Some(1));
+        // The agent couldn't ask, no answer, or garbage: unknown, not empty.
+        assert!(ok("null").is_none());
+        assert!(ok("").is_none());
+        assert!(ok("[{").is_none());
+        assert!(parse_answer::<Listener>(None, true).is_none());
+        // An agent without the query answers nothing: empty.
+        assert_eq!(parse_answer::<Listener>(Some(String::new()), true).map(|v| v.len()), Some(0));
+
+        let last = Mutex::new(Vec::new());
+        let mut stale = Vec::new();
+        assert_eq!(or_last(&last, Some(vec![1, 2]), "podman", &mut stale), vec![1, 2]);
+        assert!(stale.is_empty());
+        assert_eq!(or_last(&last, None, "podman", &mut stale), vec![1, 2]);
+        assert_eq!(stale, vec!["podman"]);
+        let mut stale = Vec::new();
+        assert_eq!(or_last(&last, Some(vec![]), "podman", &mut stale), Vec::<i32>::new());
+        assert!(stale.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_events_is_read_at_once() {
+        let (mut tx, rx) = tokio::io::duplex(4096);
+        let mut events = BufReader::new(rx).lines();
+        tx.write_all(b"die\ndie\ndestroy\n").await.unwrap();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.write_all(b"disconnect\n").await.unwrap();
+            // Past SETTLE: the next burst.
+            tokio::time::sleep(SETTLE * 3).await;
+            tx.write_all(b"start\n").await.unwrap();
+            tx
+        });
+        assert!(events.next_line().await.unwrap().is_some());
+        assert!(!settle(&mut events).await.unwrap());
+        assert_eq!(events.next_line().await.unwrap().as_deref(), Some("start"));
+        drop(writer.await.unwrap());
+        assert!(settle(&mut events).await.unwrap());
     }
 }
