@@ -35,6 +35,11 @@ plist="$app/Contents/Info.plist"
 if [ -n "$identity" ]; then
     # Inner binary first (it needs the virtualization entitlement), then the
     # bundle. Hardened runtime and a secure timestamp: notarization needs both.
+    # A virgl build's dylibs get the same identity: library validation
+    # under the hardened runtime loads only those signed by the same team.
+    for lib in "$app"/Contents/Frameworks/*.dylib; do
+        [ ! -f "$lib" ] || codesign --force --options runtime --timestamp --sign "$identity" "$lib"
+    done
     codesign --force --options runtime --timestamp --sign "$identity" \
         --entitlements "$root/berth.entitlements" "$app/Contents/Helpers/berth"
     codesign --force --options runtime --timestamp --sign "$identity" "$app"
