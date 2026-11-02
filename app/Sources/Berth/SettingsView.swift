@@ -36,13 +36,17 @@ struct SettingsView: View {
     private let hostCPUs = ProcessInfo.processInfo.activeProcessorCount
     private let hostMemoryGiB = Int(ProcessInfo.processInfo.physicalMemory >> 30)
 
+    /// The last tab shown, as macOS Settings windows do; `-settingsTab
+    /// Resources` on the command line picks one, for scripted screenshots.
+    @AppStorage("settingsTab") private var tab = "General"
+
     /// One tab per area, macOS Settings style; each tab is as tall as its form.
     var body: some View {
-        TabView {
-            general.tabItem { Label("General", systemImage: "gearshape") }
-            resources.tabItem { Label("Resources", systemImage: "cpu") }
-            network.tabItem { Label("Network", systemImage: "network") }
-            advanced.tabItem { Label("Advanced", systemImage: "wrench.and.screwdriver") }
+        TabView(selection: $tab) {
+            general.tabItem { Label("General", systemImage: "gearshape") }.tag("General")
+            resources.tabItem { Label("Resources", systemImage: "cpu") }.tag("Resources")
+            network.tabItem { Label("Network", systemImage: "network") }.tag("Network")
+            advanced.tabItem { Label("Advanced", systemImage: "wrench.and.screwdriver") }.tag("Advanced")
         }
         .sheet(isPresented: $showImport) { ImportSheet() }
         .frame(width: 520)
