@@ -204,6 +204,28 @@ final class SurfaceStreamTests: XCTestCase {
         XCTAssertTrue(gaveUp)
     }
 
+    func testASilentDaemonEndsTheLines() async throws {
+        // Connected, request read, then nothing: not even the keepalive.
+        let socketPath = tempSocketPath("hung")
+        let server = try FakeDisplayServer(path: socketPath)
+        let stream = try await offPool {
+            try Control.open(SurfaceStream.request(machine: "dev", source: .session("s"), maxFPS: 60),
+                             socketPath: socketPath, timeout: 0.2)
+        }
+        defer { stream.cancel() }
+        let conn = try await offPool { try server.accept() }
+        _ = await offPool { conn.readLine() }
+        let started = ContinuousClock.now
+        var lines = stream.lines.makeAsyncIterator()
+        do {
+            _ = try await lines.next()
+            XCTFail("a line from a silent daemon")
+        } catch {
+            XCTAssertLessThan(ContinuousClock.now - started, .seconds(2))
+        }
+        withExtendedLifetime(conn) {}
+    }
+
     func testTargetPicksTheSource() {
         XCTAssertEqual(DisplayTarget(target: "linux:dev", session: "s-x").source, .session("s-x"))
         XCTAssertEqual(DisplayTarget(target: "linux:dev", session: "s-d", scanout: 0).source, .scanout(0))

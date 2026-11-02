@@ -24,7 +24,10 @@ final class MetalFrameView: NSView {
     }
 
     var paused = false {
-        didSet { if !paused { needsPresent = true } }
+        didSet {
+            if !paused { needsPresent = true }
+            updateLinkPaused()
+        }
     }
 
     /// Whether Mac input goes to the guest. Set it through `setControlling`.
@@ -42,6 +45,7 @@ final class MetalFrameView: NSView {
     private var linear: MTLSamplerState?
     private var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
     private var link: CADisplayLink?
+    private var occlusion: NSObjectProtocol?
 
     /// The ring `buffer` wraps, held so the mapping outlives the buffer.
     private var bufferRing: Ring?
@@ -90,6 +94,8 @@ final class MetalFrameView: NSView {
         super.viewDidMoveToWindow()
         link?.invalidate()
         link = nil
+        if let occlusion { NotificationCenter.default.removeObserver(occlusion) }
+        occlusion = nil
         guard window != nil else {
             if controlling { setControlling(false) }
             return
@@ -100,6 +106,24 @@ final class MetalFrameView: NSView {
         let link = displayLink(target: self, selector: #selector(tick(_:)))
         link.add(to: .main, forMode: .common)
         self.link = link
+        occlusion = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateLinkPaused() }
+        }
+        updateLinkPaused()
+    }
+
+    /// No ticks at all while paused or hidden, rather than ticks that
+    /// return early.
+    private func updateLinkPaused() {
+        let visible = window?.occlusionState.contains(.visible) ?? false
+        link?.isPaused = paused || !visible
+        if !(link?.isPaused ?? true) { needsPresent = true }
+    }
+
+    deinit {
+        if let occlusion { NotificationCenter.default.removeObserver(occlusion) }
     }
 
     override func viewDidChangeBackingProperties() {
@@ -222,6 +246,9 @@ final class MetalFrameView: NSView {
                           destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
                 blit.endEncoding()
                 cursorUploaded = cursor.seq
+                // The copy reads the ring's mapping, which `buffer` doesn't
+                // own: a resize can drop this Ring before the GPU is done.
+                commands.addCompletedHandler { _ in withExtendedLifetime(ring) {} }
             }
         }
         let pass = MTLRenderPassDescriptor()
