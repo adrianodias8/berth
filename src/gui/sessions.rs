@@ -95,6 +95,15 @@ pub fn find(paths: &Paths, session: &str) -> Result<Option<Record>> {
     Ok(load_sessions(paths, &lock).into_iter().find(|r| r.session == session))
 }
 
+/// The desktop session showing on `machine`'s `scanout`, newest first.
+pub fn desktop_on(paths: &Paths, machine: &str, scanout: u32) -> Option<String> {
+    let lock = lock(paths).ok()?;
+    let target = format!("linux:{machine}");
+    let mut on: Vec<Record> = load_sessions(paths, &lock).into_iter().filter(|r| r.target == target && r.scanout == Some(scanout)).collect();
+    on.sort_by(|a, b| b.started.cmp(&a.started));
+    on.into_iter().next().map(|r| r.session)
+}
+
 /// Mark a session used now (and remember its note).
 pub fn touch(paths: &Paths, session: &str, note: Option<&str>) -> Result<()> {
     let lock = lock(paths)?;

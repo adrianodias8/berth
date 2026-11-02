@@ -599,7 +599,8 @@ async fn display(
     let handle = tokio::runtime::Handle::current();
     let hub = crate::gui::display::hub(move || {
         let log = Box::new(|machine: &str, session: Option<&str>, on: bool| crate::gui::log_control(&Paths::new(), machine, session, on));
-        crate::gui::display::Hub::new(&crate::gpu::frames::SURFACES, Box::new(AgentConnector(handle)), log)
+        let desktop = Box::new(|machine: &str, scanout: u32| crate::gui::sessions::desktop_on(&Paths::new(), machine, scanout));
+        crate::gui::display::Hub::new(&crate::gpu::frames::SURFACES, Box::new(AgentConnector(handle)), log).desktops(desktop)
     });
     std::thread::spawn(move || crate::gui::display::serve(&hub, stream, leftover, req));
     Ok(())

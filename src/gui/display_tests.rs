@@ -370,3 +370,47 @@ fn control_off_releases_and_stops_forwarding() {
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(log.lock().unwrap().iter().map(|l| l.2).collect::<Vec<_>>(), [true, false]);
 }
+
+/// A scanout viewer whose input session is `s-old`, with `desktop` as the
+/// session the records say is on scanout 0 now.
+fn scanout_viewer(desktop: Option<&'static str>) -> (BufReader<UnixStream>, UnixStream, mpsc::Receiver<UnixStream>, Log) {
+    let surfaces = leak();
+    let (tx, rx) = mpsc::channel();
+    let log: Log = Arc::default();
+    let l = log.clone();
+    let write = Box::new(move |m: &str, s: Option<&str>, on: bool| l.lock().unwrap().push((m.into(), s.map(str::to_string), on)));
+    let lookup = Box::new(move |m: &str, n: u32| desktop.filter(|_| m == "dev" && n == 0).map(str::to_string));
+    let hub = Arc::new(Hub::new(surfaces, Box::new(Fake(Mutex::new(tx))), write).desktops(lookup));
+    surfaces.update(&SurfaceKey::Scanout(0), 10, 10, Rect::new(0, 0, 10, 10), |_, _| {});
+    let (view, _) = viewer(&hub, DisplayReq { scanout: Some(0), ..session_req("s-old") });
+    let mut w = view.get_ref().try_clone().unwrap();
+    w.write_all(b"{\"ev\":\"control\",\"on\":true}\n{\"ev\":\"key\",\"code\":30,\"down\":true}\n").unwrap();
+    let (gone, request) = agent(&rx);
+    assert_eq!(request["session"], "s-old");
+    gone.get_ref().write_all(b"{\"ok\":false,\"error\":\"no session s-old in dev\"}\n").unwrap();
+    (view, w, rx, log)
+}
+
+#[test]
+fn scanout_input_follows_the_desktop_session_now_on_it() {
+    let (_view, mut w, rx, log) = scanout_viewer(Some("s-new"));
+    let (mut input, request) = agent(&rx);
+    assert_eq!(request, json!({"v": 1, "session": "s-new", "verb": "input.stream", "args": {}}));
+    input.get_ref().write_all(b"{\"ok\":true}\n").unwrap();
+    assert_eq!(read_line(&mut input).unwrap().unwrap(), "{\"ev\":\"key\",\"code\":30,\"down\":true}", "the line that found it gone");
+    w.write_all(b"{\"ev\":\"key\",\"code\":30,\"down\":false}\n").unwrap();
+    assert_eq!(read_line(&mut input).unwrap().unwrap(), "{\"ev\":\"key\",\"code\":30,\"down\":false}");
+    let sessions: Vec<_> = log.lock().unwrap().iter().map(|l| (l.1.clone().unwrap(), l.2)).collect();
+    assert_eq!(sessions, [("s-old".into(), true), ("s-old".into(), false), ("s-new".into(), true)]);
+}
+
+#[test]
+fn scanout_input_waits_for_a_desktop_session() {
+    let (mut view, mut w, rx, log) = scanout_viewer(None);
+    // The stream goes on, and input is dropped without asking the guest.
+    w.write_all(b"{\"ev\":\"key\",\"code\":30,\"down\":false}\n").unwrap();
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "no input stream while there's no session");
+    assert_eq!(next(&mut view)["ev"], "frame");
+    assert_eq!(next(&mut view)["ev"], "keepalive", "the picture's stream is still open");
+    assert_eq!(log.lock().unwrap().iter().map(|l| l.2).collect::<Vec<_>>(), [true, false]);
+}

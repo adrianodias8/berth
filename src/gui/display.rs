@@ -105,11 +105,15 @@ pub trait GuestConnector: Send + Sync {
 /// Writes one activity-log line for a control toggle.
 pub type ControlLog = Box<dyn Fn(&str, Option<&str>, bool) + Send + Sync>;
 
+/// The desktop session now on a machine's scanout, from the session records.
+pub type DesktopLookup = Box<dyn Fn(&str, u32) -> Option<String> + Send + Sync>;
+
 /// The feeders and input streams of one registry.
 pub struct Hub {
     surfaces: &'static Surfaces,
     connector: Box<dyn GuestConnector>,
     log: ControlLog,
+    desktop: DesktopLookup,
     linger: Duration,
     feeders: Mutex<HashMap<SurfaceKey, Feeder>>,
     inputs: Mutex<HashMap<(String, String), InputPipe>>,
@@ -140,7 +144,14 @@ pub fn hub(make: impl FnOnce() -> Hub) -> Arc<Hub> {
 
 impl Hub {
     pub fn new(surfaces: &'static Surfaces, connector: Box<dyn GuestConnector>, log: ControlLog) -> Hub {
-        Hub { surfaces, connector, log, linger: LINGER, feeders: Mutex::default(), inputs: Mutex::default(), ids: AtomicU64::new(1) }
+        let desktop = Box::new(|_: &str, _: u32| None);
+        Hub { surfaces, connector, log, desktop, linger: LINGER, feeders: Mutex::default(), inputs: Mutex::default(), ids: AtomicU64::new(1) }
+    }
+
+    /// Where a scanout's input goes once the session it named has ended.
+    pub fn desktops(mut self, desktop: DesktopLookup) -> Hub {
+        self.desktop = desktop;
+        self
     }
 
     #[cfg(test)]
@@ -260,26 +271,29 @@ impl Hub {
     }
 
     /// Write one input line to the session's `input.stream`, opening it
-    /// (again, once, if the old one broke).
-    fn send_input(&self, machine: &str, session: &str, line: &str) {
+    /// (again, once, if the old one broke). Err when the guest has no such
+    /// session; other failures drop the line.
+    fn send_input(&self, machine: &str, session: &str, line: &str) -> Result<(), Gone> {
         let mut inputs = self.inputs.lock().unwrap();
         let pipe = inputs.entry((machine.into(), session.into())).or_default();
         for _ in 0..2 {
             if pipe.stream.is_none() {
                 match self.open_input(machine, session) {
                     Ok(s) => pipe.stream = Some(s),
+                    Err(err) if err == format!("no session {session} in {machine}") => return Err(Gone),
                     Err(err) => {
                         eprintln!("display: input for {machine} session {session}: {err}");
-                        return;
+                        return Ok(());
                     }
                 }
             }
             let mut stream = pipe.stream.as_ref().unwrap();
             if stream.write_all(format!("{line}\n").as_bytes()).is_ok() {
-                return;
+                return Ok(());
             }
             pipe.stream = None;
         }
+        Ok(())
     }
 
     fn open_input(&self, machine: &str, session: &str) -> Result<UnixStream, String> {
@@ -292,6 +306,10 @@ impl Hub {
         Ok(stream)
     }
 }
+
+/// The guest has no session by that name (it ended, or the VM restarted).
+#[derive(Debug, PartialEq)]
+struct Gone;
 
 /// Send a stream verb's request line and check its reply line.
 fn open_stream(r: &mut impl BufRead, mut w: &UnixStream, session: &str, verb: &str, args: Value) -> Result<(), String> {
@@ -586,9 +604,16 @@ fn doorbells(surfaces: &Surfaces, key: &SurfaceKey, stream: &UnixStream, seen: &
 }
 
 /// The viewer's input lines, until it hangs up. Control needs a session.
+/// A scanout's input follows the desktop session on it when the one named
+/// has ended (berth restarted the machine's desktop, say); until there is
+/// one, input is dropped and the records looked at once a second.
 fn read_input(hub: &Hub, req: &DisplayReq, key: &SurfaceKey, stream: UnixStream, leftover: Vec<u8>, done: &AtomicBool) {
     let _ = stream.set_read_timeout(None);
     let mut r = BufReader::new(io::Cursor::new(leftover).chain(&stream));
+    let mut session = req.session.clone();
+    // Since when `session` is gone with no desktop to follow, and when the
+    // records were last looked at.
+    let mut orphaned: Option<(String, Instant)> = None;
     let mut control = false;
     let mut dropped = 0u32;
     while let Ok(Some(line)) = read_line(&mut r) {
@@ -598,11 +623,13 @@ fn read_input(hub: &Hub, req: &DisplayReq, key: &SurfaceKey, stream: UnixStream,
         let size = hub.surfaces.info(key).map(|i| (i.width, i.height));
         match check_input(&line, size) {
             Ok(Input::Control(on)) => {
-                if let Some(session) = &req.session
+                if let Some(session) = &session
                     && on != control
                 {
                     control = on;
-                    if on {
+                    if orphaned.is_some() {
+                        // Nobody to give it to yet.
+                    } else if on {
                         hub.take_control(&req.machine, session);
                     } else {
                         hub.release_control(&req.machine, session);
@@ -610,9 +637,38 @@ fn read_input(hub: &Hub, req: &DisplayReq, key: &SurfaceKey, stream: UnixStream,
                 }
             }
             Ok(Input::Event) => {
-                if control && let Some(session) = &req.session {
-                    hub.send_input(&req.machine, session, line.trim());
+                if !control {
+                    continue;
                 }
+                let Some(old) = session.clone() else { continue };
+                if let Some((gone, looked)) = &mut orphaned {
+                    if looked.elapsed() < Duration::from_secs(1) {
+                        continue;
+                    }
+                    *looked = Instant::now();
+                    let Some(new) = req.scanout.and_then(|n| (hub.desktop)(&req.machine, n)).filter(|s| s != gone) else { continue };
+                    eprintln!("display: {key}: input goes to session {new}");
+                    hub.take_control(&req.machine, &new);
+                    session = Some(new);
+                    orphaned = None;
+                } else if hub.send_input(&req.machine, &old, line.trim()).is_ok() {
+                    continue;
+                } else {
+                    hub.release_control(&req.machine, &old);
+                    match req.scanout.and_then(|n| (hub.desktop)(&req.machine, n)).filter(|s| *s != old) {
+                        Some(new) => {
+                            eprintln!("display: {key}: session {old} ended, input goes to {new}");
+                            hub.take_control(&req.machine, &new);
+                            session = Some(new);
+                        }
+                        None => {
+                            eprintln!("display: {key}: session {old} ended, input waits for a desktop session");
+                            orphaned = Some((old, Instant::now()));
+                            continue;
+                        }
+                    }
+                }
+                let _ = hub.send_input(&req.machine, session.as_deref().unwrap(), line.trim());
             }
             Err(err) => {
                 // A misbehaving viewer shouldn't fill the daemon's log.
@@ -623,7 +679,10 @@ fn read_input(hub: &Hub, req: &DisplayReq, key: &SurfaceKey, stream: UnixStream,
             }
         }
     }
-    if control && let Some(session) = &req.session {
+    if control
+        && orphaned.is_none()
+        && let Some(session) = &session
+    {
         hub.release_control(&req.machine, session);
     }
     done.store(true, Ordering::SeqCst);

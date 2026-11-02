@@ -175,7 +175,11 @@ While the viewer has control, the daemon forwards each valid line,
 unchanged, to the session's `input.stream` (one per session, opened on the
 first event and closed when no viewer has control). Lines are dropped while
 it doesn't, without a session, and when invalid (unknown `ev`, a field
-missing or out of range). Giving control back, or hanging up while holding
+missing or out of range). When the guest no longer has the session (it ended, or
+berth restarted the machine), a scanout's input moves to the desktop
+session berth's records now place on that scanout. Until there is one the
+picture goes on, input is dropped, and the records are looked at again at
+most once a second. Giving control back, or hanging up while holding
 it, sends `{"ev":"release_all"}`.
 
 ### Screenshots: once
