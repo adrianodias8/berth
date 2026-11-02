@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/images/icon.png" alt="Berth app icon" width="128"></p>
+
 # berth
 
 A free, open-source way to run Docker containers on Apple Silicon Macs, in the
@@ -90,8 +92,6 @@ ddev composer create-project drupal/cms
 ddev drush site:install --yes
 open http://drupal-cms.ddev.site
 ```
-
-![Drupal CMS served by DDEV on berth](docs/images/drupal-site.png)
 
 The project's containers show up in the app, grouped by project (see
 [In pictures](#in-pictures)). How fast this runs next to OrbStack is under
