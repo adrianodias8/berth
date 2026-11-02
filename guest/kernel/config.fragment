@@ -119,3 +119,28 @@ CONFIG_ZRAM=y
 # Compressed swap in RAM (agent/src/memory.rs), with the fastest compressor.
 CONFIG_ZRAM_BACKEND_LZ4=y
 CONFIG_ZRAM_DEF_COMP_LZ4=y
+
+# The Linux display (src/gpu, "gui": true): virtio-gpu with its KMS side
+# and the fbdev console on it (the first thing that shows on the Mac),
+# dma-bufs between the compositor, the GPU and the capture agent (udmabuf,
+# the system heap, sync files), virtual input for the GUI agent (uinput,
+# read back through evdev), and virtio-sound for PipeWire. Without the
+# device none of it binds; it only makes the kernel bigger. DRM pulls in
+# its helpers (KMS, GEM shmem, the virtio dma-buf glue, DMA_SHARED_BUFFER)
+# through selects; bench/spikes/gpu/s1-bind.sh checks the built config.
+CONFIG_DRM=y
+CONFIG_DRM_VIRTIO_GPU=y
+CONFIG_DRM_VIRTIO_GPU_KMS=y
+CONFIG_DRM_CLIENT_SELECTION=y
+CONFIG_DRM_FBDEV_EMULATION=y
+CONFIG_FRAMEBUFFER_CONSOLE=y
+CONFIG_SYNC_FILE=y
+CONFIG_UDMABUF=y
+CONFIG_DMABUF_HEAPS=y
+CONFIG_DMABUF_HEAPS_SYSTEM=y
+CONFIG_INPUT_EVDEV=y
+CONFIG_INPUT_MISC=y
+CONFIG_INPUT_UINPUT=y
+CONFIG_SOUND=y
+CONFIG_SND=y
+CONFIG_SND_VIRTIO=y

@@ -451,6 +451,8 @@ fn build_config(paths: &Paths, res: &Resources) -> Result<Retained<VZVirtualMach
         }
         config.setDirectorySharingDevices(&NSArray::from_retained_slice(&shares));
         crate::virtiofs::attach(&config, &paths.home, home_share);
+        // The display (berth-gpu), only with "gui": true in config.json.
+        crate::gpu::attach(&config, paths);
 
         // Guest console goes to a log file for debugging.
         let console_fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);

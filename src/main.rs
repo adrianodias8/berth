@@ -7,6 +7,7 @@ mod dockerapi;
 mod engines;
 mod files;
 mod fuse;
+mod gpu;
 mod gui;
 mod gui_log;
 mod helper;
