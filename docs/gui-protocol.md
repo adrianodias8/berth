@@ -23,14 +23,22 @@ That process owns `~/.berth/mac/<name>/`:
 
 **Linux guests.** The host reaches `berth-agent` on vsock 2400 as today (the
 daemon's `connect_vsock`) with the header line `gui <machine>\n`; the agent
-then speaks the protocol below for that machine. The daemon exposes it to
-the CLI as `Request::Gui { target, request }` → `GuiReply`.
+then speaks the protocol below for that machine. The CLI reaches it through
+the daemon's control socket: it sends `{"cmd":"gui","machine":"<machine>"}`
+(`Request::Gui { machine }`), the daemon answers one `GuiReply` line
+(`{"ok":true,"error":null}`, or `ok: false` with why, e.g. the VM isn't
+running), and from then on carries the connection's bytes to and from the
+agent's `gui <machine>` stream unchanged, so the client speaks the messages
+below exactly as it does to a macOS VM's `agent.sock`.
 
 ## Messages
 
-After the transport header, the host sends **one JSON line** and the guest
-answers **one JSON line**, optionally followed by a binary payload of exactly
-`payload_len` bytes. One request per connection.
+After the transport header, the host sends **one JSON line**, optionally
+followed by a binary payload of exactly the request's `payload_len` bytes
+(only `push` has one), and the guest answers **one JSON line**, optionally
+followed by a binary payload of exactly the reply's `payload_len` bytes. One
+request per connection. The host doesn't half-close its side after sending,
+so the guest reads exactly `payload_len` bytes rather than to EOF.
 
 Request:
 
@@ -46,6 +54,8 @@ Reply:
 
 - `v` is the protocol version; a guest that doesn't know it replies
   `{"ok":false,"error":"unsupported version"}`.
+- `session` is `null` outside a session (and for `hello` and `session.new`).
+- `payload_len` in a request is omitted when 0.
 - `hit` (optional) names the element a pointer action landed on; the host
   logs it. Coordinates are guest screen points, origin top-left.
 - Errors never close the connection without a reply line.
@@ -79,6 +89,14 @@ listing the candidates.
 
 `note` never reaches a guest: the host logs it.
 
+`push`'s tar (the request's payload) holds `name` at its top level (a
+leading `./` when `name` starts with `-`); `dest` null means the guest's
+default folder (`~/Pushed`). For a Linux guest the host leaves out Apple's
+`._*` metadata files; for a macOS guest it keeps them (bsdtar restores them).
+
+`berth gui screenshot` saves the PNG as
+`~/.berth/logs/gui/shots/<log id>.png`, the path in the log's `screenshot`.
+
 ## Activity log
 
 `~/.berth/logs/gui/<YYYY-MM-DD>.jsonl`, one line when a command starts
@@ -102,3 +120,11 @@ Sessions idle longer than `gui_idle_minutes` (default 30) are ended by the
 next `berth gui` call or the daemon. macOS: at most 2 VMs run at once
 (Apple's license); `session new --clone` past that waits in
 `~/.berth/gui/queue.json`, first come first served.
+
+Details: times are UTC, `2026-11-02T10:00:00Z`; `note` is the session's
+latest `berth gui note`. `queue.json` is
+`[{"ticket","base","agent":who,"since","pid"}]`; an entry whose `pid` is
+gone is dropped. Running macOS VMs are counted by live
+`~/.berth/mac/*/run.pid`. A clone is named `gui-<8 hex>` and deleted when
+its session ends. Both files change only under `flock` on
+`~/.berth/gui/lock`. `gui_idle_minutes: 0` turns expiry off.

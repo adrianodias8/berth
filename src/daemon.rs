@@ -41,6 +41,15 @@ pub enum Request {
     Machine { action: String, args: Vec<String> },
     Engine { args: String },
     Snapshot { name: String, memory: bool },
+    /// `berth gui` for a Linux machine: after the GuiReply line, the
+    /// connection is carried to the agent's `gui <machine>` (docs/gui-protocol.md).
+    Gui { machine: String },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GuiReply {
+    pub ok: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -454,8 +463,10 @@ async fn serve(paths: Paths, cpus: usize, memory: u64) -> Result<()> {
 async fn handle_control(stream: UnixStream, cpus: usize, memory: u64) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut line = String::new();
-    BufReader::new(read).read_line(&mut line).await?;
+    let mut read = BufReader::new(read);
+    read.read_line(&mut line).await?;
     let reply = match serde_json::from_str::<Request>(&line)? {
+        Request::Gui { machine } => return gui(read, write, &machine).await,
         Request::Status => {
             let state = vm::state().await?;
             let running = vm::state_name(state) == "running";
@@ -517,6 +528,42 @@ async fn handle_control(stream: UnixStream, cpus: usize, memory: u64) -> Result<
     };
     write.write_all(reply.as_bytes()).await?;
     write.write_all(b"\n").await?;
+    Ok(())
+}
+
+/// Carry a `berth gui` connection to the agent's GUI side for a machine.
+/// The name goes into a header line, so it's checked here.
+async fn gui(client_read: BufReader<tokio::net::unix::OwnedReadHalf>, client_write: tokio::net::unix::OwnedWriteHalf, machine: &str) -> Result<()> {
+    let valid = !machine.is_empty() && !machine.starts_with('.') && machine.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    let guest = if valid {
+        guest_stream(&format!("gui {machine}")).await.map_err(|e| format!("can't reach the VM's agent: {e:#}"))
+    } else {
+        Err(format!("bad machine name {machine:?}"))
+    };
+    carry_gui(client_read, client_write, guest).await
+}
+
+/// The reply line, then the bytes both ways.
+async fn carry_gui(
+    mut client_read: BufReader<tokio::net::unix::OwnedReadHalf>,
+    mut client_write: tokio::net::unix::OwnedWriteHalf,
+    guest: std::result::Result<UnixStream, String>,
+) -> Result<()> {
+    let reply = GuiReply { ok: guest.is_ok(), error: guest.as_ref().err().cloned() };
+    client_write.write_all(format!("{}\n", serde_json::to_string(&reply)?).as_bytes()).await?;
+    let Ok(guest) = guest else { return Ok(()) };
+    let (mut guest_read, mut guest_write) = guest.into_split();
+    // Done once the guest has answered and hung up. The client finishing
+    // first (it sent everything) only ends the guest's input.
+    let up = async {
+        let _ = tokio::io::copy(&mut client_read, &mut guest_write).await;
+        let _ = guest_write.shutdown().await;
+        std::future::pending::<()>().await
+    };
+    tokio::select! {
+        down = tokio::io::copy(&mut guest_read, &mut client_write) => { down?; }
+        _ = up => {}
+    }
     Ok(())
 }
 
@@ -741,4 +788,42 @@ fn exit(paths: &Paths) -> ! {
         let _ = std::fs::remove_file(path);
     }
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn gui_connections_are_carried_after_the_reply() {
+        let (mut client, daemon_side) = UnixStream::pair().unwrap();
+        let (daemon_guest, mut agent) = UnixStream::pair().unwrap();
+        let (read, write) = daemon_side.into_split();
+        let carry = tokio::spawn(carry_gui(BufReader::new(read), write, Ok(daemon_guest)));
+        let agent = tokio::spawn(async move {
+            let mut request = vec![0u8; 18];
+            agent.read_exact(&mut request).await.unwrap();
+            agent.write_all(b"{\"ok\":true}\nPNG").await.unwrap();
+            request
+        });
+        let mut line = String::new();
+        BufReader::new(&mut client).read_line(&mut line).await.unwrap();
+        assert_eq!(line, "{\"ok\":true,\"error\":null}\n");
+        client.write_all(b"{\"verb\":\"hello\"}\nX").await.unwrap();
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).await.unwrap();
+        assert_eq!(answer, b"{\"ok\":true}\nPNG");
+        assert_eq!(agent.await.unwrap(), b"{\"verb\":\"hello\"}\nX");
+        carry.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn gui_refusals_are_one_line() {
+        let (mut client, daemon_side) = UnixStream::pair().unwrap();
+        let (read, write) = daemon_side.into_split();
+        carry_gui(BufReader::new(read), write, Err("bad machine name \"a b\"".into())).await.unwrap();
+        let mut answer = String::new();
+        client.read_to_string(&mut answer).await.unwrap();
+        assert_eq!(answer, "{\"ok\":false,\"error\":\"bad machine name \\\"a b\\\"\"}\n");
+    }
 }
