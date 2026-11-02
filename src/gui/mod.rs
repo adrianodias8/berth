@@ -392,9 +392,16 @@ fn log(paths: &Paths, line: &Line) {
 /// End sessions idle past gui_idle_minutes; it's an error to go on in one.
 fn end_idle(ctx: &mut Ctx) -> Result<()> {
     let idle = sessions::take_idle(ctx.paths)?;
+    let mut failed = Vec::new();
     for record in &idle {
         eprintln!("berth gui: ended session {} on {} (idle over {} min)", record.session, record.target, sessions::idle_minutes(ctx.paths));
-        end_in_guest(ctx.paths, record);
+        if !end_in_guest(ctx.paths, record) {
+            failed.push(record.clone());
+        }
+    }
+    // A clone that's still there keeps its record (and its slot accounted for).
+    if let Err(err) = sessions::restore(ctx.paths, &failed) {
+        eprintln!("berth gui: couldn't keep the record of a session whose VM is still there: {err:#}");
     }
     if let Some(session) = &ctx.session
         && idle.iter().any(|r| &r.session == session)
@@ -404,19 +411,26 @@ fn end_idle(ctx: &mut Ctx) -> Result<()> {
     Ok(())
 }
 
-/// Best effort: the session's screen goes away with a clone anyway.
-fn end_in_guest(paths: &Paths, record: &sessions::Record) {
-    let Ok(target) = Target::parse(&record.target) else { return };
-    let ended = call(paths, &target, Some(&record.session), "session.end", json!({}), None, Duration::from_secs(10));
+/// How long the guest may take to end a session: a Linux guest stops its
+/// units (up to 30 s) and then kills what's left (up to 20 s).
+const SESSION_END_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Best effort: the session's screen goes away with a clone anyway. False
+/// only when a clone VM couldn't be deleted (it's still running).
+fn end_in_guest(paths: &Paths, record: &sessions::Record) -> bool {
+    let Ok(target) = Target::parse(&record.target) else { return true };
+    let ended = call(paths, &target, Some(&record.session), "session.end", json!({}), None, SESSION_END_TIMEOUT);
     if record.clone
         && let Target::Mac(vm) = &target
     {
         if let Err(err) = macos::delete(vm) {
             eprintln!("berth gui: couldn't delete the session's VM {vm}: {err:#}");
+            return false;
         }
     } else if let Err(err) = ended {
         eprintln!("berth gui: ending {} in the guest: {err:#}", record.session);
     }
+    true
 }
 
 /// How long a verb may take in the guest, plus room for the round trip.
@@ -439,7 +453,7 @@ fn call(paths: &Paths, target: &Target, session: Option<&str>, verb: &str, args:
     let request = proto::Request { v: proto::VERSION, session: session.map(str::to_string), verb: verb.into(), args, payload_len };
     let (reply, bytes) = proto::exchange(&stream, &request, file.as_mut().map(|f| f as &mut dyn std::io::Read))?;
     if !reply.ok {
-        bail!("{}", reply.error.clone().unwrap_or_else(|| format!("{target} refused {verb}")));
+        bail!("{}", reply.error.as_deref().map(printable).unwrap_or_else(|| format!("{target} refused {verb}")));
     }
     Ok((reply, bytes))
 }
@@ -464,7 +478,8 @@ fn act(ctx: &mut Ctx, id: &str, action: Action) -> Result<Outcome> {
                     bail!("the guest sent no image");
                 }
                 let shots = gui_log::shots(ctx.paths);
-                std::fs::create_dir_all(&shots)?;
+                gui_log::private_dir(&gui_log::dir(ctx.paths))?;
+                gui_log::private_dir(&shots)?;
                 // The app refreshes every 2 s: one file per session, replaced.
                 let path = if ctx.who.kind == gui_log::APP_KIND {
                     let key = ctx.session.clone().unwrap_or_else(|| target.to_string()).replace(['/', ':'], "-");
@@ -472,7 +487,11 @@ fn act(ctx: &mut Ctx, id: &str, action: Action) -> Result<Outcome> {
                 } else {
                     shots.join(format!("{id}.png"))
                 };
-                std::fs::write(&path, &bytes)?;
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(&path)?;
+                    std::io::Write::write_all(&mut file, &bytes)?;
+                }
                 outcome.screenshot = Some(path);
                 outcome.png = bytes;
             }
@@ -513,10 +532,15 @@ fn act(ctx: &mut Ctx, id: &str, action: Action) -> Result<Outcome> {
                 record
             };
             match record {
-                Some(record) => end_in_guest(ctx.paths, &record),
+                Some(record) => {
+                    if !end_in_guest(ctx.paths, &record) {
+                        sessions::restore(ctx.paths, std::slice::from_ref(&record))?;
+                        bail!("session {session}'s VM is still running; its record is kept: try berth gui session end again");
+                    }
+                }
                 // Not ours (another Mac user's tooling, or a lost file): still tell the guest.
                 None => {
-                    call(ctx.paths, &need_target(ctx)?, Some(&session), "session.end", json!({}), None, Duration::from_secs(30))?;
+                    call(ctx.paths, &need_target(ctx)?, Some(&session), "session.end", json!({}), None, SESSION_END_TIMEOUT)?;
                 }
             }
             if ctx.session.as_deref() == Some(&session) {
@@ -570,8 +594,9 @@ fn new_clone_session(ctx: &Ctx) -> Result<sessions::Record> {
 }
 
 /// Queue for a macOS VM slot, first come first served, then clone the base
-/// and start the clone while still holding the lock, so the next waiter
-/// counts it.
+/// and start the clone. The ticket stays at the head of the queue while the
+/// clone starts, so the next waiter counts it, but the lock (which every
+/// `berth gui` call takes) isn't held for the start.
 fn wait_for_slot(ctx: &Ctx, base: &str, vm: &str) -> Result<()> {
     let ticket = gui_log::new_id();
     let me = sessions::Waiting { ticket: ticket.clone(), base: base.into(), agent: ctx.who.clone(), since: gui_log::now(), pid: std::process::id() };
@@ -589,14 +614,13 @@ fn wait_for_slot(ctx: &Ctx, base: &str, vm: &str) -> Result<()> {
         };
         let running = macos::running(ctx.paths);
         if ahead == 0 && running < macos::MAX_RUNNING {
-            let started = macos::clone(base, vm).and_then(|()| {
+            sessions::save_queue(ctx.paths, &lock, &queue)?;
+            drop(lock);
+            break macos::clone(base, vm).and_then(|()| {
                 macos::start(vm).inspect_err(|_| {
                     let _ = macos::delete(vm);
                 })
             });
-            queue.retain(|w| w.ticket != ticket);
-            sessions::save_queue(ctx.paths, &lock, &queue)?;
-            break started;
         }
         sessions::save_queue(ctx.paths, &lock, &queue)?;
         drop(lock);
@@ -609,12 +633,11 @@ fn wait_for_slot(ctx: &Ctx, base: &str, vm: &str) -> Result<()> {
         }
         std::thread::sleep(Duration::from_secs(2));
     };
-    if result.is_err() {
-        let lock = sessions::lock(ctx.paths)?;
-        let mut queue = sessions::load_queue(ctx.paths, &lock);
-        queue.retain(|w| w.ticket != ticket);
-        sessions::save_queue(ctx.paths, &lock, &queue)?;
-    }
+    // Out of the queue: started (now counted as running) or given up.
+    let lock = sessions::lock(ctx.paths)?;
+    let mut queue = sessions::load_queue(ctx.paths, &lock);
+    queue.retain(|w| w.ticket != ticket);
+    sessions::save_queue(ctx.paths, &lock, &queue)?;
     result
 }
 
@@ -651,10 +674,17 @@ fn tar(path: &Path, out: &Path, for_linux: bool) -> Result<String> {
     Ok(name)
 }
 
+/// Text with control characters escaped, so a guest-chosen string can't
+/// send escape sequences (clipboard writes, cursor moves) to the terminal.
+pub fn printable(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() { c.escape_default().to_string() } else { c.to_string() }).collect()
+}
+
 /// What a command prints, as text.
 pub fn render(o: &Outcome) -> String {
     let r = &o.result;
-    let s = |v: &Value| v.as_str().map(str::to_string).unwrap_or_else(|| if v.is_null() { String::new() } else { v.to_string() });
+    // Guest text (titles, app names, paths) goes to the user's terminal.
+    let s = |v: &Value| v.as_str().map(printable).unwrap_or_else(|| if v.is_null() { String::new() } else { v.to_string() });
     match o.verb.as_str() {
         "push" => format!("pushed to {}", s(&r["path"])),
         "open" => format!("opened {} (pid {})", s(&r["window"]), s(&r["pid"])),

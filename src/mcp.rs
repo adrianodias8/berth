@@ -243,6 +243,31 @@ fn tools() -> Vec<Value> {
         .collect()
 }
 
+/// What the agent may copy out of this Mac. Guest text the agent reads
+/// (labels, titles) could steer it, so nothing in the home folder's hidden
+/// folders (~/.ssh, ~/.aws, ~/.config), no hidden file or folder pushed by
+/// name (.env, .git), not the home folder itself, and nothing in ~/Library
+/// but ~/Library/Developer (Xcode's builds). A build inside a hidden folder,
+/// like SwiftPM's .build/debug/App.app, is fine. `berth gui push` itself is
+/// not limited.
+fn pushable(path: &str) -> Result<std::path::PathBuf> {
+    let full = std::fs::canonicalize(path).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).and_then(|h| std::fs::canonicalize(h).ok());
+    let dot = |p: &std::path::Path| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'));
+    let refused = dot(&full)
+        || full.parent().is_none()
+        || home.as_ref().is_some_and(|home| {
+            full == *home
+                || full.strip_prefix(home).ok().and_then(|rest| rest.components().next()).is_some_and(|c| dot(std::path::Path::new(c.as_os_str())))
+                || (full.starts_with(home.join("Library")) && !full.starts_with(home.join("Library/Developer")))
+                || !full.starts_with(home) && full.starts_with("/Users")
+        });
+    if refused {
+        anyhow::bail!("gui_push won't copy {} (hidden files, the home folder, ~/Library and other users' files stay on this Mac); run `berth gui push` yourself if you mean it", full.display());
+    }
+    Ok(full)
+}
+
 /// A tool call's arguments as the action gui::perform takes.
 fn action_for(name: &str, a: &Value) -> Result<Action> {
     let s = |k: &str| a[k].as_str().map(str::to_string);
@@ -259,7 +284,7 @@ fn action_for(name: &str, a: &Value) -> Result<Action> {
         "gui_session_new" => Ok(Action::SessionNew { clone: a["clone"] == true }),
         "gui_session_end" => Ok(Action::SessionEnd { session: s("session") }),
         "gui_session_list" => Ok(Action::SessionList),
-        "gui_push" => Ok(Action::Push { path: need("path")?.into(), to: s("to") }),
+        "gui_push" => Ok(Action::Push { path: pushable(&need("path")?)?, to: s("to") }),
         "gui_open" => {
             let args = a["args"].as_array().cloned().unwrap_or_default();
             guest("open", json!({"app": need("app")?, "args": args, "wait_s": a["wait_s"].as_u64().unwrap_or(20)}))
@@ -329,6 +354,25 @@ mod tests {
         for (raw, enc) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")] {
             assert_eq!(base64(raw.as_bytes()), enc);
         }
+    }
+
+    #[test]
+    fn push_refuses_secrets() {
+        let home = std::fs::canonicalize(std::env::var("HOME").unwrap()).unwrap();
+        let tmp = std::env::temp_dir().join(format!("berth-push-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join(".build/debug/App.app")).unwrap();
+        std::fs::create_dir_all(tmp.join(".git")).unwrap();
+        assert!(pushable(tmp.join(".build/debug/App.app").to_str().unwrap()).is_ok());
+        assert!(pushable(tmp.join(".git").to_str().unwrap()).is_err());
+        assert!(pushable(home.to_str().unwrap()).is_err());
+        assert!(pushable("/").is_err());
+        if home.join("Library/Preferences").exists() {
+            assert!(pushable(home.join("Library/Preferences").to_str().unwrap()).is_err());
+        }
+        if home.join(".ssh").exists() {
+            assert!(pushable(home.join(".ssh").to_str().unwrap()).is_err());
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

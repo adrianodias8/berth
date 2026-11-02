@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import ImageIO
 import SwiftUI
 
@@ -1040,17 +1041,31 @@ private struct CommandInspector: View {
 // MARK: - Menu bar
 
 /// Sessions and the slot queue for the menu bar panel, read every few
-/// seconds only while a GUI flag is on.
+/// seconds only while a GUI flag is on (no timer at all otherwise).
 @MainActor
 final class GuiMenuState: ObservableObject {
     static let shared = GuiMenuState()
     @Published private(set) var sessions: [GuiSession] = []
     @Published private(set) var queued = 0
     private var timer: Timer?
+    private var flagsWatch: AnyCancellable?
 
     private init() {
-        timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-            Task { @MainActor in await self?.reload() }
+        let flags = FeatureFlags.shared
+        flagsWatch = flags.$mac.combineLatest(flags.$gui)
+            .map { $0 || $1 }
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] on in self?.setActive(on) }
+    }
+
+    private func setActive(_ on: Bool) {
+        timer?.invalidate()
+        timer = nil
+        if on {
+            timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+                Task { @MainActor in await self?.reload() }
+            }
         }
         Task { await reload() }
     }

@@ -421,8 +421,14 @@ fn sway_config(size: [u32; 2]) -> String {
 }
 
 /// The compositor's launcher: its own session bus, then sway or cage.
-fn launcher(id: &str, app: Option<&[String]>) -> String {
+fn launcher(id: &str, app: Option<&[String]>, gpu_3d: bool) -> String {
     let rt = runtime(id);
+    // gles2 only on a GPU that does 3D and is bound into the machine.
+    let renderer = if gpu_3d {
+        format!("if [ -e {} ]; then export WLR_RENDERER=gles2; else export WLR_RENDERER=pixman; fi; ", install::RENDER_NODE)
+    } else {
+        "export WLR_RENDERER=pixman; ".to_string()
+    };
     let compositor = match app {
         Some(argv) => format!("cage -- {}", argv.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")),
         None => format!("sway -c {rt}/sway.conf"),
@@ -430,12 +436,10 @@ fn launcher(id: &str, app: Option<&[String]>) -> String {
     format!(
         "RT={rt}; echo $$ > $RT/compositor.pid; \
          export XDG_RUNTIME_DIR=$RT WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_HEADLESS_OUTPUTS=1; \
-         if [ -e {} ]; then export WLR_RENDERER=gles2; else export WLR_RENDERER=pixman; fi; \
-         {APP_ENV}\
+         {renderer}{APP_ENV}\
          if command -v dbus-daemon >/dev/null; then dbus-daemon --session --address=unix:path=$RT/bus --fork --nopidfile --print-pid > $RT/dbus.pid; fi; \
          export DBUS_SESSION_BUS_ADDRESS=unix:path=$RT/bus; \
-         exec {compositor} >$RT/compositor.log 2>&1",
-        install::RENDER_NODE
+         exec {compositor} >$RT/compositor.log 2>&1"
     )
 }
 
@@ -487,7 +491,7 @@ fn session_new(m: &Machine, args: &Value) -> Result<Done, String> {
         quote(&sway_config(size))
     );
     m.run(&setup, &me, SHORT).map_err(|e| format!("setting up the session: {e}"))?;
-    m.spawn(&format!("berth-gui-{id}"), &launcher(&id, app.as_deref())).map_err(|e| format!("starting the compositor: {e}"))?;
+    m.spawn(&format!("berth-gui-{id}"), &launcher(&id, app.as_deref(), install::gpu_has_3d())).map_err(|e| format!("starting the compositor: {e}"))?;
     // Up when its Wayland socket (and sway's IPC) is there.
     let ready = format!(
         "RT={rt}; for i in $(seq 100); do \
@@ -1016,8 +1020,11 @@ mod tests {
 
     #[test]
     fn launchers_quote_apps() {
-        let l = launcher("s-1", Some(&["gnome-calculator".to_string(), "it's".to_string()]));
+        let l = launcher("s-1", Some(&["gnome-calculator".to_string(), "it's".to_string()]), false);
         assert!(l.contains("exec cage -- 'gnome-calculator' 'it'\\''s'"), "{l}");
-        assert!(launcher("s-1", None).contains("sway -c /tmp/berth-gui-s-1/sway.conf"));
+        assert!(l.contains("export WLR_RENDERER=pixman; ") && !l.contains("gles2"), "{l}");
+        let l = launcher("s-1", None, true);
+        assert!(l.contains("sway -c /tmp/berth-gui-s-1/sway.conf"));
+        assert!(l.contains("WLR_RENDERER=gles2"), "{l}");
     }
 }

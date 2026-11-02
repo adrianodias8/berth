@@ -229,10 +229,11 @@ enum MachineCmd {
         /// the internet only; implies --isolated)
         #[arg(long)]
         isolate_network: bool,
-        /// Set it up for GUI apps (sway, cage, AT-SPI); `--gui omarchy` on
-        /// archlinux adds Hyprland and Omarchy's configuration. Needs
-        /// "gui": true in config.json while experimental.
-        #[arg(long, num_args = 0..=1, default_missing_value = "1", value_name = "omarchy", hide = true)]
+        /// Set it up for GUI apps (sway, cage, AT-SPI); `--gui=omarchy` (with
+        /// the =, so `--gui <name>` stays a name) on archlinux adds Hyprland
+        /// and Omarchy's configuration. Needs "gui": true in config.json
+        /// while experimental.
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "1", value_name = "omarchy", hide = true)]
         gui: Option<String>,
     },
     /// Run a GUI app in a machine, in a headless session of its own; prints

@@ -124,6 +124,22 @@ pub fn take_idle(paths: &Paths) -> Result<Vec<Record>> {
     Ok(idle)
 }
 
+/// Put back records take_idle took whose end failed (a clone VM that
+/// couldn't be deleted), so they stay tracked and are tried again.
+pub fn restore(paths: &Paths, records: &[Record]) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let lock = lock(paths)?;
+    let mut sessions = load_sessions(paths, &lock);
+    for record in records {
+        if !sessions.iter().any(|r| r.session == record.session) {
+            sessions.push(record.clone());
+        }
+    }
+    save_sessions(paths, &lock, &sessions)
+}
+
 pub fn alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
 }

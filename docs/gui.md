@@ -15,12 +15,12 @@ The flags below are hidden from `--help` while the feature is experimental.
 
 ```sh
 berth machine create dev --distro debian:trixie --gui   # Debian/Ubuntu, Fedora or Arch
-berth machine create desk --distro archlinux --gui omarchy   # Arch only
+berth machine create desk --distro archlinux --gui=omarchy   # Arch only
 ```
 
 `--gui` installs sway, cage, grim, wtype, D-Bus, at-spi2 and the GTK/Qt
 accessibility bridges with the distribution's package manager.
-`--gui omarchy` (Arch only, best effort) also installs Hyprland and
+`--gui=omarchy` (Arch only, best effort) also installs Hyprland and
 Omarchy's desktop packages and clones Omarchy v4.0.6's configuration; its
 log is `/var/log/berth-omarchy.log` in the machine.
 

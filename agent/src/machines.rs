@@ -118,12 +118,14 @@ fn isolation(name: &str) -> Isolation {
     Isolation { files: config.lines().any(|l| l == ISOLATED), network: config.lines().any(|l| l == ISOLATED_NETWORK) }
 }
 
-/// Folders an isolated machine was given (`Bind=` lines).
+/// Folders an isolated machine was given (`Bind=` lines; a --gui machine's
+/// render node isn't one).
 fn mounts(name: &str) -> Vec<String> {
     std::fs::read_to_string(nspawn_path(name))
         .unwrap_or_default()
         .lines()
         .filter_map(|l| l.strip_prefix("Bind=").map(str::to_string))
+        .filter(|m| m != crate::gui::install::RENDER_NODE)
         .collect()
 }
 
@@ -192,6 +194,18 @@ fn create(
         let _ = std::fs::remove_file(&tarball);
         let _ = std::fs::remove_dir_all(&root);
     })?;
+    // --gui's distro and kind are checked here, before the machine is set
+    // up, so a refused --gui leaves nothing behind.
+    if !gui.is_empty() {
+        let os_release = crate::inroot::Root::new(root.clone())
+            .and_then(|r| r.read("/etc/os-release", 1 << 16).or_else(|_| r.read("/usr/lib/os-release", 1 << 16)))
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        if let Err(e) = crate::gui::install::scripts(&os_release, gui, user) {
+            let _ = std::fs::remove_dir_all(&root);
+            return Err(e);
+        }
+    }
 
     // The user, with the same UID as on the Mac so files in the shared home
     // keep their ownership; passwordless sudo where sudo exists.
@@ -694,6 +708,7 @@ pub fn handle(action: &str, mut host: UnixStream) -> io::Result<()> {
                 let dropin = crate::gui::install::gpu_dropin_path(name);
                 if std::fs::remove_file(&dropin).is_ok() {
                     let _ = std::fs::remove_dir(Path::new(&dropin).parent().unwrap_or(Path::new("/nonexistent")));
+                    let _ = sh("systemctl daemon-reload");
                 }
                 apply_isolation(); // without it now
                 std::fs::remove_dir_all(format!("{MACHINES}/{name}")).map(|_| "ok".into())

@@ -49,7 +49,7 @@ pub fn create(
     if let Some(kind) = gui {
         require_gui(paths)?;
         if !matches!(kind, "1" | "omarchy") {
-            bail!("--gui {kind}: plain --gui, or --gui omarchy");
+            bail!("--gui={kind}: plain --gui, or --gui=omarchy");
         }
     }
     let user = std::env::var("USER")?;
@@ -81,6 +81,14 @@ pub fn create(
         Some("omarchy") => notes.push("GUI, Omarchy".into()),
         Some(_) => notes.push("GUI".into()),
         None => {}
+    }
+    // An agent older than --gui would ignore the extra argument and make a
+    // plain machine: ask it first (an empty request does nothing).
+    if gui.is_some()
+        && let Err(e) = call(paths, "gui", &["", ""])
+        && e.to_string().contains("unknown action gui")
+    {
+        bail!("the VM's berth agent is older than --gui; restart berth to update it");
     }
     println!("Creating {name} ({distro_name}, {})...", notes.join(", "));
     let flag = |b: bool| if b { "1" } else { "" };
@@ -206,7 +214,7 @@ pub fn display(paths: &Paths, name: &str, session: Option<&str>, screenshot: Opt
         }
     }
     println!();
-    println!("Sessions run headless: berth can't show one in a Mac window yet (that comes with GPU display support).");
+    println!("Sessions run headless: watch one in Berth.app (Agents > Watch opens its Display window).");
     println!("To see one now, save its screen: berth machine display {name} --session <id> --screenshot screen.png");
     Ok(())
 }

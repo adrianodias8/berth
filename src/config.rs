@@ -146,6 +146,9 @@ fn applies(key: &str) -> &'static str {
     match key {
         "ports" => "applies to new forwards right away",
         "mac" | "gui_idle_minutes" | "gui_titles" => "applies right away",
+        // Sessions and `machine create --gui` read config.json live; the
+        // GPU device is attached at start.
+        "gui" => "Linux GUI sessions follow right away; the GPU device on the next start (berth restart)",
         _ => "applies on the next start (berth restart)",
     }
 }

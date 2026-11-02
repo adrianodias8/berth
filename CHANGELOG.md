@@ -14,7 +14,7 @@ Experimental, off unless turned on in `~/.berth/config.json`
   copies. At most 2 run at once (Apple's license). `docs/mac-vms.md`.
 - **berth-gui-mac** (`guest/mac-agent`): the GUI agent for macOS guests, in
   Swift: screenshots, accessibility tree, clicks by label, typing, keys.
-- **Linux GUI machines** (`"gui": true`): `berth machine create --gui [omarchy]`,
+- **Linux GUI machines** (`"gui": true`): `berth machine create --gui[=omarchy]`,
   `berth machine run <name> -- <cmd>` and `berth machine display <name>`;
   each GUI session is a headless sway or cage compositor in the machine
   with AT-SPI accessibility. `docs/gui.md`.
@@ -29,7 +29,9 @@ Experimental, off unless turned on in `~/.berth/config.json`
   a timeline per chat, an inspector with the screenshot and the command to
   rerun it, Take Over) and Display windows for Linux sessions.
 - **berth-gpu** (`"gui": true`, macOS 27): a virtio-gpu device for the
-  Linux VM: 2D scanout, EDID, hardware cursor, frames kept for screenshots.
+  Linux VM: 2D scanout, EDID, hardware cursor. Nothing shows its display on
+  the Mac yet (a debug PNG dump aside); Linux screenshots come from inside
+  the session.
   berth's kernel gains DRM/virtio-gpu, udmabuf, dma-buf heaps, uinput and
   virtio-sound (unused unless the device is there). New settings
   `gpu_memory_mib` and `gpu_display`.

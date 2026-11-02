@@ -91,7 +91,7 @@ Reply:
 | `screenshot` | `{"window":null\|"<app>","format":"png"}` | `{"width","height"}` | PNG bytes |
 | `click` | `{"x":..,"y":..}` or `{"label":"Save"}`, `"button":"left"\|"right"`, `"count":1` | `{}` | – |
 | `type` | `{"text":"hello"}` | `{}` | – |
-| `key` | `{"combo":"cmd+a"}` (modifiers `cmd ctrl alt shift`; on Linux `cmd` is `super`) | `{}` | – |
+| `key` | `{"combo":"cmd+a"}` (modifiers `cmd ctrl alt shift`; on Linux `cmd` is `super`; `delete` is forward delete, `backspace` deletes left) | `{}` | – |
 | `scroll` | `{"x","y","dx","dy"}` | `{}` | – |
 | `drag` | `{"from":[x,y],"to":[x,y]}` | `{}` | – |
 | `tree` | `{"app":null\|"<app>","depth":12}` | `{"tree": Node}` | – |

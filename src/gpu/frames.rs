@@ -1,6 +1,7 @@
 //! The latest frame of every scanout, and the cursor, as the guest last
-//! flushed them: what screenshots, the app's peek thumbnails and the display
-//! window read (`latest`, `wait_newer`, `cursor`). The command server
+//! flushed them, for a host-side display window and screenshots still to
+//! come (`latest`, `wait_newer`, `cursor` have no caller yet); today only
+//! device.rs's debug dump reads them. The command server
 //! (server.rs) writes here on SET_SCANOUT, RESOURCE_FLUSH and the cursor
 //! commands; nothing here knows about virtio.
 //!

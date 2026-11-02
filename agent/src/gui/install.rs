@@ -1,4 +1,4 @@
-//! `berth machine create --gui [omarchy]`: what a machine needs for GUI
+//! `berth machine create --gui[=omarchy]`: what a machine needs for GUI
 //! sessions, from its own distro's packages, and the GPU's render node.
 //!
 //! Sessions (mod.rs) need a headless wlroots compositor (sway; cage for
@@ -6,7 +6,7 @@
 //! session D-Bus and at-spi2-core for the accessibility tree, read with
 //! python3-gi. Xwayland runs X11 apps (Electron's default).
 //!
-//! `--gui omarchy` (Arch only) adds Hyprland from Arch's repositories and
+//! `--gui=omarchy` (Arch only) adds Hyprland from Arch's repositories and
 //! Omarchy's configuration from its git tag `OMARCHY_VERSION`, best effort:
 //! Omarchy is a whole distribution installed from its own ISO, so its full
 //! app list and its own package repository are left out, and a failure there
@@ -16,11 +16,34 @@ use std::io;
 
 /// The Omarchy release berth sets up (a tag of github.com/basecamp/omarchy).
 pub const OMARCHY_VERSION: &str = "v4.0.6";
+/// The commit that tag names, checked after the clone: a moved tag fails
+/// the Omarchy step instead of installing something unreviewed.
+pub const OMARCHY_COMMIT: &str = "237f1b4071a0bff2296c6d740ba2b9fd695ebfa0";
 const OMARCHY_REPO: &str = "https://github.com/basecamp/omarchy.git";
 
 /// The render node a GPU-backed VM has; machines get it bound in when it
 /// exists in the VM.
 pub const RENDER_NODE: &str = "/dev/dri/renderD128";
+
+/// Whether the VM's GPU does 3D (virgl). A 2D-only virtio-gpu can still
+/// have a render node, and wlroots' gles2 renderer fails on it, so the
+/// compositor uses pixman unless the kernel says 3D is there
+/// (DRM_IOCTL_VIRTGPU_GETPARAM, VIRTGPU_PARAM_3D_FEATURES).
+pub fn gpu_has_3d() -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(node) = std::fs::OpenOptions::new().read(true).write(true).open(RENDER_NODE) else { return false };
+    #[repr(C)]
+    struct GetParam {
+        param: u64,
+        value: u64,
+    }
+    let mut value: libc::c_int = 0;
+    let mut req = GetParam { param: 1, value: &mut value as *mut libc::c_int as u64 };
+    // _IOWR('d', 0x40 + 0x03, struct drm_virtgpu_getparam)
+    const GETPARAM: libc::c_ulong = 0xC010_6443;
+    let rc = unsafe { libc::ioctl(node.as_raw_fd(), GETPARAM as _, &mut req) };
+    rc == 0 && value != 0
+}
 
 /// The machine's package manager, from its os-release ID and ID_LIKE.
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -142,7 +165,7 @@ pub fn install_script(family: Family, packages: &[&str]) -> String {
     )
 }
 
-/// Omarchy's configuration for `user`, from its pinned tag, without
+/// Omarchy's configuration for `user`, from its pinned tag and commit, without
 /// overwriting the user's own files. Best effort, logged inside.
 pub fn omarchy_script(user: &str) -> String {
     format!(
@@ -150,6 +173,8 @@ pub fn omarchy_script(user: &str) -> String {
          {{ {} && h=$(getent passwd {user} | cut -d: -f6) && \
            rm -rf \"$h/.local/share/omarchy\" && \
            su {user} -c 'git -c advice.detachedHead=false clone -q --depth 1 --branch {OMARCHY_VERSION} {OMARCHY_REPO} ~/.local/share/omarchy && \
+             {{ [ \"$(git -C ~/.local/share/omarchy rev-parse HEAD)\" = {OMARCHY_COMMIT} ] || \
+               {{ echo \"omarchy {OMARCHY_VERSION} is not commit {OMARCHY_COMMIT}\"; rm -rf ~/.local/share/omarchy; false; }}; }} && \
              mkdir -p ~/.config && cp -rn ~/.local/share/omarchy/config/. ~/.config/' && \
            echo \"omarchy {OMARCHY_VERSION} configured for {user}\"; }} >>/var/log/berth-omarchy.log 2>&1 || \
          echo 'berth: Omarchy setup failed; see /var/log/berth-omarchy.log in the machine' >&2; true",
@@ -182,8 +207,8 @@ pub fn scripts(os_release: &str, kind: &str, user: &str) -> io::Result<Vec<Strin
     match kind {
         "" | "1" | "true" => {}
         "omarchy" if family == Family::Arch => out.push(omarchy_script(user)),
-        "omarchy" => return Err(io::Error::other("--gui omarchy needs an Arch Linux machine (--distro archlinux)")),
-        other => return Err(io::Error::other(format!("--gui {other}: plain --gui, or --gui omarchy"))),
+        "omarchy" => return Err(io::Error::other("--gui=omarchy needs an Arch Linux machine (--distro archlinux)")),
+        other => return Err(io::Error::other(format!("--gui={other}: plain --gui, or --gui=omarchy"))),
     }
     Ok(out)
 }

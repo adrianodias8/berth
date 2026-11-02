@@ -147,26 +147,54 @@ fn read_short_line(stream: &mut impl Read) -> Result<String> {
 }
 
 /// Send one request (and its payload) and read the reply and its payload.
+/// The most a guest reply may carry (a screenshot is a few MiB).
+pub const MAX_REPLY_PAYLOAD: u64 = 256 << 20;
+
 pub fn exchange<S: Read + Write>(mut stream: S, request: &Request, payload: Option<&mut dyn Read>) -> Result<(Reply, Vec<u8>)> {
     let mut line = serde_json::to_vec(request)?;
     line.push(b'\n');
-    stream.write_all(&line)?;
-    if let Some(payload) = payload {
-        let sent = std::io::copy(&mut payload.take(request.payload_len), &mut stream)?;
-        if sent != request.payload_len {
-            bail!("the payload ended after {sent} of {} bytes", request.payload_len);
-        }
-    }
-    stream.flush()?;
+    let sent = (|| -> std::io::Result<Option<u64>> {
+        stream.write_all(&line)?;
+        let sent = match payload {
+            Some(payload) => Some(std::io::copy(&mut payload.take(request.payload_len), &mut stream)?),
+            None => None,
+        };
+        stream.flush()?;
+        Ok(sent)
+    })();
     // One request per connection, so the reader may read ahead freely.
     let mut reader = BufReader::new(stream);
+    match sent {
+        Ok(Some(sent)) if sent != request.payload_len => bail!("the payload ended after {sent} of {} bytes", request.payload_len),
+        Ok(_) => {}
+        // A guest that refuses a push answers and hangs up without reading
+        // the payload, so the write fails; its reply says why.
+        Err(err) => {
+            let mut text = String::new();
+            if reader.read_line(&mut text).is_ok()
+                && let Ok(reply) = serde_json::from_str::<Reply>(&text)
+                && !reply.ok
+            {
+                return Ok((reply, Vec::new()));
+            }
+            return Err(err.into());
+        }
+    }
     let mut text = String::new();
     if reader.read_line(&mut text).map_err(timeout_message)? == 0 {
         bail!("the guest agent closed the connection without replying");
     }
     let reply: Reply = serde_json::from_str(&text).with_context(|| format!("bad reply from the guest agent: {:?}", text.trim()))?;
-    let mut bytes = vec![0u8; usize::try_from(reply.payload_len)?];
-    reader.read_exact(&mut bytes).context("the guest's payload was cut short")?;
+    // The length comes from the guest: cap it, and grow the buffer only as
+    // bytes arrive, so a bogus length can't make the host allocate it.
+    if reply.payload_len > MAX_REPLY_PAYLOAD {
+        bail!("the guest agent sent a {} byte payload (over the {} MiB limit)", reply.payload_len, MAX_REPLY_PAYLOAD >> 20);
+    }
+    let mut bytes = Vec::new();
+    reader.by_ref().take(reply.payload_len).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != reply.payload_len {
+        bail!("the guest's payload was cut short");
+    }
     Ok((reply, bytes))
 }
 
@@ -213,6 +241,23 @@ mod tests {
         assert_eq!(req["v"], 1);
         assert_eq!(req["session"], Value::Null);
         assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn a_refused_push_reports_the_guests_reason() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let guest = std::thread::spawn(move || {
+            let mut reader = BufReader::new(theirs.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            (&theirs).write_all(b"{\"ok\":false,\"error\":\"no session abc\"}\n").unwrap();
+        });
+        let big = vec![0u8; 16 << 20];
+        let request = Request { v: 1, session: None, verb: "push".into(), args: serde_json::json!({}), payload_len: big.len() as u64 };
+        let (reply, _) = exchange(&ours, &request, Some(&mut &big[..])).unwrap();
+        assert!(!reply.ok);
+        assert_eq!(reply.error.as_deref(), Some("no session abc"));
+        guest.join().unwrap();
     }
 
     #[test]

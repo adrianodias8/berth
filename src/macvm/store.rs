@@ -66,6 +66,15 @@ impl Vm {
     pub fn provision(&self) -> PathBuf {
         self.dir.join("provision.json")
     }
+    /// The guest's SSH host key, pinned on the first `berth mac shell`
+    /// (the disk carries the key, so clones and resets copy it).
+    pub fn known_hosts(&self) -> PathBuf {
+        self.dir.join("known_hosts")
+    }
+    /// The account's password when berth generated it (0600); clones copy it.
+    pub fn password(&self) -> PathBuf {
+        self.dir.join("password")
+    }
     /// The clean state `set-base` saved: what clones are made from and what
     /// `reset` of this VM itself goes back to.
     pub fn clean(&self) -> PathBuf {

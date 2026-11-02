@@ -5,8 +5,10 @@
 //!
 //! - protocol.rs: the virtio-gpu wire format;
 //! - server.rs: the resource table and the 2D commands;
-//! - frames.rs: the latest frame of each scanout, for screenshots and the
-//!   app (`frames::latest`), and a PNG encoder;
+//! - frames.rs: the latest frame of each scanout, and a PNG encoder. Only
+//!   the debug dump (device.rs) reads them for now: a host-side display
+//!   window and screenshots are still to come (`berth gui screenshot` on
+//!   Linux uses grim inside the session);
 //! - device.rs: the Virtualization.framework side (queues, guest memory,
 //!   the shared memory region, snapshots);
 //! - virgl.rs: where virglrenderer (3D through ANGLE on Metal) plugs in,

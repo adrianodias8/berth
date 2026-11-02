@@ -55,8 +55,9 @@ pub enum MacCmd {
         /// The account to create
         #[arg(long, default_value = "berth")]
         user: String,
-        #[arg(long, default_value = "berth")]
-        password: String,
+        /// The account's password (default: a random one, kept 0600 in the VM's folder)
+        #[arg(long)]
+        password: Option<String>,
         /// The guest's display, in points: WIDTHxHEIGHT@1x or @2x (Retina)
         #[arg(long, default_value = store::DEFAULT_SCREEN)]
         screen: String,
@@ -289,7 +290,7 @@ struct CreateOptions {
     memory_mib: Option<u64>,
     disk_gib: u64,
     user: String,
-    password: String,
+    password: Option<String>,
     screen: Display,
     display: bool,
     dry_run: bool,
@@ -378,7 +379,17 @@ fn create(paths: &Paths, name: &str, opts: CreateOptions) -> Result<()> {
         vz::install(&vm, &meta, &hw, &ipsw)?;
         println!("Installed in {:.0}s.", started.elapsed().as_secs_f64());
         // Read by the first boot, which `run` removes once it's started.
-        let provision = vz::Provision { full_name: opts.user.clone(), username: opts.user.clone(), password: opts.password.clone() };
+        // A fixed default would be an admin login over SSH for anything on
+        // the shared NAT subnet (the Linux VM, its containers, other guests).
+        let password = match &opts.password {
+            Some(p) => p.clone(),
+            None => {
+                let p = random_password();
+                write_private(&vm.password(), p.as_bytes())?;
+                p
+            }
+        };
+        let provision = vz::Provision { full_name: opts.user.clone(), username: opts.user.clone(), password };
         write_private(&vm.provision(), &serde_json::to_vec(&provision)?)?;
         Ok(())
     })();
@@ -392,7 +403,7 @@ fn create(paths: &Paths, name: &str, opts: CreateOptions) -> Result<()> {
          berth mac shell {name}          (password {})\n  \
          berth mac stop {name} && berth mac set-base {name}   to make it the clean state for clones and resets",
         opts.user,
-        if opts.password == "berth" { "berth" } else { "as given" }
+        if opts.password.is_some() { "as given".to_string() } else { format!("in {}", vm.password().display()) }
     );
     Ok(())
 }
@@ -444,6 +455,12 @@ fn asif_supported() -> bool {
         .is_some_and(|major| major >= 26)
 }
 
+/// 20 characters from an unambiguous alphabet (about 100 bits).
+fn random_password() -> String {
+    const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    (0..20).map(|_| ALPHABET[unsafe { libc::arc4random_uniform(ALPHABET.len() as u32) } as usize] as char).collect()
+}
+
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(path)?;
@@ -481,6 +498,13 @@ fn clone(root: &Path, base: &str, name: &str) -> Result<()> {
         let hw = vz::new_hardware(&base_vm.load_hw()?.hardware_model_bytes()?);
         vm.save_hw(&hw)?;
         let meta = Meta { base: Some(base.to_string()), created: store::now(), ..base_vm.load_meta()? };
+        // Same disk, so same account, password and host key.
+        if let Ok(password) = std::fs::read(base_vm.password()) {
+            write_private(&vm.password(), &password)?;
+        }
+        if let Ok(keys) = std::fs::read(base_vm.known_hosts()) {
+            write_private(&vm.known_hosts(), &keys)?;
+        }
         vm.save_meta(&meta)
     })();
     if let Err(err) = made {
@@ -532,6 +556,15 @@ fn reset(root: &Path, name: &str) -> Result<()> {
     store::clone_file(&disk, &vm.disk())?;
     store::clone_file(&aux, &vm.aux())?;
     let _ = std::fs::remove_file(vm.provision());
+    // The base's disk carries the base's host key.
+    if let Some(base) = &meta.base {
+        match std::fs::read(Vm::new(root, base).known_hosts()) {
+            Ok(keys) => write_private(&vm.known_hosts(), &keys)?,
+            Err(_) => {
+                let _ = std::fs::remove_file(vm.known_hosts());
+            }
+        }
+    }
     println!("Reset {name} to {from} in {:.1}s.", started.elapsed().as_secs_f64());
     if was_running {
         start_in(root, name, false)?;
@@ -666,8 +699,11 @@ fn shell(paths: &Paths, root: &Path, name: &str, command: &[String]) -> Result<(
         .with_context(|| format!("{name} has no address yet (no DHCP lease for {} in {}); is it still booting?", hw.mac_address, dhcp::LEASES))?;
     let user = meta.user.unwrap_or_else(|| "berth".into());
     let mut ssh = Command::new("ssh");
-    // Every clone and reset is a new host key at a reused address.
-    ssh.args(["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"]);
+    // The address comes from the DHCP leases, which anything on the NAT
+    // subnet can influence: pin the host key per VM (trusted on first use),
+    // under an alias, since addresses are reused across VMs.
+    ssh.args(["-o", "StrictHostKeyChecking=accept-new", "-o", "HostKeyAlias=berth-mac-vm", "-o", "LogLevel=ERROR"]);
+    ssh.arg("-o").arg(format!("UserKnownHostsFile={}", vm.known_hosts().display()));
     // berth's key, for a guest it was added to (else the password).
     if paths.ssh_key().exists() {
         ssh.arg("-i").arg(paths.ssh_key());

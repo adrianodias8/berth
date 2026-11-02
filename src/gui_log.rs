@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -208,14 +209,27 @@ pub fn shots(paths: &Paths) -> PathBuf {
     dir(paths).join("shots")
 }
 
+/// The log holds typed text, prompts and screenshots: only the user may
+/// read it (home folders are 0755 by default). Tightens an existing folder.
+pub fn private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
 /// Append a line to its day's file in one write, so lines from agents
 /// running at once don't interleave.
 pub fn write(paths: &Paths, line: &Line) -> Result<()> {
-    std::fs::create_dir_all(dir(paths))?;
+    private_dir(&dir(paths))?;
     let day = line.time.get(..10).unwrap_or("unknown");
     let mut text = serde_json::to_string(line)?;
     text.push('\n');
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(dir(paths).join(format!("{day}.jsonl")))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(dir(paths).join(format!("{day}.jsonl")))?;
     file.write_all(text.as_bytes())?;
     Ok(())
 }

@@ -268,9 +268,11 @@ final class Handler {
             try AX.requireTrust()
             while true {
                 // The frontmost app can change while waiting (a launch), so
-                // look it up on every poll.
+                // look it up on every poll. Closed menus still list their
+                // items, so the menu bar doesn't count (File > Save is not
+                // the save sheet's button).
                 if let target = try? Apps.target(a["app"]?.string),
-                   LabelMatch.exists(label, in: AX.tree(AX.app(target.processIdentifier), depth: 40).root) {
+                   LabelMatch.exists(label, in: AX.tree(AX.app(target.processIdentifier), depth: 40).root.pruned(roles: ["AXMenuBar"])) {
                     return .success(["waited_ms": elapsed()])
                 }
                 if Date() >= deadline { throw GuiError("timed out after \(Int(timeout)) s waiting for '\(label)'") }

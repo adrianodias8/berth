@@ -10,9 +10,9 @@ import SwiftUI
 // MARK: - Feature flags
 
 /// The "mac" and "gui" switches in ~/.berth/config.json. Off unless set to
-/// true, so without them the app is exactly as before. Re-read every few
-/// seconds so `berth config set mac true` shows the sections without a
-/// relaunch (reading a small file; the VM isn't involved).
+/// true, so without them the app is exactly as before. Re-read when the
+/// file or its folder changes (a kernel event, no polling), so
+/// `berth config set mac true` shows the sections without a relaunch.
 @MainActor
 final class FeatureFlags: ObservableObject {
     static let shared = FeatureFlags(config: BerthPaths.config)
@@ -23,15 +23,35 @@ final class FeatureFlags: ObservableObject {
     var agents: Bool { mac || gui }
 
     private let config: URL
+    private let watch: Bool
+    /// The folder (an atomic save renames into it) and the file itself (an
+    /// in-place write); the file's is re-armed on every reload.
+    private var folderSource: DispatchSourceFileSystemObject?
+    private var fileSource: DispatchSourceFileSystemObject?
     private var timer: Timer?
 
     init(config: URL, watch: Bool = true) {
         self.config = config
+        self.watch = watch
         reload()
         if watch {
-            timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-                Task { @MainActor in self?.reload() }
+            folderSource = Self.source(config.deletingLastPathComponent(), [.write, .rename, .delete]) { [weak self] in self?.reload() }
+            if folderSource == nil {
+                // No ~/.berth yet: look for it now and then until it's there.
+                timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+                    Task { @MainActor in self?.watchFolderOnceItExists() }
+                }
             }
+        }
+    }
+
+    private func watchFolderOnceItExists() {
+        guard folderSource == nil else { return }
+        folderSource = Self.source(config.deletingLastPathComponent(), [.write, .rename, .delete]) { [weak self] in self?.reload() }
+        if folderSource != nil {
+            timer?.invalidate()
+            timer = nil
+            reload()
         }
     }
 
@@ -39,6 +59,20 @@ final class FeatureFlags: ObservableObject {
         let flags = Self.read(config)
         if flags.mac != mac { mac = flags.mac }
         if flags.gui != gui { gui = flags.gui }
+        if watch {
+            fileSource?.cancel()
+            fileSource = Self.source(config, [.write, .extend, .delete, .rename]) { [weak self] in self?.reload() }
+        }
+    }
+
+    private static func source(_ url: URL, _ mask: DispatchSource.FileSystemEvent, _ handler: @escaping @MainActor () -> Void) -> DispatchSourceFileSystemObject? {
+        let fd = open(url.path, O_EVTONLY)
+        guard fd >= 0 else { return nil }
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: mask, queue: .main)
+        source.setEventHandler { MainActor.assumeIsolated { handler() } }
+        source.setCancelHandler { close(fd) }
+        source.resume()
+        return source
     }
 
     /// Only a JSON `true` turns a flag on, as for the CLI (config.rs

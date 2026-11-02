@@ -121,7 +121,7 @@ final class KeyComboTests: XCTestCase {
         XCTAssertEqual(try KeyCombo.parse("a"), KeyCombo(keyCode: 0, modifiers: []))
         XCTAssertEqual(try KeyCombo.parse("cmd+a"), KeyCombo(keyCode: 0, modifiers: .cmd))
         XCTAssertEqual(try KeyCombo.parse("Cmd+Shift+S"), KeyCombo(keyCode: 1, modifiers: [.cmd, .shift]))
-        XCTAssertEqual(try KeyCombo.parse("ctrl+alt+delete"), KeyCombo(keyCode: 51, modifiers: [.ctrl, .alt]))
+        XCTAssertEqual(try KeyCombo.parse("ctrl+alt+delete"), KeyCombo(keyCode: 117, modifiers: [.ctrl, .alt]))
         XCTAssertEqual(try KeyCombo.parse("option + left"), KeyCombo(keyCode: 123, modifiers: .alt))
         XCTAssertEqual(try KeyCombo.parse("super+space"), KeyCombo(keyCode: 49, modifiers: .cmd))
     }
@@ -227,6 +227,25 @@ final class LabelMatchTests: XCTestCase {
         XCTAssertTrue(LabelMatch.exists("saved", in: tree))
         XCTAssertTrue(LabelMatch.exists("Save", in: tree))
         XCTAssertFalse(LabelMatch.exists("Done", in: tree))
+        // wait prunes the menu bar: a closed menu's item isn't on screen.
+        XCTAssertFalse(LabelMatch.exists("Close", in: tree.pruned(roles: ["AXMenuBar"])))
+    }
+
+    func testContainersLoseAndNestedMatchIsOneElement() throws {
+        let t = Node(role: "AXApplication", label: "Notes", children: [
+            Node(role: "AXWindow", label: "Notes", frame: Frame(0, 25, 800, 600), children: [
+                Node(role: "AXButton", label: "Notes", frame: Frame(10, 40, 80, 24), path: [0, 0]),
+                Node(role: "AXGroup", label: "Export", frame: Frame(100, 40, 120, 40), children: [
+                    Node(role: "AXButton", label: "Export", frame: Frame(110, 45, 60, 24), path: [0, 1, 0]),
+                ], path: [0, 1]),
+                Node(role: "AXCell", label: "Open", frame: Frame(10, 100, 200, 24), children: [
+                    Node(role: "AXStaticText", label: "Open", frame: Frame(14, 104, 40, 16), path: [0, 2, 0]),
+                ], path: [0, 2]),
+            ], path: [0]),
+        ])
+        XCTAssertEqual(try LabelMatch.find("Notes", in: t).path, [0, 0])
+        XCTAssertEqual(try LabelMatch.find("Export", in: t).path, [0, 1, 0])
+        XCTAssertEqual(try LabelMatch.find("Open", in: t).path, [0, 2])
     }
 
     func testLabelFromAttributes() {

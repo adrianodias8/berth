@@ -40,8 +40,10 @@ public struct KeyCombo: Equatable {
             "l": 37, "j": 38, "'": 39, "k": 40, ";": 41, "\\": 42, ",": 43, "/": 44,
             "n": 45, "m": 46, ".": 47, "`": 50,
             "return": 36, "enter": 36, "tab": 48, "space": 49,
-            "delete": 51, "backspace": 51, "escape": 53, "esc": 53,
-            "forwarddelete": 117, "home": 115, "end": 119, "pageup": 116, "pagedown": 121,
+            // "delete" is forward delete on both guests (as X11 and the
+            // web name it); the Mac's ⌫ key is "backspace".
+            "backspace": 51, "escape": 53, "esc": 53,
+            "delete": 117, "del": 117, "forwarddelete": 117, "home": 115, "end": 119, "pageup": 116, "pagedown": 121,
             "left": 123, "right": 124, "down": 125, "up": 126,
             "help": 114, "capslock": 57, "keypadenter": 76,
             "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97, "f7": 98,

@@ -114,7 +114,7 @@ One custom Virtio device (`VZCustomVirtioDeviceConfiguration`) speaking the
   `card0` for the primary session.
 - Also: clipboard both ways, HiDPI, hardware cursor through `cursorq`,
   audio via `VZVirtioSoundDeviceConfiguration` + PipeWire.
-- Machine flags: `berth machine create desk --distro archlinux --gui omarchy`,
+- Machine flags: `berth machine create desk --distro archlinux --gui=omarchy`,
   `berth machine create dev --gui`, `berth machine display desk`,
   `berth machine run dev -- firefox`.
 

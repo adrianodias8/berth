@@ -95,13 +95,34 @@ public enum LabelMatch {
         let want = label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !want.isEmpty else { throw GuiError("empty label") }
         let all = root.flattened().filter { $0.label != nil }
-        let exact = dedupe(all.filter { $0.label!.lowercased() == want })
+        let exact = narrow(all.filter { $0.label!.lowercased() == want })
         if exact.count == 1 { return exact[0] }
         if exact.count > 1 { throw ambiguous(label, exact) }
-        let partial = dedupe(all.filter { $0.label!.lowercased().contains(want) })
+        let partial = narrow(all.filter { $0.label!.lowercased().contains(want) })
         if partial.count == 1 { return partial[0] }
         if partial.count > 1 { throw ambiguous(label, partial) }
         throw GuiError("no element labelled '\(label)'")
+    }
+
+    /// Roles that hold other elements rather than being one to click
+    /// (docs/gui-protocol.md: a container loses to any other match).
+    static let containers: Set<String> = [
+        "AXApplication", "AXWindow", "AXSheet", "AXDrawer", "AXGroup",
+        "AXScrollArea", "AXSplitGroup", "AXLayoutArea",
+    ]
+
+    /// The protocol's rules, as the Linux guest applies them: containers lose
+    /// to anything else, a match inside another match is that same element
+    /// (the outer one is kept), and duplicates with one role and frame count once.
+    static func narrow(_ nodes: [Node]) -> [Node] {
+        var m = nodes
+        if m.contains(where: { !containers.contains($0.role) }) {
+            m.removeAll { containers.contains($0.role) }
+        }
+        let outer = m.filter { n in
+            !m.contains { o in o.path.count < n.path.count && Array(n.path.prefix(o.path.count)) == o.path }
+        }
+        return dedupe(outer)
     }
 
     /// Whether any node carries the label (exact or substring); `wait` needs
