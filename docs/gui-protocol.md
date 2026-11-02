@@ -78,6 +78,10 @@ Reply:
   logs it. Coordinates are guest screen points, origin top-left.
 - Errors never close the connection without a reply line.
 
+A live view of a Linux session (the daemon's `display` stream, its shared
+memory ring, and the agent's `screen.stream` and `input.stream`, which
+stream after their reply line) is in docs/display-protocol.md.
+
 ## Verbs
 
 | verb | args | result | payload |

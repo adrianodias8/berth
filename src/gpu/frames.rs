@@ -1,32 +1,48 @@
-//! The latest frame of every scanout, and the cursor, as the guest last
-//! flushed them, for a host-side display window and screenshots still to
-//! come (`latest`, `wait_newer`, `cursor` have no caller yet); today only
-//! device.rs's debug dump reads them. The command server
-//! (server.rs) writes here on SET_SCANOUT, RESOURCE_FLUSH and the cursor
-//! commands; nothing here knows about virtio.
+//! Every surface berth shows, with its latest frame and cursor: a VM
+//! scanout as the GPU device last flushed it (server.rs writes those on
+//! SET_SCANOUT, RESOURCE_FLUSH and the cursor commands), or a guest GUI
+//! session's screen as its capture stream sends it (gui/display.rs).
+//! Nothing here knows about virtio or the guest.
 //!
-//! Frames are BGRA, 4 bytes a pixel, rows packed (`stride == width * 4`),
-//! with opaque alpha for formats that have none. The pixels sit behind an
-//! `Arc`: a reader takes a frame without copying, and the next flush copies
-//! only if a reader still holds the old one.
+//! Each surface's pixels live in a ring (ring.rs): a file in
+//! ~/.berth/run/surfaces that Berth.app maps, so frames reach it without a
+//! copy. Here, under one lock, is everything else: the frame sequence, a
+//! short history of what each frame changed (so a viewer that skipped
+//! frames gets the union of their damage), the cursor, and a condvar that
+//! `wait_newer` sleeps on. The display stream (docs/display-protocol.md)
+//! is built on `wait_newer` and `info`; screenshots on `png`.
 //!
-//! Also a PNG encoder (`encode_png`), stored (uncompressed) deflate blocks
-//! with CRC-32 and Adler-32, which needs no crate: a 1080p screenshot is
-//! ~8 MB and takes milliseconds, which is what an agent's screenshot wants.
+//! `DISPLAY` is the GPU device's view of the registry: scanout `n` is the
+//! surface `Scanout(n)`, behind the same calls the device has always made.
+//!
+//! Frames are BGRA with opaque alpha for formats that have none. Also a PNG
+//! encoder (`encode_png`), stored (uncompressed) deflate blocks with CRC-32
+//! and Adler-32, which needs no crate: a 1080p screenshot is ~8 MB and
+//! takes milliseconds, which is what an agent's screenshot wants.
 
+#[path = "ring.rs"]
+pub mod ring;
+
+use std::collections::{BTreeMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::protocol::{MAX_SCANOUTS, Rect};
+use ring::{CursorState, Ring};
 
-/// One scanout's picture.
+/// How many frames' damage a surface remembers. A viewer further behind
+/// than that gets a full frame.
+pub const DAMAGE_HISTORY: usize = 16;
+
+/// One surface's picture, packed (`stride == width * 4`).
 #[derive(Clone, Debug)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
     /// BGRA, rows of `width * 4` bytes.
     pub pixels: Arc<Vec<u8>>,
-    /// Bumped on every change, across all scanouts: a reader can tell
+    /// Bumped on every frame, across all surfaces: a reader can tell
     /// whether it has seen this one.
     pub sequence: u64,
 }
@@ -60,125 +76,451 @@ pub struct Cursor {
     pub image: Option<CursorImage>,
 }
 
-struct Inner {
-    frames: [Option<Frame>; MAX_SCANOUTS],
-    cursor: Cursor,
-    sequence: u64,
+/// What a surface shows.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SurfaceKey {
+    /// A guest GUI session's screen, fed by its capture stream.
+    Session { machine: String, session: String },
+    /// A scanout of the VM's GPU device.
+    Scanout(u32),
 }
 
-/// The frames of one GPU device.
-pub struct Frames {
+impl SurfaceKey {
+    /// The start of its ring's file name (the gen follows).
+    pub fn stem(&self) -> String {
+        match self {
+            SurfaceKey::Session { machine, session } => format!("session-{machine}-{session}"),
+            SurfaceKey::Scanout(n) => format!("scanout-{n}"),
+        }
+    }
+}
+
+impl std::fmt::Display for SurfaceKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SurfaceKey::Session { machine, session } => write!(f, "{machine} session {session}"),
+            SurfaceKey::Scanout(n) => write!(f, "scanout {n}"),
+        }
+    }
+}
+
+/// A live surface's ring, as the display stream's reply describes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Info {
+    /// None for an anonymous ring (no surfaces directory set: tests).
+    pub path: Option<PathBuf>,
+    pub generation: u64,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+}
+
+/// What a viewer has had so far: `wait_newer` answers with what's newer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Seen {
+    /// The ring generation (0: none).
+    pub generation: u64,
+    pub frame: u64,
+    pub cursor: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ev {
+    /// Slot `slot` holds frame `seq`. `damage` covers everything that
+    /// changed since the frame the viewer saw: the whole surface (`full`)
+    /// after a resize or when the history doesn't reach back that far.
+    Frame { slot: u32, seq: u64, damage: Rect, full: bool },
+    Cursor { seq: u64 },
+    /// A new ring generation, or None: no live surface any more.
+    Resize(Option<Info>),
+    /// The surface's source failed (its capture stream ended).
+    End(String),
+    Timeout,
+}
+
+#[derive(Default)]
+struct Surface {
+    ring: Option<Ring>,
+    /// The latest frame's sequence (0: none in this ring).
+    seq: u64,
+    /// What each recent frame of this ring changed, oldest first.
+    damage: VecDeque<(u64, Rect)>,
+    /// Frames up to here have left the history (or are from an older
+    /// ring): a viewer that saw only those needs a full frame.
+    floor: u64,
+    cursor: CursorState,
+    cursor_image: Option<CursorImage>,
+    cursor_seq: u64,
+    ended: Option<String>,
+}
+
+impl Surface {
+    fn info(&self) -> Option<Info> {
+        let r = self.ring.as_ref()?;
+        Some(Info { path: r.path().map(Path::to_path_buf), generation: r.generation(), width: r.width(), height: r.height(), stride: r.stride() as u32 })
+    }
+
+    /// The union of what changed after frame `after`, or None when the
+    /// history doesn't reach back to it.
+    fn damage_since(&self, after: u64) -> Option<Rect> {
+        if after < self.floor || after == 0 {
+            return None;
+        }
+        Some(self.damage.iter().filter(|(s, _)| *s > after).fold(Rect::default(), |u, (_, r)| union(u, *r)))
+    }
+
+    fn write_cursor(&mut self, seq: u64) {
+        let image = self.cursor_image.as_ref().map(|i| i.pixels.as_slice());
+        if let Some(ring) = &mut self.ring {
+            ring.write_cursor(seq, self.cursor, image);
+        }
+    }
+}
+
+struct Inner {
+    dir: Option<PathBuf>,
+    map: BTreeMap<SurfaceKey, Surface>,
+    /// Frame and cursor sequence numbers, shared by all surfaces.
+    sequence: u64,
+    /// Ring generations, 1..=u32::MAX, unique across daemon runs (seeded
+    /// from the clock).
+    generation: u64,
+}
+
+/// A registry of surfaces.
+pub struct Surfaces {
     inner: Mutex<Inner>,
     changed: Condvar,
 }
 
-/// The VM's display (one GPU device per VM).
-pub static DISPLAY: Frames = Frames::new();
+/// All of berth's surfaces: the VM's scanouts and the GUI sessions' screens.
+pub static SURFACES: Surfaces = Surfaces::new();
 
-/// The latest frame of `scanout`, or None if it's off. For the display and
-/// app side: screenshots, peek.
-#[allow(dead_code)] // for the display window, screenshots and peek
-pub fn latest(scanout: u32) -> Option<Frame> {
-    DISPLAY.latest(scanout)
+/// The VM's display (one GPU device per VM), onto `SURFACES`.
+pub static DISPLAY: Frames = Frames::on(&SURFACES);
+
+/// The bounding box of two rectangles (an empty one adds nothing).
+pub fn union(a: Rect, b: Rect) -> Rect {
+    if a.is_empty() {
+        return b;
+    }
+    if b.is_empty() {
+        return a;
+    }
+    let (x0, y0) = (a.x.min(b.x), a.y.min(b.y));
+    let x1 = (a.x as u64 + a.width as u64).max(b.x as u64 + b.width as u64);
+    let y1 = (a.y as u64 + a.height as u64).max(b.y as u64 + b.height as u64);
+    Rect::new(x0, y0, (x1 - x0 as u64) as u32, (y1 - y0 as u64) as u32)
 }
 
-impl Frames {
+fn contains(outer: Rect, inner: Rect) -> bool {
+    inner.is_empty()
+        || (inner.x >= outer.x
+            && inner.y >= outer.y
+            && inner.x as u64 + inner.width as u64 <= outer.x as u64 + outer.width as u64
+            && inner.y as u64 + inner.height as u64 <= outer.y as u64 + outer.height as u64)
+}
+
+impl Default for Surfaces {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Surfaces {
+    /// Without a directory (`set_dir`), rings are anonymous memory.
     pub const fn new() -> Self {
-        Self {
-            inner: Mutex::new(Inner {
-                frames: [const { None }; MAX_SCANOUTS],
-                cursor: Cursor { scanout: 0, x: 0, y: 0, image: None },
-                sequence: 0,
-            }),
-            changed: Condvar::new(),
+        Self { inner: Mutex::new(Inner { dir: None, map: BTreeMap::new(), sequence: 0, generation: 0 }), changed: Condvar::new() }
+    }
+
+    /// Put rings in `dir` from now on (made 0700), removing any a previous
+    /// daemon left there.
+    pub fn set_dir(&self, dir: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        for entry in std::fs::read_dir(dir)?.flatten() {
+            if entry.path().extension().is_some_and(|e| e == "ring") {
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
+        self.inner.lock().unwrap().dir = Some(dir.to_path_buf());
+        Ok(())
     }
 
-    pub fn latest(&self, scanout: u32) -> Option<Frame> {
-        self.inner.lock().unwrap().frames.get(scanout as usize)?.clone()
+    /// Show `key` at `width` x `height` and draw `rect` of it with `draw`,
+    /// given the frame's bytes and stride: it redraws all of `rect` and
+    /// nothing outside it. A new size is a new ring generation, starting
+    /// black. An empty `rect` at the same size is no new frame.
+    pub fn update(&self, key: &SurfaceKey, width: u32, height: u32, rect: Rect, draw: impl FnOnce(&mut [u8], usize)) {
+        self.update_parts(key, width, height, &[rect], draw);
     }
 
-    /// A frame of `scanout` newer than `after` (a sequence number), waiting
-    /// up to `timeout` for one: lets a viewer follow the display without
-    /// polling.
-    #[allow(dead_code)] // for the display window
-    pub fn wait_newer(&self, scanout: u32, after: u64, timeout: Duration) -> Option<Frame> {
+    /// `update` for a frame that redraws several rectangles: its damage is
+    /// their bounding box.
+    pub fn update_parts(&self, key: &SurfaceKey, width: u32, height: u32, parts: &[Rect], draw: impl FnOnce(&mut [u8], usize)) {
+        if ring::Layout::new(width, height).is_none() {
+            return;
+        }
+        let rect = parts.iter().fold(Rect::default(), |u, r| union(u, *r));
+        let mut inner = self.inner.lock().unwrap();
+        let inner = &mut *inner;
+        let s = inner.map.entry(key.clone()).or_default();
+        let resized = s.ring.as_ref().is_none_or(|r| r.width() != width || r.height() != height);
+        if resized {
+            // The header holds a u32 gen (so does the app's reply parser):
+            // seconds since 1970 fit, and a later daemon starts above
+            // whatever this one reached unless it resized more than once a
+            // second.
+            if inner.generation == 0 {
+                inner.generation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_secs() & u32::MAX as u64);
+            }
+            inner.generation = inner.generation % u32::MAX as u64 + 1;
+            let ring = Ring::create(inner.dir.as_deref(), &key.stem(), inner.generation, width, height).or_else(|err| {
+                eprintln!("display: can't share {key}'s frames ({err}); keeping them in memory");
+                Ring::create(None, &key.stem(), inner.generation, width, height)
+            });
+            let Ok(ring) = ring else { return };
+            // The old ring (and its file) goes now; viewers still mapping it
+            // keep their pages.
+            s.ring = Some(ring);
+            s.damage.clear();
+            s.seq = 0;
+            // A cursor set before carries over into the new ring.
+            if s.cursor_seq > 0 {
+                inner.sequence += 1;
+                s.write_cursor(inner.sequence);
+                s.cursor_seq = inner.sequence;
+            }
+        } else if rect.is_empty() {
+            return;
+        }
+        inner.sequence += 1;
+        let seq = inner.sequence;
+        let full = Rect::new(0, 0, width, height);
+        let damage = if resized { full } else { rect.intersect(&full).unwrap_or_default() };
+        if resized {
+            s.floor = seq - 1;
+        }
+        let ring = s.ring.as_mut().unwrap();
+        // The slot about to be written holds an older frame: bring it up to
+        // date with what changed since, unless this frame redraws all of it.
+        let slot_frame = ring.slot_frame(ring.next_slot());
+        let catch_up = match s.damage.back() {
+            None => None,
+            Some(_) if slot_frame == 0 || slot_frame < s.floor => Some(full),
+            Some(_) => Some(s.damage.iter().filter(|(q, _)| *q > slot_frame).fold(Rect::default(), |u, (_, r)| union(u, *r))),
+        }
+        .filter(|c| !parts.iter().any(|p| contains(*p, *c)));
+        ring.write(seq, catch_up, |px, stride| {
+            if !rect.is_empty() {
+                draw(px, stride)
+            }
+        });
+        s.seq = seq;
+        s.damage.push_back((seq, damage));
+        while s.damage.len() > DAMAGE_HISTORY {
+            s.floor = s.damage.pop_front().unwrap().0;
+        }
+        self.changed.notify_all();
+    }
+
+    /// The surface's latest frame, copied out packed.
+    pub fn frame(&self, key: &SurfaceKey) -> Option<Frame> {
+        let inner = self.inner.lock().unwrap();
+        let s = inner.map.get(key)?;
+        let ring = s.ring.as_ref()?;
+        let slot = ring.latest()?;
+        let (w, h, stride) = (ring.width(), ring.height(), ring.stride());
+        let src = ring.slot(slot);
+        let row = w as usize * 4;
+        let mut pixels = Vec::with_capacity(row * h as usize);
+        for y in 0..h as usize {
+            pixels.extend_from_slice(&src[y * stride..y * stride + row]);
+        }
+        Some(Frame { width: w, height: h, pixels: Arc::new(pixels), sequence: s.seq })
+    }
+
+    /// A PNG of the surface's latest frame, if it has one.
+    pub fn png(&self, key: &SurfaceKey) -> Option<Vec<u8>> {
+        self.frame(key).map(|f| f.png())
+    }
+
+    pub fn info(&self, key: &SurfaceKey) -> Option<Info> {
+        self.inner.lock().unwrap().map.get(key)?.info()
+    }
+
+    /// Wait up to `timeout` for anything about `key` newer than `seen`:
+    /// an end, a resize, a frame, a cursor change, in that order.
+    pub fn wait_newer(&self, key: &SurfaceKey, seen: &Seen, timeout: Duration) -> Ev {
         let deadline = Instant::now() + timeout;
         let mut inner = self.inner.lock().unwrap();
         loop {
-            if let Some(Some(f)) = inner.frames.get(scanout as usize)
-                && f.sequence > after
-            {
-                return Some(f.clone());
+            if let Some(s) = inner.map.get(key) {
+                if let Some(err) = &s.ended {
+                    return Ev::End(err.clone());
+                }
+                let generation = s.ring.as_ref().map_or(0, Ring::generation);
+                if generation != seen.generation {
+                    return Ev::Resize(s.info());
+                }
+                if let Some(ring) = &s.ring
+                    && s.seq > seen.frame
+                    && let Some(slot) = ring.latest()
+                {
+                    let full = Rect::new(0, 0, ring.width(), ring.height());
+                    let (damage, is_full) = match s.damage_since(seen.frame) {
+                        Some(d) if d != full => (d, false),
+                        _ => (full, true),
+                    };
+                    return Ev::Frame { slot: slot as u32, seq: s.seq, damage, full: is_full };
+                }
+                if s.ring.is_some() && s.cursor_seq > seen.cursor {
+                    return Ev::Cursor { seq: s.cursor_seq };
+                }
+            } else if seen.generation != 0 {
+                return Ev::Resize(None);
             }
-            let left = deadline.checked_duration_since(Instant::now())?;
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else { return Ev::Timeout };
             inner = self.changed.wait_timeout(inner, left).unwrap().0;
         }
     }
 
-    #[allow(dead_code)] // for the display window
+    /// Move the cursor (the hot spot) on `key`, and change its image when
+    /// `image` is Some (Some(None) hides it).
+    pub fn set_cursor(&self, key: &SurfaceKey, x: i32, y: i32, image: Option<Option<&CursorImage>>) {
+        let mut inner = self.inner.lock().unwrap();
+        let inner = &mut *inner;
+        inner.sequence += 1;
+        let seq = inner.sequence;
+        let s = inner.map.entry(key.clone()).or_default();
+        s.cursor.x = x;
+        s.cursor.y = y;
+        if let Some(image) = image {
+            s.cursor_image = image.cloned();
+            let i = s.cursor_image.as_ref();
+            s.cursor.visible = i.is_some();
+            s.cursor.width = i.map_or(0, |i| i.width);
+            s.cursor.height = i.map_or(0, |i| i.height);
+            s.cursor.hot_x = i.map_or(0, |i| i.hot_x);
+            s.cursor.hot_y = i.map_or(0, |i| i.hot_y);
+        }
+        s.write_cursor(seq);
+        s.cursor_seq = seq;
+        self.changed.notify_all();
+    }
+
+    /// The surface is off (its scanout was disabled): its ring goes, the
+    /// cursor stays for when it's back.
+    pub fn remove(&self, key: &SurfaceKey) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(s) = inner.map.get_mut(key) {
+            s.ring = None;
+            s.damage.clear();
+            s.seq = 0;
+        }
+        drop(inner);
+        self.changed.notify_all();
+    }
+
+    /// Forget the surface entirely (its source stopped).
+    pub fn forget(&self, key: &SurfaceKey) {
+        self.inner.lock().unwrap().map.remove(key);
+        self.changed.notify_all();
+    }
+
+    /// The surface's source failed: viewers get `Ev::End(error)` until
+    /// `begin` (a new source starts).
+    pub fn end(&self, key: &SurfaceKey, error: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        let s = inner.map.entry(key.clone()).or_default();
+        s.ended = Some(error.to_string());
+        s.ring = None;
+        drop(inner);
+        self.changed.notify_all();
+    }
+
+    pub fn begin(&self, key: &SurfaceKey) {
+        if let Some(s) = self.inner.lock().unwrap().map.get_mut(key) {
+            s.ended = None;
+        }
+    }
+
+    fn clear_scanouts(&self) {
+        self.inner.lock().unwrap().map.retain(|k, _| !matches!(k, SurfaceKey::Scanout(_)));
+        self.changed.notify_all();
+    }
+}
+
+/// One GPU device's scanouts, as surfaces `Scanout(n)` of a registry:
+/// `SURFACES` for the VM's device, a registry of its own for a device in a
+/// test.
+pub struct Frames {
+    own: Surfaces,
+    shared: Option<&'static Surfaces>,
+    cursor: Mutex<Cursor>,
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Frames {
+    /// Frames in a registry of their own, in memory.
+    pub const fn new() -> Self {
+        Self { own: Surfaces::new(), shared: None, cursor: Mutex::new(Cursor { scanout: 0, x: 0, y: 0, image: None }) }
+    }
+
+    pub const fn on(surfaces: &'static Surfaces) -> Self {
+        Self { own: Surfaces::new(), shared: Some(surfaces), cursor: Mutex::new(Cursor { scanout: 0, x: 0, y: 0, image: None }) }
+    }
+
+    pub fn surfaces(&self) -> &Surfaces {
+        self.shared.unwrap_or(&self.own)
+    }
+
+    /// The latest frame of `scanout`, or None if it's off.
+    pub fn latest(&self, scanout: u32) -> Option<Frame> {
+        self.surfaces().frame(&SurfaceKey::Scanout(scanout))
+    }
+
+    #[cfg(test)]
     pub fn cursor(&self) -> Cursor {
-        self.inner.lock().unwrap().cursor.clone()
+        self.cursor.lock().unwrap().clone()
     }
 
     /// Show `scanout` at `width` x `height` (SET_SCANOUT), keeping the old
     /// pixels when the size didn't change, and draw `rect` of it with `draw`.
     pub(crate) fn update(&self, scanout: u32, width: u32, height: u32, rect: Rect, draw: impl FnOnce(&mut [u8], usize)) {
-        let i = scanout as usize;
-        if i >= MAX_SCANOUTS {
+        if scanout as usize >= MAX_SCANOUTS {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
-        inner.sequence += 1;
-        let sequence = inner.sequence;
-        let slot = &mut inner.frames[i];
-        if slot.as_ref().is_none_or(|f| f.width != width || f.height != height) {
-            *slot = Some(Frame {
-                width,
-                height,
-                pixels: Arc::new(vec![0; width as usize * height as usize * 4]),
-                sequence,
-            });
-        }
-        let frame = slot.as_mut().unwrap();
-        frame.sequence = sequence;
-        if !rect.is_empty() {
-            let stride = frame.stride();
-            draw(Arc::make_mut(&mut frame.pixels).as_mut_slice(), stride);
-        }
-        drop(inner);
-        self.changed.notify_all();
+        self.surfaces().update(&SurfaceKey::Scanout(scanout), width, height, rect, draw);
     }
 
     /// The scanout was disabled (SET_SCANOUT with resource 0, or reset).
     pub(crate) fn remove(&self, scanout: u32) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(slot) = inner.frames.get_mut(scanout as usize) {
-            *slot = None;
-        }
-        inner.sequence += 1;
-        drop(inner);
-        self.changed.notify_all();
+        self.surfaces().remove(&SurfaceKey::Scanout(scanout));
     }
 
     pub(crate) fn clear(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.frames = [const { None }; MAX_SCANOUTS];
-        inner.cursor = Cursor::default();
-        inner.sequence += 1;
-        drop(inner);
-        self.changed.notify_all();
+        *self.cursor.lock().unwrap() = Cursor::default();
+        self.surfaces().clear_scanouts();
     }
 
     pub(crate) fn set_cursor(&self, cursor: Cursor) {
-        self.inner.lock().unwrap().cursor = cursor;
+        self.surfaces().set_cursor(&SurfaceKey::Scanout(cursor.scanout), cursor.x as i32, cursor.y as i32, Some(cursor.image.as_ref()));
+        *self.cursor.lock().unwrap() = cursor;
     }
 
     pub(crate) fn move_cursor(&self, scanout: u32, x: u32, y: u32) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.cursor.scanout = scanout;
-        inner.cursor.x = x;
-        inner.cursor.y = y;
+        let mut cursor = self.cursor.lock().unwrap();
+        cursor.scanout = scanout;
+        cursor.x = x;
+        cursor.y = y;
+        self.surfaces().set_cursor(&SurfaceKey::Scanout(scanout), x as i32, y as i32, None);
     }
 }
 
@@ -423,12 +765,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+    fn leak() -> &'static Surfaces {
+        Box::leak(Box::new(Surfaces::new()))
+    }
+
+    fn session(s: &str) -> SurfaceKey {
+        SurfaceKey::Session { machine: "dev".into(), session: s.into() }
+    }
+
     #[test]
     fn frames_keep_the_latest_and_signal_readers() {
         let frames = Frames::new();
         assert!(frames.latest(0).is_none());
         frames.update(0, 4, 2, Rect::new(0, 0, 4, 2), |px, stride| {
-            assert_eq!(stride, 16);
+            assert_eq!(stride, 256, "ring rows are 256-byte aligned");
             px.fill(7);
         });
         let first = frames.latest(0).unwrap();
@@ -437,10 +788,8 @@ mod tests {
         frames.update(0, 4, 2, Rect::new(0, 0, 1, 1), |px, _| px[0] = 9);
         let second = frames.latest(0).unwrap();
         assert_eq!(first.pixels[0], 7);
-        assert_eq!(second.pixels[0], 9);
+        assert_eq!((second.pixels[0], second.pixels[4]), (9, 7));
         assert!(second.sequence > first.sequence);
-        assert!(frames.wait_newer(0, second.sequence, Duration::from_millis(10)).is_none());
-        assert!(frames.wait_newer(0, first.sequence, Duration::from_millis(10)).is_some());
         // A size change starts a fresh frame.
         frames.update(0, 2, 2, Rect::default(), |_, _| unreachable!());
         assert_eq!(frames.latest(0).unwrap().pixels.len(), 16);
@@ -451,11 +800,149 @@ mod tests {
 
     #[test]
     fn waiting_wakes_on_update() {
-        let frames = Arc::new(Frames::new());
-        let f = frames.clone();
-        let t = std::thread::spawn(move || f.wait_newer(1, 0, Duration::from_secs(5)));
+        let s = leak();
+        let t = std::thread::spawn(move || s.wait_newer(&SurfaceKey::Scanout(1), &Seen::default(), Duration::from_secs(5)));
         std::thread::sleep(Duration::from_millis(20));
-        frames.update(1, 1, 1, Rect::new(0, 0, 1, 1), |px, _| px.fill(1));
-        assert_eq!(t.join().unwrap().unwrap().pixels[0], 1);
+        s.update(&SurfaceKey::Scanout(1), 1, 1, Rect::new(0, 0, 1, 1), |px, _| px[..4].fill(1));
+        assert!(matches!(t.join().unwrap(), Ev::Resize(Some(Info { width: 1, height: 1, .. }))));
+    }
+
+    #[test]
+    fn display_is_scanouts_of_the_registry() {
+        assert!(std::ptr::eq(DISPLAY.surfaces(), &SURFACES));
+        let s = leak();
+        let frames = Frames::on(s);
+        frames.update(0, 8, 8, Rect::new(0, 0, 8, 8), |px, _| px.fill(3));
+        let info = s.info(&SurfaceKey::Scanout(0)).unwrap();
+        assert_eq!((info.width, info.height, info.stride, info.path), (8, 8, 256, None));
+        assert_eq!(s.frame(&SurfaceKey::Scanout(0)).unwrap().pixels[0], 3);
+        assert!(s.png(&SurfaceKey::Scanout(0)).unwrap().starts_with(b"\x89PNG"));
+        frames.set_cursor(Cursor { scanout: 0, x: 4, y: 5, image: None });
+        frames.move_cursor(0, 6, 7);
+        assert_eq!((frames.cursor().x, frames.cursor().y), (6, 7));
+        // Sessions in the same registry survive a device reset.
+        s.update(&session("a"), 2, 2, Rect::new(0, 0, 2, 2), |_, _| {});
+        frames.clear();
+        assert!(s.info(&SurfaceKey::Scanout(0)).is_none());
+        assert!(s.info(&session("a")).is_some());
+    }
+
+    #[test]
+    fn keys_are_independent_and_waits_wake_per_key() {
+        let s = leak();
+        s.update(&session("a"), 4, 4, Rect::new(0, 0, 4, 4), |px, _| px.fill(1));
+        s.update(&session("b"), 2, 2, Rect::new(0, 0, 2, 2), |px, _| px.fill(2));
+        assert_eq!(s.frame(&session("a")).unwrap().pixels[0], 1);
+        assert_eq!(s.frame(&session("b")).unwrap().pixels[0], 2);
+        assert_ne!(s.info(&session("a")).unwrap().generation, s.info(&session("b")).unwrap().generation);
+        let a = s.info(&session("a")).unwrap();
+        let seen = Seen { generation: a.generation, frame: s.frame(&session("a")).unwrap().sequence, cursor: u64::MAX };
+        let started = Instant::now();
+        assert_eq!(s.wait_newer(&session("a"), &seen, Duration::from_millis(30)), Ev::Timeout);
+        assert!(started.elapsed() >= Duration::from_millis(30));
+        // A frame of b doesn't wake a viewer of a; a frame of a does.
+        let t = std::thread::spawn(move || {
+            let started = Instant::now();
+            (s.wait_newer(&session("a"), &seen, Duration::from_secs(5)), started.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        s.update(&session("b"), 2, 2, Rect::new(0, 0, 1, 1), |_, _| {});
+        std::thread::sleep(Duration::from_millis(80));
+        s.update(&session("a"), 4, 4, Rect::new(1, 1, 1, 1), |_, _| {});
+        let (ev, waited) = t.join().unwrap();
+        assert!(matches!(ev, Ev::Frame { damage: Rect { x: 1, y: 1, width: 1, height: 1 }, full: false, .. }), "{ev:?}");
+        assert!(waited >= Duration::from_millis(100));
+        s.forget(&session("a"));
+        assert_eq!(s.wait_newer(&session("a"), &seen, Duration::ZERO), Ev::Resize(None));
+    }
+
+    #[test]
+    fn skipped_frames_add_up_their_damage() {
+        let s = leak();
+        let k = session("d");
+        s.update(&k, 100, 100, Rect::new(0, 0, 100, 100), |_, _| {});
+        let info = s.info(&k).unwrap();
+        let first = s.frame(&k).unwrap().sequence;
+        let seen = Seen { generation: info.generation, frame: first, cursor: u64::MAX };
+        s.update(&k, 100, 100, Rect::new(10, 10, 5, 5), |_, _| {});
+        s.update(&k, 100, 100, Rect::new(50, 20, 10, 10), |_, _| {});
+        match s.wait_newer(&k, &seen, Duration::ZERO) {
+            Ev::Frame { damage, full, .. } => assert_eq!((damage, full), (Rect::new(10, 10, 50, 20), false)),
+            ev => panic!("{ev:?}"),
+        }
+        // 16 frames back is still in the history; 17 isn't.
+        for _ in 0..14 {
+            s.update(&k, 100, 100, Rect::new(0, 0, 1, 1), |_, _| {});
+        }
+        assert!(matches!(s.wait_newer(&k, &seen, Duration::ZERO), Ev::Frame { full: false, .. }));
+        s.update(&k, 100, 100, Rect::new(0, 0, 1, 1), |_, _| {});
+        assert!(matches!(s.wait_newer(&k, &seen, Duration::ZERO), Ev::Frame { full: true, damage: Rect { width: 100, height: 100, .. }, .. }));
+        // A new size: a resize first, then a full frame.
+        s.update(&k, 50, 50, Rect::new(0, 0, 1, 1), |_, _| {});
+        let Ev::Resize(Some(info2)) = s.wait_newer(&k, &seen, Duration::ZERO) else { panic!() };
+        assert_ne!(info2.generation, info.generation);
+        let latest = s.frame(&k).unwrap().sequence;
+        let after = Seen { generation: info2.generation, frame: latest - 1, ..seen };
+        assert!(matches!(s.wait_newer(&k, &after, Duration::ZERO), Ev::Frame { full: true, .. }));
+    }
+
+    #[test]
+    fn slots_keep_undamaged_pixels_across_rotation() {
+        let s = leak();
+        let k = SurfaceKey::Scanout(0);
+        let put = |x: u32, v: u8| s.update(&k, 8, 1, Rect::new(x, 0, 1, 1), |px, _| px[x as usize * 4] = v);
+        s.update(&k, 8, 1, Rect::new(0, 0, 8, 1), |px, _| px.fill(1));
+        for (i, x) in [3u32, 5, 7, 0, 3].iter().enumerate() {
+            put(*x, 10 + i as u8);
+        }
+        let px: Vec<u8> = s.frame(&k).unwrap().pixels.iter().step_by(4).copied().collect();
+        assert_eq!(px, [13, 1, 1, 14, 1, 11, 1, 12]);
+    }
+
+    #[test]
+    fn cursor_changes_are_events() {
+        let s = leak();
+        let k = SurfaceKey::Scanout(0);
+        let image = CursorImage { width: 2, height: 2, hot_x: 1, hot_y: 1, pixels: Arc::new(vec![0xab; 16]) };
+        // Set before the surface exists, it shows up with it.
+        s.set_cursor(&k, 3, 4, Some(Some(&image)));
+        s.update(&k, 16, 16, Rect::new(0, 0, 16, 16), |_, _| {});
+        let info = s.info(&k).unwrap();
+        let frame = s.frame(&k).unwrap().sequence;
+        let Ev::Cursor { seq } = s.wait_newer(&k, &Seen { generation: info.generation, frame, cursor: 0 }, Duration::ZERO) else { panic!() };
+        s.set_cursor(&k, 8, 9, None);
+        let Ev::Cursor { seq: moved } = s.wait_newer(&k, &Seen { generation: info.generation, frame, cursor: seq }, Duration::ZERO) else { panic!() };
+        assert!(moved > seq);
+        let inner = s.inner.lock().unwrap();
+        let ring = inner.map[&k].ring.as_ref().unwrap();
+        let (state, at) = ring.cursor().unwrap();
+        assert_eq!((state.x, state.y, state.hot_x, state.width, state.visible, at), (8, 9, 1, 2, true, moved));
+        assert_eq!(ring.cursor_image()[0], 0xab);
+    }
+
+    #[test]
+    fn rings_are_files_and_a_resize_replaces_them() {
+        let dir = std::env::temp_dir().join(format!("berth-surfaces-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("scanout-0.1.ring"), b"stale").unwrap();
+        let s = leak();
+        s.set_dir(&dir).unwrap();
+        assert!(!dir.join("scanout-0.1.ring").exists(), "a previous daemon's rings go");
+        let k = session("r");
+        s.update(&k, 640, 480, Rect::new(0, 0, 640, 480), |px, _| px.fill(5));
+        let old = s.info(&k).unwrap().path.unwrap();
+        assert!(old.file_name().unwrap().to_string_lossy().starts_with("session-dev-r."));
+        let read = ring::Ring::open_read(&old).unwrap();
+        let mut out = Vec::new();
+        assert!(read.read_slot(read.latest().unwrap(), &mut out).is_some());
+        assert_eq!(out[0], 5);
+        s.update(&k, 1920, 1080, Rect::new(0, 0, 1, 1), |_, _| {});
+        let new = s.info(&k).unwrap().path.unwrap();
+        assert_ne!(new, old);
+        assert!(!old.exists() && new.exists());
+        s.forget(&k);
+        assert!(!new.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
