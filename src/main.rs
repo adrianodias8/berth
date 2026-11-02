@@ -7,12 +7,15 @@ mod dockerapi;
 mod engines;
 mod files;
 mod fuse;
+mod gui;
+mod gui_log;
 mod helper;
 mod import;
 mod k8s;
 mod macexec;
 mod macvm;
 mod machines;
+mod mcp;
 mod memory;
 mod paths;
 mod ports;
@@ -178,6 +181,14 @@ enum Cmd {
         #[command(subcommand)]
         action: macvm::MacCmd,
     },
+    /// Drive apps in a macOS or Linux guest for testing: push, open,
+    /// screenshot, click by label, type (docs/agents/SKILL.md)
+    // Hidden while behind the "mac" / "gui" flags.
+    #[command(hide = true)]
+    Gui(gui::GuiArgs),
+    /// An MCP server on stdin/stdout with the `berth gui` actions as tools
+    #[command(hide = true)]
+    Mcp,
     /// Run the VM in the foreground (used internally by `start`)
     #[command(hide = true)]
     Daemon,
@@ -489,6 +500,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Mac { action } => macvm::command(&paths, action),
+        Cmd::Gui(args) => gui::run(&paths, args),
+        Cmd::Mcp => mcp::serve(&paths),
         Cmd::Daemon => daemon::run(paths),
         Cmd::Helper { .. } => unreachable!(),
     }
