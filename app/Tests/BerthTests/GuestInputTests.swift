@@ -114,6 +114,12 @@ final class ProtocolStringTests: XCTestCase {
         XCTAssertEqual(session as NSDictionary, jsonObject(#"{"cmd":"display","machine":"dev","session":"s-x","max_fps":60}"#))
         let scanout = SurfaceStream.request(machine: "dev", source: .scanout(0), maxFPS: 120)
         XCTAssertEqual(scanout as NSDictionary, jsonObject(#"{"cmd":"display","machine":"dev","scanout":0,"max_fps":120}"#))
+        // A desktop's scanout names its session too: input goes there.
+        let desktop = SurfaceStream.request(machine: "dev", source: .scanout(0), maxFPS: 60, inputSession: "s-d")
+        XCTAssertEqual(desktop as NSDictionary,
+                       jsonObject(#"{"cmd":"display","machine":"dev","scanout":0,"session":"s-d","max_fps":60}"#))
+        let target = DisplayTarget(target: "linux:dev", session: "s-d", scanout: 0)
+        XCTAssertEqual(SurfaceStream(target: target).inputSession, "s-d")
         XCTAssertEqual(SurfaceStream(machine: "m", source: .scanout(0), maxFPS: 500).maxFPS, 120)
         XCTAssertEqual(SurfaceStream(machine: "m", source: .scanout(0), maxFPS: 0).maxFPS, 1)
     }

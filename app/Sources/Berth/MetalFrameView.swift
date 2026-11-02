@@ -209,7 +209,7 @@ final class MetalFrameView: NSView {
     static func encodeSlotRead(_ commands: MTLCommandBuffer, buffer: MTLBuffer, ring: Ring, slot: Int,
                                into texture: MTLTexture) -> SlotRead? {
         let seq = ring.slotSeq(slot)
-        guard seq & 1 == 0, let blit = commands.makeBlitCommandEncoder() else { return nil }
+        guard seq != 0, seq & 1 == 0, let blit = commands.makeBlitCommandEncoder() else { return nil }
         blit.copy(from: buffer, sourceOffset: ring.slotOffsets[slot], sourceBytesPerRow: ring.stride,
                   sourceBytesPerImage: ring.stride * ring.height,
                   sourceSize: MTLSize(width: ring.width, height: ring.height, depth: 1),

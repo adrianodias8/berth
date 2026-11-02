@@ -285,7 +285,7 @@ has them):
 
 | line | does |
 |---|---|
-| `{"ev":"pointer","x":640,"y":400}` | moves the pointer there (screen points, clamped to the screen) |
+| `{"ev":"pointer","x":640,"y":400}` | moves the pointer there (screen points, clamped to the screen; berth's outputs are scale 1, so these are the surface's pixels of docs/display-protocol.md) |
 | `{"ev":"button","button":272,"down":true}` | presses or releases a button: evdev codes, 272 left, 273 right, 274 middle (0x110 to 0x117) |
 | `{"ev":"scroll","dx":0,"dy":30,"discrete":true}` | scrolls by points, positive `dy` down; `discrete` (true, or a non-zero count) sends mouse-wheel clicks of 15 points (at least one), otherwise a continuous scroll |
 | `{"ev":"key","code":30,"down":true}` | presses or releases a key: evdev codes below 0x300, on a US keymap |

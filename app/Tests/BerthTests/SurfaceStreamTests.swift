@@ -79,6 +79,51 @@ func jsonObject(_ line: String) -> NSDictionary? {
 }
 
 final class SurfaceStreamTests: XCTestCase {
+    func testASurfaceNotLiveYetWaitsForItsResize() async throws {
+        let socketPath = tempSocketPath("notlive")
+        let server = try FakeDisplayServer(path: socketPath)
+        let ring = try FakeRing(path: tempFilePath("late"), width: 64, height: 32, gen: 4)
+        let stream = SurfaceStream(machine: "dev", source: .session("s-new"), socketPath: socketPath)
+        stream.backoff = [.milliseconds(20)]
+        stream.start()
+        defer { stream.cancel() }
+
+        let conn = try await offPool { try server.accept() }
+        _ = await offPool { conn.readLine() }
+        conn.send(#"{"ok":true,"transports":["ring"],"ring":null,"gen":0,"width":0,"height":0,"stride":0,"format":"bgra8","slots":3,"live":false}"#,
+                  #"{"ev":"keepalive"}"#)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(stream.state, .connecting)
+        XCTAssertNil(stream.ring)
+
+        conn.send(#"{"ev":"resize","ring":"\#(ring.path)","gen":4,"width":64,"height":32,"stride":256,"format":"bgra8","slots":3,"live":true}"#,
+                  #"{"ev":"frame","slot":0,"seq":5,"damage":[[0,0,64,32]]}"#)
+        let live = await waitUntil { stream.state == .live && stream.pending.seq == 5 }
+        XCTAssertTrue(live, "pending \(stream.pending), state \(stream.state)")
+        XCTAssertEqual(stream.ring?.gen, 4)
+    }
+
+    func testASurfaceThatEndsBeforeItsFirstFrameIsAFailure() async throws {
+        let socketPath = tempSocketPath("neverlive")
+        let server = try FakeDisplayServer(path: socketPath)
+        let stream = SurfaceStream(machine: "dev", source: .session("s-gone"), socketPath: socketPath)
+        stream.backoff = [.milliseconds(10)]
+        stream.start()
+        defer { stream.cancel() }
+        for _ in 0..<SurfaceStream.maxFailures {
+            let conn = try await offPool { try server.accept() }
+            _ = await offPool { conn.readLine() }
+            conn.send(#"{"ok":true,"transports":["ring"],"ring":null,"live":false}"#,
+                      #"{"ev":"end","error":"session ended"}"#)
+            conn.close()
+        }
+        let gaveUp = await waitUntil {
+            if case .unavailable = stream.state { return true }
+            return false
+        }
+        XCTAssertTrue(gaveUp, "state \(stream.state)")
+    }
+
     func testStreamsFramesResizesForwardsInputAndGivesUp() async throws {
         let socketPath = tempSocketPath("disp")
         let server = try FakeDisplayServer(path: socketPath)

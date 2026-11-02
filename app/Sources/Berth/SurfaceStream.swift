@@ -193,7 +193,7 @@ final class Ring: @unchecked Sendable {
     func snapshot() -> CGImage? {
         let slot = latest
         let before = slotSeq(slot)
-        guard before & 1 == 0 else { return nil }
+        guard before != 0, before & 1 == 0 else { return nil }
         let bytes = Data(bytes: base + slotOffsets[slot], count: stride * height)
         berth_fence_acquire()
         guard slotSeq(slot) == before, let provider = CGDataProvider(data: bytes as CFData) else { return nil }
@@ -267,6 +267,9 @@ final class SurfaceStream: @unchecked Sendable {
     let source: Source
     let maxFPS: Int
     let socketPath: String
+    /// For a scanout: the desktop session input goes to. The daemon drops
+    /// input on a stream that names no session.
+    let inputSession: String?
     /// Waits between failed tries; the last repeats.
     var backoff: [Duration] = [.milliseconds(250), .milliseconds(500), .seconds(1)]
     /// Called on the main queue.
@@ -280,15 +283,18 @@ final class SurfaceStream: @unchecked Sendable {
     private var controlOn = false
     private var task: Task<Void, Never>?
 
-    init(machine: String, source: Source, maxFPS: Int = 60, socketPath: String = BerthPaths.controlSocket) {
+    init(machine: String, source: Source, inputSession: String? = nil, maxFPS: Int = 60,
+         socketPath: String = BerthPaths.controlSocket) {
         self.machine = machine
         self.source = source
+        self.inputSession = inputSession
         self.maxFPS = max(1, min(maxFPS, 120))
         self.socketPath = socketPath
     }
 
     convenience init(target: DisplayTarget, maxFPS: Int = 60, socketPath: String = BerthPaths.controlSocket) {
-        self.init(machine: target.machine, source: target.source, maxFPS: maxFPS, socketPath: socketPath)
+        self.init(machine: target.machine, source: target.source, inputSession: target.session, maxFPS: maxFPS,
+                  socketPath: socketPath)
     }
 
     deinit { cancel() }
@@ -300,11 +306,14 @@ final class SurfaceStream: @unchecked Sendable {
     var current: (ring: Ring?, pending: Pending) { lock.withLock { (_ring, _pending) } }
 
     /// The request line, as docs/display-protocol.md spells it.
-    static func request(machine: String, source: Source, maxFPS: Int) -> [String: Any] {
+    /// A scanout's request names `inputSession` too, so input reaches it.
+    static func request(machine: String, source: Source, maxFPS: Int, inputSession: String? = nil) -> [String: Any] {
         var obj: [String: Any] = ["cmd": "display", "machine": machine, "max_fps": maxFPS]
         switch source {
         case let .session(session): obj["session"] = session
-        case let .scanout(n): obj["scanout"] = n
+        case let .scanout(n):
+            obj["scanout"] = n
+            if let inputSession { obj["session"] = inputSession }
         }
         return obj
     }
@@ -383,7 +392,7 @@ final class SurfaceStream: @unchecked Sendable {
 
     /// One connection, from the request to its close.
     private func session() async -> Outcome {
-        let request = Self.request(machine: machine, source: source, maxFPS: maxFPS)
+        let request = Self.request(machine: machine, source: source, maxFPS: maxFPS, inputSession: inputSession)
         let path = socketPath
         let conn: LineStream
         do {
@@ -413,22 +422,32 @@ final class SurfaceStream: @unchecked Sendable {
             return .failed("no display reply: \(error.localizedDescription)")
         }
         guard reply.ok else { return .failed(reply.error ?? "display refused") }
-        guard reply.transports?.contains("ring") ?? true, let path = reply.ring else {
+        guard reply.transports?.contains("ring") ?? true else {
             return .failed("no ring transport offered")
         }
-        do {
-            let ring = try Ring.open(path)
-            let control = lock.withLock { () -> Bool in
-                _ring = ring
-                _pending.slot = ring.latest
-                _pending.serial += 1
-                return controlOn
+        // Not live yet (a session's capture still starting, a scanout that's
+        // off): no ring until a resize doorbell brings one. A connection that
+        // ends before then counts as a failure, so a surface that never
+        // comes still falls back to screenshots.
+        var hadRing = false
+        if let path = reply.ring {
+            do {
+                let ring = try Ring.open(path)
+                lock.withLock {
+                    _ring = ring
+                    _pending.slot = ring.latest
+                    _pending.serial += 1
+                }
+                hadRing = true
+            } catch {
+                return .failed(error.localizedDescription)
             }
-            if control { conn.send(InputEvent.control(on: true).json) }
-        } catch {
-            return .failed(error.localizedDescription)
+        } else if reply.live != false {
+            return .failed("no ring offered")
         }
-        set(.live)
+        if lock.withLock({ controlOn }) { conn.send(InputEvent.control(on: true).json) }
+        if hadRing { set(.live) }
+        let ended = { hadRing ? Outcome.wasLive : Outcome.failed("the surface ended before its first frame") }
         do {
             while let line = try await lines.next() {
                 guard let bell = try? JSONDecoder().decode(Doorbell.self, from: Data(line.utf8)) else { continue }
@@ -451,14 +470,18 @@ final class SurfaceStream: @unchecked Sendable {
                         _pending.slot = ring.latest
                         _pending.serial += 1
                     }
+                    if !hadRing {
+                        hadRing = true
+                        set(.live)
+                    }
                 case "end":
-                    return .wasLive
+                    return ended()
                 default:
                     continue // keepalive, and events newer than this app
                 }
             }
         } catch {}
-        return .wasLive
+        return ended()
     }
 }
 

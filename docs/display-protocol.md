@@ -165,7 +165,7 @@ The viewer may send one JSON line per event on the same connection:
 | Line | What |
 |---|---|
 | `{"ev":"control","on":true}` | take control (`false`: give it back). Handled by the daemon, not forwarded; each change is one line in the activity log (`verb: "control"`, `who.kind: "berth-app"`) |
-| `{"ev":"pointer","x":640,"y":400}` | move the pointer to a surface position (`0 ≤ x < width`, `0 ≤ y < height`) |
+| `{"ev":"pointer","x":640,"y":400}` | move the pointer to a surface position in pixels (`0 ≤ x < width`, `0 ≤ y < height`); the agent takes them as screen points, the same at scale 1, which is all berth's outputs use |
 | `{"ev":"button","button":272,"down":true}` | a button: 272 left, 273 right, 274 middle (evdev `BTN_*`) |
 | `{"ev":"scroll","dx":0,"dy":-15,"discrete":true}` | scroll by `dx`, `dy` (pixels, \|v\| ≤ 10000); `discrete` (optional, true/false or a number) marks wheel steps |
 | `{"ev":"key","code":30,"down":true}` | a key by evdev code (`< 0x300`; 30 is `KEY_A`) |
