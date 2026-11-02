@@ -103,19 +103,18 @@ pub fn grant(paths: &Paths, vm: &Vm) -> Result<()> {
     if !std::io::stdin().is_terminal() {
         bail!("the grants need a person: run berth mac grant {} in a terminal", vm.name);
     }
-    // Screen Recording lists the agent only once it has tried a capture.
-    let _ = call(vm, "screenshot", json!({"format": "png"}));
     control(vm, json!({"op": "display"}))?;
     let password = std::fs::read_to_string(vm.password()).ok().filter(|_| vm.load_meta().is_ok_and(|m| m.user.is_some()));
     let asks = match password.as_deref() {
-        Some(p) if p == super::DEFAULT_PASSWORD => format!(" If it asks for a password, it's {p}."),
-        Some(_) => format!(" If it asks for a password, it's in {}.", vm.password().display()),
+        Some(p) if p == super::DEFAULT_PASSWORD => format!("\n   If it asks for a password, it's {p}."),
+        Some(_) => format!("\n   If it asks for a password, it's in {}.", vm.password().display()),
         None => String::new(),
     };
     println!("{}'s window is open. berth-gui-mac needs two switches, once for this VM and its clones.", vm.name);
     while !ax {
         open(vm, ACCESSIBILITY)?;
-        wait_for_enter(&format!("In System Settings > Privacy & Security > Accessibility, switch on berth-gui-mac.{asks} Then press Enter"))?;
+        println!("\n1. In the VM: System Settings > Privacy & Security > Accessibility: switch on berth-gui-mac.{asks}");
+        wait_for_enter()?;
         (ax, screen) = permissions(vm)?;
         if !ax {
             println!("Accessibility still isn't on for berth-gui-mac.");
@@ -123,9 +122,11 @@ pub fn grant(paths: &Paths, vm: &Vm) -> Result<()> {
     }
     while !screen {
         open(vm, SCREEN_RECORDING)?;
-        wait_for_enter(&format!(
-            "In Screen & System Audio Recording, switch on berth-gui-mac (if macOS offers to quit it, choose Later).{asks} Then press Enter"
-        ))?;
+        // The pane lists the agent only once it tries a capture with the
+        // pane open (one tried earlier, before the pane, didn't show up).
+        let _ = call(vm, "screenshot", json!({"format": "png"}));
+        println!("\n2. In the VM: Screen & System Audio Recording: switch on berth-gui-mac (if macOS offers to quit it, choose Later).{asks}");
+        wait_for_enter()?;
         // Screen Recording applies to a process started after the grant.
         restart(paths, vm)?;
         screen = permissions(vm)?.1;
@@ -166,8 +167,8 @@ fn restart(paths: &Paths, vm: &Vm) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_enter(prompt: &str) -> Result<()> {
-    print!("{prompt}: ");
+fn wait_for_enter() -> Result<()> {
+    print!("   Press Enter when it's on: ");
     std::io::stdout().flush()?;
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line)? == 0 {

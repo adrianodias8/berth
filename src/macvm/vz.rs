@@ -29,7 +29,7 @@ use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, ProtocolObject};
 use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, define_class, extern_class, extern_methods, msg_send};
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSScreen, NSWindow, NSWindowStyleMask};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSApplicationTerminateReply, NSBackingStoreType, NSScreen, NSWindow, NSWindowStyleMask};
 use objc2_foundation::{NSArray, NSData, NSDictionary, NSError, NSObject, NSObjectProtocol, NSPoint, NSProgress, NSRect, NSSize, NSString, NSURL};
 use objc2_virtualization::*;
 
@@ -377,6 +377,39 @@ define_class!(
     }
 );
 
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements and this type has no Drop.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "BerthMacAppDelegate"]
+    struct AppDelegate;
+
+    unsafe impl NSObjectProtocol for AppDelegate {}
+
+    unsafe impl NSApplicationDelegate for AppDelegate {
+        /// Quit (⌘Q in the menu, the Dock icon) would end the process and
+        /// with it the VM, hard: someone closing the window killed a VM
+        /// mid-setup that way. Quitting only hides the window; the VM keeps
+        /// running like one started without it, and `berth mac stop` stops it.
+        #[unsafe(method(applicationShouldTerminate:))]
+        fn should_terminate(&self, app: &NSApplication) -> NSApplicationTerminateReply {
+            WINDOW.with(|w| {
+                if let Some(window) = w.borrow().as_ref() {
+                    window.orderOut(None);
+                }
+            });
+            app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+            NSApplicationTerminateReply::TerminateCancel
+        }
+    }
+);
+
+impl AppDelegate {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        unsafe { msg_send![Self::alloc(mtm), init] }
+    }
+}
+
 impl VmDelegate {
     fn new() -> Retained<Self> {
         let this = Self::alloc().set_ivars(());
@@ -429,6 +462,10 @@ pub fn run(vm: &Vm, display: bool) -> Result<()> {
 
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let app_delegate = AppDelegate::new(mtm);
+    app.setDelegate(Some(ProtocolObject::from_ref(&*app_delegate)));
+    // The application holds its delegate weakly.
+    std::mem::forget(app_delegate);
 
     let config = build_config(vm, &meta, &hw).inspect_err(|_| {
         for path in [vm.control(), vm.agent(), vm.pid()] {
