@@ -105,15 +105,8 @@ pub fn create(
 
 /// Linux GUI sessions are behind `"gui": true` in config.json until
 /// they're stable (docs/plans/gui-vms-agent-testing.md).
-fn gui_enabled(paths: &Paths) -> bool {
-    std::fs::read(paths.config())
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .is_some_and(|c| c.get("gui").and_then(|v| v.as_bool()) == Some(true))
-}
-
 fn require_gui(paths: &Paths) -> Result<()> {
-    if !gui_enabled(paths) {
+    if !crate::config::flag(paths, "gui") {
         bail!("Linux GUI sessions are experimental: turn them on with \"gui\": true in ~/.berth/config.json");
     }
     Ok(())

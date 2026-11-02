@@ -56,6 +56,11 @@ pub struct Request {
     pub verb: String,
     #[serde(default)]
     pub args: Value,
+    /// The payload's length (push's tar). The host doesn't half-close
+    /// after sending, so this is how the guest knows where it ends; without
+    /// it, the payload runs to EOF.
+    #[serde(default)]
+    pub payload_len: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -135,6 +140,14 @@ pub fn answer(machine: &str, request: &Request, payload: &mut dyn Read) -> (Vec<
     if request.v != 1 {
         return (fail("unsupported version"), Vec::new());
     }
+    let mut limited;
+    let payload: &mut dyn Read = match request.payload_len {
+        Some(n) => {
+            limited = (&mut *payload).take(n);
+            &mut limited
+        }
+        None => payload,
+    };
     match dispatch(machine, request, payload) {
         Ok(done) => {
             let reply = Reply { ok: true, result: done.result, error: None, payload_len: done.payload.len(), hit: done.hit };
@@ -934,6 +947,14 @@ mod tests {
         // Tests run with no berth config.json beside them.
         let out = machine_action("x", r#"{"v":1,"verb":"hello"}"#);
         assert!(out.starts_with("{\"ok\":false") && out.contains("Linux GUI sessions are off") && out.ends_with('\n'), "{out}");
+    }
+
+    #[test]
+    fn a_request_names_its_payload_length() {
+        let r: Request = serde_json::from_str(r#"{"v":1,"verb":"push","args":{"name":"a"},"payload_len":5}"#).unwrap();
+        assert_eq!(r.payload_len, Some(5));
+        let r: Request = serde_json::from_str(r#"{"v":1,"verb":"hello"}"#).unwrap();
+        assert_eq!(r.payload_len, None);
     }
 
     #[test]

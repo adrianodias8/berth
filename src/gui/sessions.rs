@@ -100,7 +100,7 @@ pub fn touch(paths: &Paths, session: &str, note: Option<&str>) -> Result<()> {
 
 /// "gui_idle_minutes" in config.json, 30 by default; 0 never expires.
 pub fn idle_minutes(paths: &Paths) -> u64 {
-    gui_log::config_value(paths, "gui_idle_minutes").and_then(|v| v.as_u64()).unwrap_or(30)
+    crate::config::value(paths, "gui_idle_minutes").and_then(|v| v.as_u64()).unwrap_or(30)
 }
 
 /// Split sessions into those still in use and those idle longer than

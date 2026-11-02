@@ -41,14 +41,14 @@ final class FeatureFlags: ObservableObject {
         if flags.gui != gui { gui = flags.gui }
     }
 
-    /// Only a JSON `true` (or the string "true") turns a flag on: a 1 that
-    /// JSONSerialization would bridge to Bool doesn't.
+    /// Only a JSON `true` turns a flag on, as for the CLI (config.rs
+    /// `flag`): a 1 that JSONSerialization would bridge to Bool doesn't.
     nonisolated static func read(_ url: URL) -> (mac: Bool, gui: Bool) {
         guard let data = try? Data(contentsOf: url),
               let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return (false, false) }
         func on(_ key: String) -> Bool {
             if let number = dict[key] as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() { return number.boolValue }
-            return (dict[key] as? String)?.lowercased() == "true"
+            return false
         }
         return (on("mac"), on("gui"))
     }
@@ -64,7 +64,8 @@ struct MacVM: Decodable, Identifiable, Hashable {
     let base: String?
     let cpus: Int
     let memoryMib: Int
-    let diskGib: Int
+    /// Space the disk image takes on the Mac (it grows as the guest writes).
+    let diskBytes: UInt64?
     let ip: String?
     var id: String { name }
     var isRunning: Bool { state == "running" }
@@ -72,7 +73,7 @@ struct MacVM: Decodable, Identifiable, Hashable {
     enum CodingKeys: String, CodingKey {
         case name, state, base, cpus, ip
         case memoryMib = "memory_mib"
-        case diskGib = "disk_gib"
+        case diskBytes = "disk_bytes"
     }
 }
 
@@ -99,13 +100,15 @@ enum MacVMs {
     /// `berth mac create`'s arguments; without a file it downloads the
     /// latest IPSW this Mac supports.
     static func createArgs(_ new: NewMacVM) -> [String] {
-        var args = ["create", new.name, "--cpus", String(new.cpus), "--memory", String(new.memoryMib), "--disk", String(new.diskGib)]
+        var args = ["create", new.name, "--cpus", String(new.cpus), "--memory-mib", String(new.memoryMib), "--disk-gib", String(new.diskGib)]
         if let ipsw = new.ipsw { args += ["--ipsw", ipsw.path] }
         return args
     }
 
     /// Lowercase letters, digits and -, 1–32 characters: it names a folder
-    /// in ~/.berth/mac and the guest's host name.
+    /// in ~/.berth/mac and the guest's host name. Stricter than the CLI's
+    /// rule (letters, digits, - _ ., up to 64), so every name made here is
+    /// one the CLI takes.
     static func validName(_ name: String) -> Bool {
         (1...32).contains(name.count) && !name.hasPrefix("-")
             && name.allSatisfy { $0.isASCII && ($0.isLowercase || $0.isNumber || $0 == "-") }
@@ -417,7 +420,7 @@ struct MacVMsView: View {
             Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 6) {
                 fact("CPUs", "\(vm.cpus)")
                 fact("Memory", MacVMs.gib(mib: vm.memoryMib))
-                fact("Disk", "\(vm.diskGib) GiB")
+                fact("Disk used", vm.diskBytes.map { String(format: "%.1f GiB", Double($0) / 1_073_741_824) } ?? "—")
                 fact("Cloned from", vm.base ?? "—")
                 fact("IP address", vm.ip ?? (vm.isRunning ? "waiting…" : "—"))
             }

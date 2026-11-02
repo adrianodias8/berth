@@ -41,6 +41,20 @@ except `ports`, which applies to new forwards right away.
 | `image_store` | `"classic"` | where Docker keeps images. `"classic"` is Docker's overlay2 store (as OrbStack uses); `"containerd"` is containerd's image store, Docker 29's own default, which holds multi-platform images and build attestations but makes each `docker build` ~1.2 s slower (it compresses and unpacks every layer). Each store lists only its own images: after a switch, pull or build them again (the other store's stay on disk until switched back). Changing it restarts dockerd at the next start |
 | `finder` | `true` | Docker volumes, machines' files and running containers' root filesystems in Finder at `~/Berth`, over SMB from the VM, while berth runs |
 
+### Experimental
+
+These turn on features that are still being built (`docs/plans/gui-vms-agent-testing.md`).
+With both flags off, nothing below runs or writes files.
+
+| Key | Default | |
+|---|---|---|
+| `mac` | `false` | macOS VMs (`berth mac`, `docs/mac-vms.md`), `mac:*` targets for `berth gui`, and the app's macOS VMs and Agents sections; applies right away |
+| `gui` | `false` | Linux GUI machines (`berth machine create --gui`, `docs/gui.md`), `linux:*` targets for `berth gui`, the app's Agents section and Display windows, and (on macOS 27, at the next start) a virtio-gpu display device in the VM |
+| `gpu_memory_mib` | `256` | MiB of host memory shared with the VM's GPU device, 16–16384, rounded up to a power of two; with `gui` on, applies on the next start |
+| `gpu_display` | `"1920x1080"` | the GPU device's display size, `WIDTHxHEIGHT` from 640x480 to 7680x4320; with `gui` on, applies on the next start |
+| `gui_idle_minutes` | `30` | `berth gui` sessions unused this long are ended by the next `berth gui` call (a throwaway macOS clone is deleted); `0` never ends them |
+| `gui_titles` | `false` | name Claude Code chats in the agent activity log by their titles, read from `~/.claude/projects` on this Mac (`docs/agents.md`) |
+
 ## Suspend instead of shutdown
 
 With `"stop": "suspend"` (or `berth stop --suspend`), `berth stop` pauses

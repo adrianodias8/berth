@@ -38,25 +38,18 @@ pub struct Who {
 }
 
 /// Who is running this process, with the chat title if that's turned on.
+/// Berth.app's own screenshot refreshes (it sets BERTH_GUI_WHO to this).
+pub const APP_KIND: &str = "berth-app";
+
 pub fn who(paths: &Paths) -> Who {
     let env: HashMap<String, String> = std::env::vars().collect();
     let parent = unsafe { libc::getppid() } as u32;
     let mut who = detect(&env, &ancestors(parent), parent);
     who.cwd = std::env::current_dir().ok().map(|d| d.to_string_lossy().into_owned());
-    if who.kind == "claude-code" && config_bool(paths, "gui_titles") {
+    if who.kind == "claude-code" && crate::config::flag(paths, "gui_titles") {
         who.title = who.chat.as_deref().and_then(|chat| claude_title(&paths.home, chat));
     }
     who
-}
-
-/// A boolean in ~/.berth/config.json; missing or unreadable is false.
-pub fn config_bool(paths: &Paths, key: &str) -> bool {
-    config_value(paths, key).and_then(|v| v.as_bool()).unwrap_or(false)
-}
-
-pub fn config_value(paths: &Paths, key: &str) -> Option<Value> {
-    let bytes = std::fs::read(paths.config()).ok()?;
-    serde_json::from_slice::<serde_json::Map<String, Value>>(&bytes).ok()?.remove(key)
 }
 
 /// Agent variables, not a user's own settings for that tool (CODEX_HOME,
@@ -89,6 +82,9 @@ fn kind_of_process(name: &str) -> Option<&'static str> {
 /// An agent inside an editor's terminal has both sets of variables: the
 /// agent's come first.
 pub fn detect(env: &HashMap<String, String>, ancestors: &[(u32, String)], parent: u32) -> Who {
+    if env.get("BERTH_GUI_WHO").is_some_and(|v| v == APP_KIND) {
+        return Who { kind: APP_KIND.into(), pid: Some(parent), ..Who::default() };
+    }
     let ancestor = |kind: &str| ancestors.iter().find(|(_, name)| kind_of_process(name) == Some(kind)).map(|(pid, _)| *pid);
     let ai_agent = env.get("AI_AGENT").map(|s| s.to_ascii_lowercase()).unwrap_or_default();
     let kind = if env.contains_key("CLAUDECODE") || env.contains_key("CLAUDE_CODE_SESSION_ID") || ai_agent.starts_with("claude") {

@@ -2,6 +2,38 @@
 
 What changed, newest first. Details are in the commit messages.
 
+## Unreleased
+
+Experimental, off unless turned on in `~/.berth/config.json`
+(`docs/configuration.md`, Experimental):
+
+- **macOS VMs** (`"mac": true`): `berth mac create|list|start|stop|reset|clone|set-base|delete|shell|info`
+  installs macOS from the newest or a given IPSW with its account set up
+  (no Setup Assistant), runs each VM in its own process with an optional
+  window, and gives clean-state clones and a one-second `reset` through APFS
+  copies. At most 2 run at once (Apple's license). `docs/mac-vms.md`.
+- **berth-gui-mac** (`guest/mac-agent`): the GUI agent for macOS guests, in
+  Swift: screenshots, accessibility tree, clicks by label, typing, keys.
+- **Linux GUI machines** (`"gui": true`): `berth machine create --gui [omarchy]`,
+  `berth machine run <name> -- <cmd>` and `berth machine display <name>`;
+  each GUI session is a headless sway or cage compositor in the machine
+  with AT-SPI accessibility. `docs/gui.md`.
+- **Agent testing**: `berth gui` (push, open, screenshot, click by label,
+  type, key, scroll, drag, tree, wait, windows, focus, quit, note,
+  sessions) and `berth mcp` (the same as MCP tools): coding agents test
+  apps in macOS VMs and Linux machines, each in its own session or
+  throwaway clone, with every action logged with the agent that ran it in
+  `~/.berth/logs/gui`. The skill: `docs/agents/SKILL.md`. `docs/agents.md`.
+- **App:** macOS VMs section (create with progress, start with a window,
+  clone, make base, reset, delete), Agents section (live session cards,
+  a timeline per chat, an inspector with the screenshot and the command to
+  rerun it, Take Over) and Display windows for Linux sessions.
+- **berth-gpu** (`"gui": true`, macOS 27): a virtio-gpu device for the
+  Linux VM: 2D scanout, EDID, hardware cursor, frames kept for screenshots.
+  berth's kernel gains DRM/virtio-gpu, udmabuf, dma-buf heaps, uinput and
+  virtio-sound (unused unless the device is there). New settings
+  `gpu_memory_mib` and `gpu_display`.
+
 ## 0.1.3 (2026-11-02)
 
 - **App:** Settings is split into tabs (General, Resources, Network,

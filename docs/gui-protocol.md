@@ -180,23 +180,26 @@ Targets are written `mac:<vm>` or `linux:<machine>`.
 
 Berth.app's Display window refreshes a Linux session with
 `berth gui screenshot … --json` every 2 s, run with `BERTH_GUI_WHO=berth-app`
-in its environment. The CLI logs those with `"who":{"kind":"berth-app"}` (or
-skips logging them); the app's Agents view hides that kind. `--json` prints
-one object with the PNG's `"path"`.
+in its environment. The CLI doesn't log those calls, they don't count as
+use of the session (it can still go idle), and the PNG goes to one file per
+session, `shots/live-<session>.png`, replaced each time. The app's Agents
+view also hides any `"who":{"kind":"berth-app"}` line. `--json` prints one
+object with the PNG's `"path"` (also as `"screenshot"`).
 
 ## Sessions
 
 Host-side state in `~/.berth/gui/sessions.json`:
 `[{"session","target","agent":who,"clone":bool,"started","last_used","note"}]`.
 Sessions idle longer than `gui_idle_minutes` (default 30) are ended by the
-next `berth gui` call or the daemon. macOS: at most 2 VMs run at once
+next `berth gui` call (the daemon doesn't expire them yet). macOS: at most 2 VMs run at once
 (Apple's license); `session new --clone` past that waits in
 `~/.berth/gui/queue.json`, first come first served.
 
 Details: times are UTC, `2026-11-02T10:00:00Z`; `note` is the session's
 latest `berth gui note`. `queue.json` is
 `[{"ticket","base","agent":who,"since","pid"}]`; an entry whose `pid` is
-gone is dropped. Running macOS VMs are counted by live
-`~/.berth/mac/*/run.pid`. A clone is named `gui-<8 hex>` and deleted when
+gone is dropped. Running macOS VMs are counted by held
+`~/.berth/mac/*/run.pid` locks. `session new --clone` without `--target`
+clones `~/.berth/mac/default-base`. A clone is named `gui-<8 hex>` and deleted when
 its session ends. Both files change only under `flock` on
 `~/.berth/gui/lock`. `gui_idle_minutes: 0` turns expiry off.

@@ -268,13 +268,13 @@ pub struct Outcome {
 
 impl Outcome {
     pub fn to_json(&self) -> Value {
-        json!({"ok": true, "verb": self.verb, "result": self.result, "hit": self.hit, "screenshot": self.screenshot})
+        json!({"ok": true, "verb": self.verb, "result": self.result, "hit": self.hit, "screenshot": self.screenshot, "path": self.screenshot})
     }
 }
 
 /// The feature flags: "mac" for macOS targets, "gui" for Linux ones.
 pub fn gate(paths: &Paths, target: Option<&Target>) -> Result<()> {
-    let (mac, gui) = (gui_log::config_bool(paths, "mac"), gui_log::config_bool(paths, "gui"));
+    let (mac, gui) = (crate::config::flag(paths, "mac"), crate::config::flag(paths, "gui"));
     match target {
         Some(Target::Mac(_)) if !mac => bail!("macOS VMs are off; turn them on with \"mac\": true in ~/.berth/config.json"),
         Some(Target::Linux(_)) if !gui => bail!("Linux GUI is off; turn it on with \"gui\": true in ~/.berth/config.json"),
@@ -344,7 +344,12 @@ pub fn perform(ctx: &mut Ctx, action: Action) -> Result<Outcome> {
         hit: None,
         who: ctx.who.clone(),
     };
-    log(ctx.paths, &line);
+    // Berth.app's Display refreshes (BERTH_GUI_WHO=berth-app) aren't an
+    // agent's work: not logged, and they don't keep a session from idling.
+    let watcher = ctx.who.kind == gui_log::APP_KIND;
+    if !watcher {
+        log(ctx.paths, &line);
+    }
     let started = Instant::now();
     let id = line.id.clone();
     let result = act(ctx, &id, action);
@@ -365,8 +370,11 @@ pub fn perform(ctx: &mut Ctx, action: Action) -> Result<Outcome> {
             line.error = Some(format!("{err:#}"));
         }
     }
-    log(ctx.paths, &line);
+    if !watcher {
+        log(ctx.paths, &line);
+    }
     if result.is_ok()
+        && !watcher
         && verb != "session.end"
         && let Some(session) = &ctx.session
     {
@@ -457,7 +465,13 @@ fn act(ctx: &mut Ctx, id: &str, action: Action) -> Result<Outcome> {
                 }
                 let shots = gui_log::shots(ctx.paths);
                 std::fs::create_dir_all(&shots)?;
-                let path = shots.join(format!("{id}.png"));
+                // The app refreshes every 2 s: one file per session, replaced.
+                let path = if ctx.who.kind == gui_log::APP_KIND {
+                    let key = ctx.session.clone().unwrap_or_else(|| target.to_string()).replace(['/', ':'], "-");
+                    shots.join(format!("live-{key}.png"))
+                } else {
+                    shots.join(format!("{id}.png"))
+                };
                 std::fs::write(&path, &bytes)?;
                 outcome.screenshot = Some(path);
                 outcome.png = bytes;
@@ -529,9 +543,15 @@ fn new_session(ctx: &Ctx, target: &Target, clone: bool) -> Result<sessions::Reco
 
 /// A throwaway clone of the target macOS VM, once a VM slot is free.
 fn new_clone_session(ctx: &Ctx) -> Result<sessions::Record> {
-    let Some(Target::Mac(base)) = &ctx.target else {
-        bail!("--clone copies a macOS VM: pass --target mac:<vm>. Linux sessions each get their own screen already");
+    // Without a target, the base `berth mac set-base` saved last.
+    let base = match &ctx.target {
+        Some(Target::Mac(base)) => base.clone(),
+        None => macos::default_base(ctx.paths).context(
+            "--clone copies a macOS VM: pass --target mac:<vm>, or save a base first (berth mac set-base <vm>)",
+        )?,
+        Some(_) => bail!("--clone copies a macOS VM: pass --target mac:<vm>. Linux sessions each get their own screen already"),
     };
+    let base = &base;
     if let Ok(vms) = macos::list()
         && !vms.iter().any(|vm| &vm.name == base)
     {

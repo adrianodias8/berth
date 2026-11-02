@@ -292,6 +292,21 @@ images, volumes, networks, Kubernetes, machines, terminals, logs, files and stat
   through `host.docker.internal` (as with OrbStack), including the forwarded
   Kubernetes API on 6443.
 
+**Experimental: macOS VMs and agent testing** (off unless turned on in
+`~/.berth/config.json`)
+- `berth mac`: macOS guests for testing Mac apps, installed with their
+  account already set up, cloned and reset to a clean state in about a
+  second (APFS copies). Two run at once, as Apple's license allows
+  (`docs/mac-vms.md`)
+- `berth machine create --gui`: Linux machines that run GTK, Qt and
+  Electron apps in their own headless Wayland sessions (`docs/gui.md`)
+- `berth gui` and `berth mcp`: coding agents push an app into a macOS VM or
+  Linux machine, open it, take screenshots, click by label and read the
+  accessibility tree, each in its own session so they never touch your
+  screen or each other's apps. Every action is logged with the agent that
+  ran it, and the app's Agents section shows what each one is doing
+  (`docs/agents.md`; for Claude Code: `claude mcp add berth -- berth mcp`)
+
 ## Requirements
 
 An Apple Silicon Mac. berth is developed and tested on macOS 27; berth's own
@@ -597,6 +612,9 @@ discussions) and the limits above:
 - `docs/configuration.md`: `~/.berth/config.json`, suspend, environment variables, files
 - `docs/troubleshooting.md`: common problems, starting over, uninstalling
 - `docs/file-sharing.md`: berth's own file sharing and its polling guest driver
+- `docs/mac-vms.md`, `docs/gui.md`, `docs/agents.md`: macOS VMs, Linux GUI
+  machines and agent testing (experimental); `docs/gui-protocol.md`: the
+  host ↔ guest GUI protocol
 - `docs/LEARNINGS.md`: platform quirks, measurements and dead ends found so far
 - `docs/KNOWN_ISSUES.md`: open review findings
 - `guest/kernel/README.md`: berth's guest kernel: what's in it, building, updating

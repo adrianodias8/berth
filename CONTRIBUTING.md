@@ -55,6 +55,7 @@ next to OrbStack or Docker Desktop. Only one of them should own
 | `.github/workflows/` | release builds |
 | `guest/kmod/virtiofs_poll/` | the polling virtio-fs guest driver (GPL-2.0) |
 | `guest/kernel/` | berth's guest kernel: build scripts, config, the driver's patch for 7.2 (GPL-2.0), `check.sh` |
+| `guest/mac-agent/` | `berth-gui-mac`, the GUI agent in macOS guests (Swift; `swift test` there) |
 | `app/` | Berth.app (SwiftUI) |
 | `scripts/` | build and signing |
 | `bench/` | benchmarks against OrbStack; results in `bench/results/` |
@@ -89,6 +90,7 @@ The README's "How it works" section explains the data paths; read it, and
 cargo test --release -p berth          # host unit tests (FUSE server, helper rules, watcher, …)
 cargo clippy --release -p berth
 cargo build --release -p berth-agent --target aarch64-unknown-linux-musl
+(cd guest/mac-agent && swift build -c release && swift test)   # the macOS guest's GUI agent
 # the agent's tests run in the VM:
 t=$(cd agent && cargo test --release --target aarch64-unknown-linux-musl --no-run 2>&1 | grep -o '/[^ )]*berth_agent-[0-9a-f]*')
 berth shell -- sudo "$t"

@@ -35,8 +35,7 @@ use crate::paths::Paths;
 pub const DEFAULT_MEMORY_MIB: u64 = 256;
 const DEFAULT_DISPLAY: (u32, u32) = (1920, 1080);
 
-/// The GPU settings from config.json. Read here until config.rs carries
-/// them.
+/// The GPU settings from config.json (keys checked by config.rs).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub gui: bool,
@@ -46,21 +45,12 @@ pub struct Settings {
 
 impl Settings {
     pub fn load(paths: &Paths) -> Self {
-        Self::parse(&std::fs::read(paths.config()).unwrap_or_default())
-    }
-
-    fn parse(json: &[u8]) -> Self {
-        #[derive(serde::Deserialize, Default)]
-        struct Config {
-            gui: Option<bool>,
-            gpu_memory_mib: Option<u64>,
-            gpu_display: Option<String>,
-        }
-        let c: Config = serde_json::from_slice(json).unwrap_or_default();
         Self {
-            gui: c.gui.unwrap_or(false),
-            memory_mib: c.gpu_memory_mib.unwrap_or(DEFAULT_MEMORY_MIB),
-            display: c.gpu_display.as_deref().and_then(parse_display).unwrap_or(DEFAULT_DISPLAY),
+            gui: crate::config::flag(paths, "gui"),
+            memory_mib: crate::config::value(paths, "gpu_memory_mib").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_MEMORY_MIB),
+            display: crate::config::value(paths, "gpu_display")
+                .and_then(|v| v.as_str().and_then(parse_display))
+                .unwrap_or(DEFAULT_DISPLAY),
         }
     }
 
@@ -111,11 +101,19 @@ mod tests {
 
     #[test]
     fn settings_default_to_off() {
-        assert_eq!(Settings::parse(b""), Settings { gui: false, memory_mib: 256, display: (1920, 1080) });
-        assert!(!Settings::parse(b"{\"cpus\": 4}").gui);
-        let s = Settings::parse(br#"{"gui": true, "gpu_memory_mib": 512, "gpu_display": "2560x1600"}"#);
+        let root = std::env::temp_dir().join(format!("berth-gpu-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = Paths { home: root.clone(), root: root.clone() };
+        let with = |json: &str| {
+            std::fs::write(paths.config(), json).unwrap();
+            Settings::load(&paths)
+        };
+        assert_eq!(Settings::load(&paths), Settings { gui: false, memory_mib: 256, display: (1920, 1080) });
+        assert!(!with("{\"cpus\": 4}").gui);
+        let s = with(r#"{"gui": true, "gpu_memory_mib": 512, "gpu_display": "2560x1600"}"#);
         assert_eq!(s, Settings { gui: true, memory_mib: 512, display: (2560, 1600) });
-        assert_eq!(Settings::parse(br#"{"gui": true, "gpu_display": "huge"}"#).display, (1920, 1080));
+        assert_eq!(with(r#"{"gui": true, "gpu_display": "huge"}"#).display, (1920, 1080));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

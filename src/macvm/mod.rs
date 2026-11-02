@@ -120,17 +120,8 @@ pub enum MacCmd {
     },
 }
 
-/// `"mac": true` in ~/.berth/config.json. A local reader until the key
-/// joins config.rs.
-fn enabled(paths: &Paths) -> bool {
-    std::fs::read(paths.config())
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .is_some_and(|c| c["mac"] == true)
-}
-
 pub fn command(paths: &Paths, cmd: MacCmd) -> Result<()> {
-    if !enabled(paths) {
+    if !crate::config::flag(paths, "mac") {
         bail!(
             "macOS VMs are experimental; to try them, add \"mac\": true to {}",
             paths.config().display()
@@ -159,10 +150,12 @@ pub fn command(paths: &Paths, cmd: MacCmd) -> Result<()> {
 
 // ---- For the gui slice (berth gui sessions and the slot queue) ----
 
-/// The macOS VMs running now (at most MAX_RUNNING).
-#[allow(dead_code)]
-pub fn running() -> Vec<String> {
-    store::running_in(&store::root(&Paths::new()))
+pub use store::MAX_RUNNING;
+
+/// The macOS VMs running now (at most MAX_RUNNING), by their held
+/// run.pid locks.
+pub fn running(paths: &Paths) -> Vec<String> {
+    store::running_in(&store::root(paths))
 }
 
 /// Start a VM as `berth mac start` does: an error, naming the running VMs,
@@ -180,9 +173,8 @@ pub fn agent_socket(name: &str) -> PathBuf {
 }
 
 /// The VM `set-base` saved last, which throwaway clones start from.
-#[allow(dead_code)]
-pub fn default_base() -> Option<String> {
-    let name = std::fs::read_to_string(default_base_file(&store::root(&Paths::new()))).ok()?;
+pub fn default_base(paths: &Paths) -> Option<String> {
+    let name = std::fs::read_to_string(default_base_file(&store::root(paths))).ok()?;
     let name = name.trim().to_string();
     store::valid_name(&name).is_ok().then_some(name)
 }

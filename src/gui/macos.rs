@@ -7,11 +7,11 @@
 //! Relies on:
 //!   berth mac clone <base> <name>       an APFS copy of a stopped base VM
 //!   berth mac start <name>              returns once the VM's process runs
-//!   berth mac stop <name>
+//!   berth mac stop <name> --force
 //!   berth mac delete <name> --yes
 //!   berth mac list --json               [{"name", "state", "base", …}]
-//! and on the files of docs/gui-protocol.md: a running VM has
-//! ~/.berth/mac/<name>/run.pid.
+//! and, in-process, on `macvm::running` (VMs whose run.pid lock is held)
+//! and `macvm::default_base`.
 
 use std::process::Command;
 
@@ -21,7 +21,7 @@ use serde::Deserialize;
 use crate::paths::Paths;
 
 /// Apple's license: at most two macOS VMs at once on a Mac.
-pub const MAX_RUNNING: usize = 2;
+pub use crate::macvm::MAX_RUNNING;
 
 #[derive(Deserialize, Debug)]
 pub struct Vm {
@@ -51,38 +51,20 @@ pub fn start(name: &str) -> Result<()> {
     berth(&["mac", "start", name]).map(drop)
 }
 
-/// Stop (if running) and delete a session's clone.
+/// Stop (if running) and delete a session's clone. It's thrown away, so
+/// no guest shutdown first.
 pub fn delete(name: &str) -> Result<()> {
-    let _ = berth(&["mac", "stop", name]);
+    let _ = berth(&["mac", "stop", name, "--force"]);
     berth(&["mac", "delete", name, "--yes"]).map(drop)
 }
 
-/// macOS VMs running now, by their run.pid files: cheaper than `mac list`,
-/// and true even while another `berth gui` is starting one.
+/// macOS VMs running now: cheaper than `mac list`, and true even while
+/// another `berth gui` is starting one (its process holds run.pid's lock).
 pub fn running(paths: &Paths) -> usize {
-    let Ok(dirs) = std::fs::read_dir(paths.root.join("mac")) else { return 0 };
-    dirs.flatten()
-        .filter_map(|d| std::fs::read_to_string(d.path().join("run.pid")).ok())
-        .filter_map(|pid| pid.trim().parse::<u32>().ok())
-        .filter(|&pid| super::sessions::alive(pid))
-        .count()
+    crate::macvm::running(paths).len()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn running_vms_are_counted_by_live_pid_files() {
-        let root = std::env::temp_dir().join(format!("berth-macvms-{}", crate::gui_log::new_id()));
-        let paths = Paths { home: root.clone(), root: root.clone() };
-        assert_eq!(running(&paths), 0);
-        for (name, pid) in [("a", std::process::id().to_string()), ("b", "999999".to_string()), ("c", "junk".to_string())] {
-            std::fs::create_dir_all(root.join("mac").join(name)).unwrap();
-            std::fs::write(root.join("mac").join(name).join("run.pid"), pid).unwrap();
-        }
-        std::fs::create_dir_all(root.join("mac/stopped")).unwrap();
-        assert_eq!(running(&paths), 1);
-        std::fs::remove_dir_all(root).unwrap();
-    }
+/// The VM `berth mac set-base` saved last.
+pub fn default_base(paths: &Paths) -> Option<String> {
+    crate::macvm::default_base(paths)
 }
