@@ -8,10 +8,13 @@ import SwiftUI
 // writes: ~/.berth/gui/sessions.json (active sessions), ~/.berth/gui/queue.json
 // (macOS sessions waiting for one of Apple's two VM slots) and the activity
 // log ~/.berth/logs/gui/<YYYY-MM-DD>.jsonl, one line when a command starts and
-// one when it ends. Nothing here talks to a guest. "Take over" shows a macOS
-// VM's screen through `berth mac start <vm> --display`; a Linux session opens
-// a Display window (Display.swift). Polled every second while on screen: the
-// log only grows, so each poll reads just the new bytes.
+// one when it ends. Nothing here talks to a guest, except that each session
+// card on screen takes its own screenshot every few seconds through the
+// Display windows' frame source (SessionPeek), which the CLI neither logs nor
+// counts as use. "Take over" shows a macOS VM's screen through `berth mac
+// start <vm> --display`; a Linux session opens a Display window
+// (Display.swift). Polled every second while on screen: the log only grows,
+// so each poll reads just the new bytes.
 
 // MARK: - Model
 
@@ -622,7 +625,8 @@ final class AgentActivity: ObservableObject {
         if sessions != self.sessions { self.sessions = sessions }
         if queued != self.queued { self.queued = queued }
         guard !events.isEmpty else { return }
-        ActivityLog.merge(events.filter { $0.who?.kind != "berth-app" }, into: &byID, order: &order)
+        // The CLI doesn't log the app's own screenshots; an older one did.
+        ActivityLog.merge(events.filter { $0.who?.kind != DisplayCapture.who }, into: &byID, order: &order)
         if order.count > limit {
             for id in order.prefix(order.count - limit) { byID[id] = nil }
             order.removeFirst(order.count - limit)
@@ -647,13 +651,14 @@ final class AgentActivity: ObservableObject {
 // MARK: - Screenshots
 
 /// Screenshots shrunk to the size they're shown at, decoded off the main
-/// thread and cached (a timeline has hundreds).
+/// thread and cached (a timeline has hundreds). A live screenshot isn't
+/// cached: its file is replaced each time.
 enum Shots {
     private static let cache = NSCache<NSString, NSImage>()
 
-    static func load(_ path: String, maxPixel: Int) async -> NSImage? {
+    static func load(_ path: String, maxPixel: Int, cached: Bool = true) async -> NSImage? {
         let key = "\(path)#\(maxPixel)" as NSString
-        if let hit = cache.object(forKey: key) { return hit }
+        if cached, let hit = cache.object(forKey: key) { return hit }
         let image = await offPool { () -> NSImage? in
             guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
             let options: [CFString: Any] = [
@@ -664,7 +669,7 @@ enum Shots {
             guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
             return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
         }
-        if let image { cache.setObject(image, forKey: key) }
+        if cached, let image { cache.setObject(image, forKey: key) }
         return image
     }
 }
@@ -672,12 +677,14 @@ enum Shots {
 struct ShotImage: View {
     let path: String?
     var maxPixel = 480
+    /// Shown instead of `path` when there is one (a card's live screenshot).
+    var live: NSImage?
     @State private var image: NSImage?
 
     var body: some View {
         ZStack {
             Rectangle().fill(.quaternary.opacity(0.6))
-            if let image {
+            if let image = live ?? image {
                 Image(nsImage: image).resizable().aspectRatio(contentMode: .fit)
             } else {
                 Image(systemName: path == nil ? "rectangle.dashed" : "photo").foregroundStyle(.tertiary)
@@ -687,7 +694,97 @@ struct ShotImage: View {
             image = nil
             if let path { image = await Shots.load(path, maxPixel: maxPixel) }
         }
-        .accessibilityLabel(path == nil ? "No screenshot" : "Screenshot")
+        .accessibilityLabel(path == nil && live == nil ? "No screenshot" : "Screenshot")
+    }
+}
+
+/// A card's own screenshot of its session, taken every few seconds while
+/// the card is on screen, so it shows what the agent sees now rather than
+/// its newest logged screenshot. Through DisplayCapture, as Display windows:
+/// the CLI doesn't log these or count them as use of the session.
+@MainActor
+final class SessionPeek: ObservableObject {
+    static let every: Duration = .seconds(3)
+
+    @Published private(set) var image: NSImage?
+    /// Why the newest try failed; the card shows the logged screenshot.
+    @Published private(set) var failure: String?
+    private var inFlight = false
+    private var failures = 0
+
+    /// Until cancelled. `stagger` spreads the cards' shots over the period.
+    func run(_ target: DisplayTarget, stagger: Duration) async {
+        try? await Task.sleep(for: stagger)
+        let clock = ContinuousClock()
+        while !Task.isCancelled {
+            let started = clock.now
+            await capture(target)
+            // A session that keeps failing (its VM stopped, it just ended)
+            // is tried less and less often, up to every 30 s.
+            let wait = failures == 0 ? Self.every : min(Self.every * (1 << min(failures, 4)), .seconds(30))
+            try? await clock.sleep(until: started + wait)
+        }
+    }
+
+    private func capture(_ target: DisplayTarget) async {
+        // A cancelled run's shot may still be going (the CLI isn't stopped):
+        // one at a time per card.
+        guard !inFlight else { return }
+        inFlight = true
+        defer { inFlight = false }
+        switch await DisplayCapture.shoot(target) {
+        case let .success(path):
+            if let shot = await Shots.load(path, maxPixel: 840, cached: false) {
+                image = shot
+                failure = nil
+                failures = 0
+            } else {
+                failed("Couldn't read \(path)")
+            }
+        case let .failure(error):
+            failed(error.message)
+        }
+    }
+
+    private func failed(_ message: String) {
+        image = nil
+        failure = message
+        failures += 1
+    }
+}
+
+/// Whether the view's window is on screen at all: false while it's
+/// minimized, hidden with the app, on another Space or covered.
+private struct WindowVisibility: NSViewRepresentable {
+    @Binding var visible: Bool
+
+    func makeNSView(context: Context) -> Watcher { Watcher() }
+
+    func updateNSView(_ view: Watcher, context: Context) {
+        view.changed = { visible = $0 }
+    }
+
+    final class Watcher: NSView {
+        var changed: ((Bool) -> Void)?
+        private var last: Bool?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            NotificationCenter.default.removeObserver(self)
+            if let window {
+                NotificationCenter.default.addObserver(self, selector: #selector(report),
+                                                       name: NSWindow.didChangeOcclusionStateNotification, object: window)
+            }
+            report()
+        }
+
+        @objc private func report() {
+            let visible = window?.occlusionState.contains(.visible) ?? false
+            guard visible != last else { return }
+            last = visible
+            // Not from inside a SwiftUI update.
+            DispatchQueue.main.async { [weak self] in self?.changed?(visible) }
+        }
     }
 }
 
@@ -705,6 +802,8 @@ struct AgentsView: View {
     @State private var selected: GuiCommand.ID? = UserDefaults.standard.string(forKey: "openCommand")
     /// "" is every app.
     @State private var app = ""
+    /// Cards take live screenshots only while the window can be seen.
+    @State private var windowVisible = true
     @Environment(\.openWindow) private var openWindow
 
     init(root: URL = BerthPaths.root) { _activity = StateObject(wrappedValue: AgentActivity(root: root)) }
@@ -765,9 +864,11 @@ struct AgentsView: View {
                             .padding([.horizontal, .top], 16)
                     }
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 280, maximum: 420), spacing: 16, alignment: .top)], spacing: 16) {
-                        ForEach(activity.sessions) { s in
+                        let count = activity.sessions.count
+                        ForEach(Array(activity.sessions.enumerated()), id: \.element.id) { index, s in
                             let latest = activity.latest(s.session)
                             SessionCard(session: s, latest: latest.command, screenshot: latest.screenshot, loggedNote: latest.note,
+                                        peeking: windowVisible, stagger: SessionPeek.every * index / count,
                                         showTimeline: {
                                             chat = latest.command?.who.chatKey ?? s.agent.chatKey
                                             selected = latest.command?.id
@@ -778,6 +879,7 @@ struct AgentsView: View {
                     }
                     .padding(16)
                 }
+                .background(WindowVisibility(visible: $windowVisible))
             }
         }
     }
@@ -867,14 +969,20 @@ private struct SessionCard: View {
     let screenshot: String?
     /// The newest `berth gui note`, when sessions.json has none.
     let loggedNote: String?
+    /// Take live screenshots (the window can be seen); the card's task
+    /// stops them when it leaves the screen.
+    let peeking: Bool
+    /// When this card's shots come in the period, so cards don't all shoot at once.
+    let stagger: Duration
     let showTimeline: () -> Void
     let takeOver: () -> Void
+    @StateObject private var peek = SessionPeek()
 
     private var who: GuiWho { latest?.who ?? session.agent }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            ShotImage(path: screenshot, maxPixel: 840)
+            ShotImage(path: screenshot, maxPixel: 840, live: peek.image)
                 .aspectRatio(16 / 10, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 6))
                 .overlay(alignment: .topLeading) {
@@ -883,7 +991,22 @@ private struct SessionCard: View {
                             .background(.red, in: Capsule()).foregroundStyle(.white).padding(6)
                     }
                 }
+                .overlay(alignment: .topTrailing) {
+                    // Not an error to shout about: the session may be between
+                    // apps, or its VM busy. The logged screenshot stands in.
+                    if let failure = peek.failure {
+                        Label(screenshot == nil ? "No screen" : "From the log", systemImage: "clock.arrow.circlepath")
+                            .font(.caption2).padding(.horizontal, 5).padding(.vertical, 2)
+                            .background(.regularMaterial, in: Capsule()).foregroundStyle(.secondary).padding(6)
+                            .help("Couldn't take a screenshot just now, so this is the agent's last one. "
+                                + (failure.split(whereSeparator: \.isNewline).last.map(String.init) ?? ""))
+                    }
+                }
                 .onTapGesture(count: 2, perform: showTimeline)
+                .task(id: peeking) {
+                    guard peeking else { return }
+                    await peek.run(DisplayTarget(target: session.target, session: session.session), stagger: stagger)
+                }
             HStack(spacing: 6) {
                 Image(systemName: who.icon).foregroundStyle(.secondary)
                 Text(who.kindName).font(.caption).foregroundStyle(.secondary)

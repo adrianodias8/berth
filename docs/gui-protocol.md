@@ -178,20 +178,29 @@ same `id`:
 
 Targets are written `mac:<vm>` or `linux:<machine>`.
 
-Berth.app's Display window refreshes a Linux session with
-`berth gui screenshot … --json` every 2 s, run with `BERTH_GUI_WHO=berth-app`
-in its environment. The CLI doesn't log those calls, they don't count as
-use of the session (it can still go idle), and the PNG goes to one file per
-session, `shots/live-<session>.png`, replaced each time. The app's Agents
-view also hides any `"who":{"kind":"berth-app"}` line. `--json` prints one
-object with the PNG's `"path"` (also as `"screenshot"`).
+Berth.app takes its own screenshots with `berth gui screenshot --target …
+--session … --json`, run with `BERTH_GUI_WHO=berth-app` in its environment:
+a Display window refreshes a Linux session every 2 s, and while the Agents
+view's Live mode is on screen (its window not minimized, hidden or covered)
+each session card shown refreshes its session, `linux:*` or `mac:*`, about
+every 3 s, staggered across the cards, one at a time per card, backing off
+to 30 s while they fail (the card then shows the newest logged screenshot,
+marked as such). The CLI doesn't log those calls, they don't count as use
+of the session (`last_used` stays put, so a watched session still goes idle
+after `gui_idle_minutes`), and the PNG goes to one file per session,
+`shots/live-<session>.png`, written aside and renamed into place, so a
+Display window and a card refreshing the same session never read a
+half-written file. The app's Agents view also hides any
+`"who":{"kind":"berth-app"}` line, in its cards and its Timeline. `--json`
+prints one object with the PNG's `"path"` (also as `"screenshot"`).
 
 ## Sessions
 
 Host-side state in `~/.berth/gui/sessions.json`:
 `[{"session","target","agent":who,"clone":bool,"started","last_used","note"}]`.
 Sessions idle longer than `gui_idle_minutes` (default 30) are ended by the
-next `berth gui` call (the daemon doesn't expire them yet). macOS: at most 2 VMs run at once
+next `berth gui` call (the daemon doesn't expire them yet). A call counts as
+use when it succeeds and isn't Berth.app's own (`BERTH_GUI_WHO=berth-app`). macOS: at most 2 VMs run at once
 (Apple's license); `session new --clone` past that waits in
 `~/.berth/gui/queue.json`, first come first served.
 

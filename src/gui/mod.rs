@@ -354,8 +354,9 @@ pub fn perform(ctx: &mut Ctx, action: Action) -> Result<Outcome> {
         hit: None,
         who: ctx.who.clone(),
     };
-    // Berth.app's Display refreshes (BERTH_GUI_WHO=berth-app) aren't an
-    // agent's work: not logged, and they don't keep a session from idling.
+    // Berth.app's refreshes (BERTH_GUI_WHO=berth-app: Display windows and
+    // Agents cards) aren't an agent's work: not logged, and they don't keep
+    // a session from idling.
     let watcher = ctx.who.kind == gui_log::APP_KIND;
     if !watcher {
         log(ctx.paths, &line);
@@ -546,18 +547,24 @@ fn act(ctx: &mut Ctx, id: &str, action: Action) -> Result<Outcome> {
                 let shots = gui_log::shots(ctx.paths);
                 gui_log::private_dir(&gui_log::dir(ctx.paths))?;
                 gui_log::private_dir(&shots)?;
-                // The app refreshes every 2 s: one file per session, replaced.
+                // The app refreshes every few seconds: one file per session,
+                // replaced.
                 let path = if ctx.who.kind == gui_log::APP_KIND {
                     let key = ctx.session.clone().unwrap_or_else(|| target.to_string()).replace(['/', ':'], "-");
                     shots.join(format!("live-{key}.png"))
                 } else {
                     shots.join(format!("{id}.png"))
                 };
+                // Written aside and renamed into place: a Display window and
+                // an Agents card may refresh the same session at once, and
+                // neither must read the other's half-written PNG.
+                let tmp = shots.join(format!(".{id}.png.tmp"));
                 {
                     use std::os::unix::fs::OpenOptionsExt;
-                    let mut file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(&path)?;
+                    let mut file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(&tmp)?;
                     std::io::Write::write_all(&mut file, &bytes)?;
                 }
+                std::fs::rename(&tmp, &path)?;
                 outcome.screenshot = Some(path);
                 outcome.png = bytes;
             }
