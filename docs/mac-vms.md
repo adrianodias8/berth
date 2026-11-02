@@ -21,12 +21,12 @@ berth mac create test --dry-run       # say what would be downloaded and stop
 `create` downloads the restore image (about 15 GB, kept in
 `~/.berth/mac/cache/` and resumed if interrupted), installs it, and boots it
 once to set up an account, so Setup Assistant never appears. The account is
-`berth` (or `--user`), with a random password kept in
-`~/.berth/mac/<name>/password` (0600; clones copy it) unless you pass
-`--password` (a password on the command line is visible in `ps`). A fixed
-password would let anything on the shared NAT subnet, such as the Linux VM's
-containers, log in as an administrator. Remote Login is on, and the account
-logs in automatically.
+`berth` with the password `berth` (or `--user`, `--password`; a password on
+the command line is visible in `ps`). It logs in automatically and Remote
+Login is on. Once the account exists, `create` adds berth's SSH key to it and
+turns off password logins over SSH: the Linux VM's containers share the same
+NAT subnet, and a well-known password must not let them in. The password then
+only works at the VM's own screen, for System Settings' prompts.
 
 Options: `--cpus` (default 4), `--memory-mib` (8192), `--disk-gib` (80; the
 image only takes the space the guest writes), `--screen WxH@2x` (default

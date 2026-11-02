@@ -20,7 +20,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -294,9 +294,11 @@ pub fn install(vm: &Vm, meta: &Meta, hw: &Hardware, ipsw: &std::path::Path) -> R
     let (done_tx, done_rx) = mpsc::channel::<Result<(), String>>();
     let (progress_tx, progress_rx) = mpsc::channel::<OnQueue<Retained<NSProgress>>>();
     let ipsw = ipsw.to_path_buf();
-    // Kept until the process exits: the installer and its VM must outlive
-    // the block that starts them.
-    static KEEP: Mutex<Vec<OnQueue<Retained<NSObject>>>> = Mutex::new(Vec::new());
+    // The installer and its VM must outlive the block that starts them, and
+    // be released once it's done: the VM holds a lock on the auxiliary
+    // storage, and the first boot (another process) needs it.
+    let keep: Arc<Mutex<Vec<OnQueue<Retained<NSObject>>>>> = Arc::default();
+    let kept = keep.clone();
     let q = queue.clone();
     queue.exec_async(move || {
         let config = config;
@@ -308,9 +310,9 @@ pub fn install(vm: &Vm, meta: &Meta, hw: &Hardware, ipsw: &std::path::Path) -> R
                 let _ = done_tx.send(err.as_ref().map_or(Ok(()), |e| Err(e.localizedDescription().to_string())));
             });
             installer.installWithCompletionHandler(&handler);
-            let mut keep = KEEP.lock().unwrap();
-            keep.push(OnQueue(Retained::into_super(machine)));
-            keep.push(OnQueue(Retained::into_super(installer)));
+            let mut kept = kept.lock().unwrap();
+            kept.push(OnQueue(Retained::into_super(machine)));
+            kept.push(OnQueue(Retained::into_super(installer)));
         }
     });
     let progress = progress_rx.recv_timeout(Duration::from_secs(60)).context("the installer didn't start")?;
@@ -331,6 +333,8 @@ pub fn install(vm: &Vm, meta: &Meta, hw: &Hardware, ipsw: &std::path::Path) -> R
         }
     };
     println!();
+    // Released on the queue they live on; exec_sync returns once they're gone.
+    queue.exec_sync(move || keep.lock().unwrap().clear());
     result.map_err(|e| anyhow!("installing macOS failed: {e}"))
 }
 

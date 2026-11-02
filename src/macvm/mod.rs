@@ -55,7 +55,7 @@ pub enum MacCmd {
         /// The account to create
         #[arg(long, default_value = "berth")]
         user: String,
-        /// The account's password (default: a random one, kept 0600 in the VM's folder)
+        /// The account's password (default: berth; SSH takes only berth's key once set up)
         #[arg(long)]
         password: Option<String>,
         /// The guest's display, in points: WIDTHxHEIGHT@1x or @2x (Retina)
@@ -263,15 +263,28 @@ fn stop_in(root: &Path, name: &str, force: bool) -> Result<()> {
         println!("{name} is not running");
         return Ok(());
     }
-    control(&vm, json!({"op": "stop", "force": force}))?;
     print!("Stopping {name}");
     std::io::stdout().flush()?;
+    // VZ's stop request is a press of the power button, which macOS answers
+    // with a dialog, not a shutdown (the VM was then stopped hard after
+    // STOP_GRACE, a bad moment for a disk about to become a base). Asking the
+    // guest over SSH shuts it down cleanly; the request and the hard stop stay
+    // as the fallback.
+    let asked = !force && guest_shutdown(&Paths::new(), &vm);
+    if !asked {
+        control(&vm, json!({"op": "stop", "force": force}))?;
+    }
+    let mut fallback = asked.then(|| Instant::now() + Duration::from_secs(45));
     let deadline = Instant::now() + vz::STOP_GRACE + Duration::from_secs(20);
     let mut ticks = 0u32;
     while vm.is_running() {
         if Instant::now() > deadline {
             println!();
             bail!("{name} is still running; try berth mac stop --force {name}");
+        }
+        if fallback.is_some_and(|t| Instant::now() > t) {
+            fallback = None;
+            control(&vm, json!({"op": "stop", "force": false}))?;
         }
         std::thread::sleep(Duration::from_millis(250));
         ticks += 1;
@@ -282,6 +295,30 @@ fn stop_in(root: &Path, name: &str, force: bool) -> Result<()> {
     }
     println!(" stopped");
     Ok(())
+}
+
+/// `shutdown -h now` in the guest, as its user through sudo with the VM's
+/// saved password (on stdin). False if the guest can't be reached that way.
+fn guest_shutdown(paths: &Paths, vm: &Vm) -> bool {
+    let (Ok(password), Ok(target)) = (std::fs::read(vm.password()), ssh_target(vm)) else {
+        return false;
+    };
+    if !key_works(paths, vm, &target) {
+        return false;
+    }
+    let Ok(mut child) = ssh_to(paths, vm)
+        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", &target, "sudo -S -p '' shutdown -h now"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(&password).and_then(|_| stdin.write_all(b"\n"));
+    }
+    child.wait().is_ok_and(|s| s.success())
 }
 
 struct CreateOptions {
@@ -379,16 +416,10 @@ fn create(paths: &Paths, name: &str, opts: CreateOptions) -> Result<()> {
         vz::install(&vm, &meta, &hw, &ipsw)?;
         println!("Installed in {:.0}s.", started.elapsed().as_secs_f64());
         // Read by the first boot, which `run` removes once it's started.
-        // A fixed default would be an admin login over SSH for anything on
-        // the shared NAT subnet (the Linux VM, its containers, other guests).
-        let password = match &opts.password {
-            Some(p) => p.clone(),
-            None => {
-                let p = random_password();
-                write_private(&vm.password(), p.as_bytes())?;
-                p
-            }
-        };
+        // The default is easy to type into the guest's own prompts; SSH
+        // stops taking passwords once setup is done (finish_setup).
+        let password = opts.password.clone().unwrap_or_else(|| DEFAULT_PASSWORD.into());
+        write_private(&vm.password(), password.as_bytes())?;
         let provision = vz::Provision { full_name: opts.user.clone(), username: opts.user.clone(), password };
         write_private(&vm.provision(), &serde_json::to_vec(&provision)?)?;
         Ok(())
@@ -398,12 +429,15 @@ fn create(paths: &Paths, name: &str, opts: CreateOptions) -> Result<()> {
         return Err(err);
     }
     start_in(&root, name, opts.display)?;
+    println!("First boot: macOS sets up user {} and logs in (a few minutes)…", opts.user);
+    let started = Instant::now();
+    finish_setup(paths, &vm)?;
     println!(
-        "First boot: macOS sets up user {} and logs in (a few minutes). Then:\n  \
-         berth mac shell {name}          (password {})\n  \
+        "{name} is set up in {:.0}s: user {}, SSH with berth's key only.\n  \
+         berth mac shell {name}\n  \
          berth mac stop {name} && berth mac set-base {name}   to make it the clean state for clones and resets",
-        opts.user,
-        if opts.password.is_some() { "as given".to_string() } else { format!("in {}", vm.password().display()) }
+        started.elapsed().as_secs_f64(),
+        opts.user
     );
     Ok(())
 }
@@ -455,11 +489,9 @@ fn asif_supported() -> bool {
         .is_some_and(|major| major >= 26)
 }
 
-/// 20 characters from an unambiguous alphabet (about 100 bits).
-fn random_password() -> String {
-    const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    (0..20).map(|_| ALPHABET[unsafe { libc::arc4random_uniform(ALPHABET.len() as u32) } as usize] as char).collect()
-}
+/// The account's password unless --password: typed at the VM's screen
+/// (System Settings' prompts), never accepted over SSH once set up.
+const DEFAULT_PASSWORD: &str = "berth";
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -693,25 +725,122 @@ fn shell(paths: &Paths, root: &Path, name: &str, command: &[String]) -> Result<(
     if !vm.is_running() {
         bail!("{name} isn't running: berth mac start {name}");
     }
+    let target = ssh_target(&vm)?;
+    // Agents run this unattended, so berth's key goes into the guest on
+    // first use (create normally did it already). The key lives on the
+    // guest's disk: clones and resets bring it along or not, so ask the
+    // guest rather than keeping a marker here.
+    if !key_works(paths, &vm, &target) && paths.ssh_key().exists() && vm.password().exists() {
+        authorize_key(paths, &vm, &target)?;
+    }
+    let mut ssh = ssh_to(paths, &vm);
+    ssh.arg(&target);
+    if command.is_empty() {
+        ssh.arg("-t");
+    }
+    ssh.args(command);
+    Err(ssh.exec().into())
+}
+
+/// `user@address` of a running VM, the address from the DHCP leases.
+fn ssh_target(vm: &Vm) -> Result<String> {
     let meta = vm.load_meta()?;
     let hw = vm.load_hw()?;
-    let ip = dhcp::lookup(&hw.mac_address)
-        .with_context(|| format!("{name} has no address yet (no DHCP lease for {} in {}); is it still booting?", hw.mac_address, dhcp::LEASES))?;
-    let user = meta.user.unwrap_or_else(|| "berth".into());
+    let ip = dhcp::lookup(&hw.mac_address).with_context(|| {
+        format!("{} has no address yet (no DHCP lease for {} in {}); is it still booting?", vm.name, hw.mac_address, dhcp::LEASES)
+    })?;
+    Ok(format!("{}@{ip}", meta.user.unwrap_or_else(|| "berth".into())))
+}
+
+fn ssh_to(paths: &Paths, vm: &Vm) -> Command {
     let mut ssh = Command::new("ssh");
     // The address comes from the DHCP leases, which anything on the NAT
     // subnet can influence: pin the host key per VM (trusted on first use),
     // under an alias, since addresses are reused across VMs.
     ssh.args(["-o", "StrictHostKeyChecking=accept-new", "-o", "HostKeyAlias=berth-mac-vm", "-o", "LogLevel=ERROR"]);
     ssh.arg("-o").arg(format!("UserKnownHostsFile={}", vm.known_hosts().display()));
-    // berth's key, for a guest it was added to (else the password).
     if paths.ssh_key().exists() {
         ssh.arg("-i").arg(paths.ssh_key());
     }
-    ssh.arg(format!("{user}@{ip}"));
-    if command.is_empty() {
-        ssh.arg("-t");
+    ssh
+}
+
+fn key_works(paths: &Paths, vm: &Vm, target: &str) -> bool {
+    paths.ssh_key().exists()
+        && ssh_to(paths, vm)
+            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", target, "true"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+}
+
+/// After the first boot: wait for the account and SSH, add berth's key,
+/// then turn off password logins over SSH. The default password is a
+/// well-known one, so it may only work at the VM's own screen (where it's
+/// typed into System Settings' prompts), not for anything on the NAT subnet
+/// the Linux VM and its containers share.
+fn finish_setup(paths: &Paths, vm: &Vm) -> Result<()> {
+    let password = std::fs::read(vm.password()).context("reading the VM's password")?;
+    let deadline = Instant::now() + Duration::from_secs(20 * 60);
+    let target = loop {
+        // Until sshd listens, ssh would only print "Connection refused".
+        if let Ok(target) = ssh_target(vm)
+            && target.rsplit('@').next().and_then(|ip| ip.parse().ok()).is_some_and(|ip: std::net::IpAddr| {
+                std::net::TcpStream::connect_timeout(&(ip, 22).into(), Duration::from_secs(2)).is_ok()
+            })
+            && (key_works(paths, vm, &target) || authorize_key(paths, vm, &target).is_ok())
+        {
+            break target;
+        }
+        if Instant::now() > deadline {
+            bail!("{} didn't finish setting up its account within 20 minutes; see {}", vm.name, vm.log().display());
+        }
+        std::thread::sleep(Duration::from_secs(10));
+    };
+    // sshd takes the first value it reads, and macOS's own file is
+    // 100-macos.conf; sshd starts per connection, so no restart is needed.
+    let mut child = ssh_to(paths, vm)
+        .args(["-o", "BatchMode=yes", &target])
+        .arg("sudo -S -p '' sh -c 'printf \"PasswordAuthentication no\\nKbdInteractiveAuthentication no\\n\" > /etc/ssh/sshd_config.d/000-berth.conf'")
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("running ssh")?;
+    let mut stdin = child.stdin.take().context("ssh's stdin")?;
+    stdin.write_all(&password)?;
+    stdin.write_all(b"\n")?;
+    drop(stdin);
+    if !child.wait()?.success() {
+        bail!("couldn't turn off password logins over SSH in {}", vm.name);
     }
-    ssh.args(command);
-    Err(ssh.exec().into())
+    Ok(())
+}
+
+/// Add berth's public key to the guest user's authorized_keys, logging in
+/// with the VM's saved password through SSH_ASKPASS (a script that prints
+/// the password file, so the password itself is never in an argument).
+fn authorize_key(paths: &Paths, vm: &Vm, target: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let public = std::fs::read(paths.ssh_key().with_extension("pub")).context("reading berth's public SSH key")?;
+    let askpass = vm.dir.join("askpass");
+    let quoted = vm.password().display().to_string().replace('\'', "'\\''");
+    std::fs::write(&askpass, format!("#!/bin/sh\nexec cat '{quoted}'\n"))?;
+    std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700))?;
+    let mut child = ssh_to(paths, vm)
+        .args(["-o", "PreferredAuthentications=keyboard-interactive,password", "-o", "NumberOfPasswordPrompts=1"])
+        .args(["-o", "ConnectTimeout=10", target])
+        .arg("umask 077; mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys")
+        .env("SSH_ASKPASS", &askpass)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env_remove("DISPLAY")
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("running ssh")?;
+    child.stdin.take().context("ssh's stdin")?.write_all(&public)?;
+    let status = child.wait()?;
+    let _ = std::fs::remove_file(&askpass);
+    if !status.success() {
+        bail!("couldn't log in to {target} to add berth's SSH key ({status}); is the guest still setting up its account?");
+    }
+    Ok(())
 }

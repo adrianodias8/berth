@@ -21,8 +21,9 @@
 #   3. ./install.sh --status should then say both are granted.
 # The grants can't be scripted: TCC only takes them from a person clicking in
 # System Settings (or from an MDM profile). They're tied to the binary's code
-# signature; this ad-hoc signed build changes with every rebuild, so after
-# installing a new build, grant again (toggle off and on) in the base image.
+# signature, which this script signs with a requirement of only its
+# identifier, so newer builds installed through it keep the grants. Copying a
+# binary over it by hand loses them.
 set -eu
 
 LABEL=dev.berth.gui-mac
@@ -84,8 +85,11 @@ mkdir -p "$DIR" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs" "$HOME/Pushed"
 # Replace, don't overwrite in place: the running copy keeps its old inode.
 cp "$SRC" "$BIN.new"
 chmod 755 "$BIN.new"
-# A stable signing identifier; TCC lists the binary under this name.
-codesign --force --sign - --identifier "$LABEL" "$BIN.new" >/dev/null 2>&1 || true
+# A stable signing identifier, which TCC lists the binary under, and a
+# designated requirement of only that identifier: an ad-hoc signature's
+# default requirement is its cdhash, so every rebuild would lose the grants.
+codesign --force --sign - --identifier "$LABEL" \
+    -r="designated => identifier \"$LABEL\"" "$BIN.new" >/dev/null 2>&1 || true
 mv -f "$BIN.new" "$BIN"
 
 # The plist holds absolute paths; escape what sed would treat specially.

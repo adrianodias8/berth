@@ -79,10 +79,22 @@ enum Capture {
     }
 
     static func shoot(app: NSRunningApplication?, format: String) throws -> Shot {
-        guard allowed else {
-            throw GuiError("Screen Recording is not granted to berth-gui-mac (System Settings > Privacy & Security > Screen & System Audio Recording)")
-        }
         let type = try imageType(format)
+        // Only a hint: in a macOS 27 guest, CGPreflightScreenCaptureAccess
+        // stayed false for this LaunchAgent after the grant was switched on in
+        // System Settings. So always try, and name the grant only when the
+        // capture itself fails.
+        do {
+            return try capture(app: app, type: type, format: format)
+        } catch let e as GuiError where e.message.hasSuffix("has no window on screen") {
+            throw e
+        } catch {
+            if allowed { throw error }
+            throw GuiError("Screen Recording is not granted to berth-gui-mac (System Settings > Privacy & Security > Screen & System Audio Recording): \(error)")
+        }
+    }
+
+    static func capture(app: NSRunningApplication?, type: UTType, format: String) throws -> Shot {
         do {
             let c = try content()
             let img: CGImage
