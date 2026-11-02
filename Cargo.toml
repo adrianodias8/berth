@@ -13,6 +13,7 @@ dispatch2 = "0.3.1"
 libc = "0.2.191"
 notify = "8.2.0"
 objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "NSGraphics"] }
 objc2-foundation = "0.3.2"
 objc2-virtualization = "0.3.2"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }

@@ -13,11 +13,19 @@ That process owns `~/.berth/mac/<name>/`:
 
 | File | What |
 |---|---|
-| `disk.img`, `aux.img`, `hw.json` (hardware model + machine identifier, base64) | the VM |
-| `vm.json` | `{ "cpus", "memory_mib", "base": "<name>" or null, "created" }` |
-| `run.pid` | the VM process, while it runs |
-| `control.sock` | one JSON request line, one JSON reply line: `{"op":"status"}`, `{"op":"stop"}`, `{"op":"display"}` |
-| `agent.sock` | every connection is forwarded to vsock port **2401** in the guest |
+| `disk.img`, `aux.img`, `hw.json` | the VM; `hw.json` is `{ "hardware_model", "machine_identifier" (both base64 of their `dataRepresentation`), "mac_address" }`. A clone shares its base's hardware model but gets its own machine identifier and MAC address |
+| `vm.json` | `{ "cpus", "memory_mib", "base": "<name>" or null, "created" (Unix seconds) }`, plus optional `"user"` (the account made at install), `"display": {"width","height","ppi"}` (pixels) and `"build"` (the macOS build) |
+| `run.pid` | the VM process, while it runs; it holds an `flock` on the file, so a VM counts as running only while the lock is held |
+| `run.log` | the VM process's output |
+| `control.sock` | one JSON request line, one JSON reply line: `{"op":"status"}` → `{"ok":true,"name","state","pid","started","display":<window shown>,"agent":<agent.sock path>}`, `{"op":"stop"}` (guest shutdown, hard stop after 60 s; `"force":true` stops at once), `{"op":"display"}`; errors are `{"ok":false,"error":"…"}` |
+| `agent.sock` | every connection is forwarded to vsock port **2401** in the guest; if the guest can't be reached the host answers one line itself, `{"ok":false,"error":"…","payload_len":0}`, and closes |
+| `push/` | shared into the guest (automount tag): `/Volumes/My Shared Files/berth-push` |
+| `provision.json` | the account for the first boot after install (mode 0600), removed once that boot has started |
+| `base/disk.img`, `base/aux.img` | the clean state `berth mac set-base` saved: clones are made from it and `reset` goes back to it |
+
+`~/.berth/mac/default-base` names the VM `set-base` was last run on, which
+throwaway clones start from. At most 2 macOS VMs run at once: `berth mac
+start` (and `macvm::start`) refuse a third, naming the running ones.
 
 `berth-gui-mac` listens on `AF_VSOCK` port 2401 (`VMADDR_CID_ANY`).
 
