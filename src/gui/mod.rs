@@ -18,7 +18,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
 use crate::gui_log::{self, Line, Who};
@@ -145,6 +145,16 @@ pub enum SessionCmd {
         /// session ends (waits while 2 macOS VMs run)
         #[arg(long)]
         clone: bool,
+        /// Linux: agent (a headless sway, the default), app (one app in
+        /// cage, with --app) or desktop (the VM's screen on card0)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Linux desktop: hyprland or sway (default: hyprland if set up)
+        #[arg(long)]
+        flavour: Option<String>,
+        /// Linux: an app session running this command (the rest of the line)
+        #[arg(long, num_args = 1.., allow_hyphen_values = true, value_name = "COMMAND")]
+        app: Option<Vec<String>>,
     },
     /// End a session (the current one by default)
     End { session: Option<String> },
@@ -159,7 +169,8 @@ pub enum Action {
     /// A verb the guest carries out, with its protocol args.
     Guest { verb: &'static str, args: Value },
     Note { text: String },
-    SessionNew { clone: bool },
+    /// `linux`: session.new's kind, flavour and app for a Linux guest.
+    SessionNew { clone: bool, linux: Value },
     SessionEnd { session: Option<String> },
     SessionList,
 }
@@ -181,7 +192,11 @@ impl Action {
             Action::Push { path, to } => json!({"path": path, "dest": to}),
             Action::Guest { args, .. } => args.clone(),
             Action::Note { text } => json!({"text": text}),
-            Action::SessionNew { clone } => json!({"clone": clone}),
+            Action::SessionNew { clone, linux } => {
+                let mut args = linux.clone();
+                args["clone"] = json!(clone);
+                args
+            }
             Action::SessionEnd { session } => json!({"session": session}),
             Action::SessionList => json!({}),
         }
@@ -258,7 +273,19 @@ pub fn action(cmd: GuiCmd) -> Result<Action> {
         GuiCmd::Focus { app } => guest("focus", json!({"app": app})),
         GuiCmd::Quit { app } => guest("quit", json!({"app": app})),
         GuiCmd::Note { text } => Ok(Action::Note { text }),
-        GuiCmd::Session { action: SessionCmd::New { clone } } => Ok(Action::SessionNew { clone }),
+        GuiCmd::Session { action: SessionCmd::New { clone, kind, flavour, app } } => {
+            let mut linux = json!({});
+            if let Some(kind) = kind {
+                linux["kind"] = json!(kind);
+            }
+            if let Some(flavour) = flavour {
+                linux["flavour"] = json!(flavour);
+            }
+            if let Some(app) = app {
+                linux["app"] = json!(app);
+            }
+            Ok(Action::SessionNew { clone, linux })
+        }
         GuiCmd::Session { action: SessionCmd::End { session } } => Ok(Action::SessionEnd { session }),
         GuiCmd::Session { action: SessionCmd::List } => Ok(Action::SessionList),
         GuiCmd::Watch { .. } => bail!("watch follows a display stream; it isn't something the guest does"),
@@ -651,8 +678,16 @@ fn act(ctx: &mut Ctx, id: &str, action: Action) -> Result<Outcome> {
             Ok(Outcome { verb, result: reply.result, hit: reply.hit, ..Outcome::default() })
         }
         Action::Note { .. } => done(json!({})),
-        Action::SessionNew { clone } => {
-            let record = if clone { new_clone_session(ctx)? } else { new_session(ctx, &need_target(ctx)?, false)? };
+        Action::SessionNew { clone, linux } => {
+            let options = linux.as_object().is_some_and(|o| !o.is_empty());
+            let record = if clone {
+                ensure!(!options, "--kind, --flavour and --app are for Linux targets, not --clone");
+                new_clone_session(ctx)?
+            } else {
+                let target = need_target(ctx)?;
+                ensure!(!options || !target.is_mac(), "--kind, --flavour and --app are for Linux targets");
+                new_session(ctx, &target, false, linux)?
+            };
             {
                 let lock = sessions::lock(ctx.paths)?;
                 let mut all = sessions::load_sessions(ctx.paths, &lock);
@@ -661,7 +696,13 @@ fn act(ctx: &mut Ctx, id: &str, action: Action) -> Result<Outcome> {
             }
             ctx.target = Some(Target::parse(&record.target)?);
             ctx.session = Some(record.session.clone());
-            done(json!({"session": record.session, "target": record.target, "clone": record.clone}))
+            let mut result = json!({"session": record.session, "target": record.target, "clone": record.clone});
+            for (key, value) in [("kind", json!(record.kind)), ("renderer", json!(record.renderer)), ("scanout", json!(record.scanout))] {
+                if !value.is_null() {
+                    result[key] = value;
+                }
+            }
+            done(result)
         }
         Action::SessionEnd { session } => {
             let session = session.or_else(|| ctx.session.clone()).context("which session? Pass --session or set BERTH_GUI_SESSION")?;
@@ -715,11 +756,28 @@ fn act(ctx: &mut Ctx, id: &str, action: Action) -> Result<Outcome> {
 }
 
 /// session.new in the guest, as a host record.
-fn new_session(ctx: &Ctx, target: &Target, clone: bool) -> Result<sessions::Record> {
-    let (reply, _) = call(ctx.paths, target, None, "session.new", json!({"agent": ctx.who.kind}), None, timeout_for("session.new", &json!({})))?;
-    let session = reply.result["session"].as_str().context("the guest started a session without naming it")?.to_string();
+/// `extra` adds to the request (a Linux session's kind, flavour and app).
+fn new_session(ctx: &Ctx, target: &Target, clone: bool, extra: Value) -> Result<sessions::Record> {
+    let mut args = json!({"agent": ctx.who.kind});
+    if let Some(extra) = extra.as_object() {
+        args.as_object_mut().unwrap().extend(extra.clone());
+    }
+    let (reply, _) = call(ctx.paths, target, None, "session.new", args, None, timeout_for("session.new", &json!({})))?;
+    let r = &reply.result;
+    let session = r["session"].as_str().context("the guest started a session without naming it")?.to_string();
     let now = gui_log::now();
-    Ok(sessions::Record { session, target: target.to_string(), agent: ctx.who.clone(), clone, started: now.clone(), last_used: now, note: None })
+    Ok(sessions::Record {
+        session,
+        target: target.to_string(),
+        agent: ctx.who.clone(),
+        clone,
+        started: now.clone(),
+        last_used: now,
+        note: None,
+        kind: r["kind"].as_str().map(str::to_string),
+        renderer: r["renderer"].as_str().map(str::to_string),
+        scanout: r["scanout"].as_u64().map(|n| n as u32),
+    })
 }
 
 /// A throwaway clone of the target macOS VM, once a VM slot is free.
@@ -742,7 +800,7 @@ fn new_clone_session(ctx: &Ctx) -> Result<sessions::Record> {
     wait_for_slot(ctx, base, &vm)?;
     let started = (|| {
         wait_for_agent(ctx.paths, &Target::Mac(vm.clone()))?;
-        new_session(ctx, &Target::Mac(vm.clone()), true)
+        new_session(ctx, &Target::Mac(vm.clone()), true, json!({}))
     })();
     if started.is_err() {
         let _ = macos::delete(&vm);

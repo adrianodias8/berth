@@ -130,6 +130,10 @@ fn serve(stream: UnixStream, seen: &Mutex<Seen>) {
             _ if request["session"] == "s-lost" => (json!({"ok": false, "error": "no session s-lost in dev"}), b""),
             "session.list" => (json!({"ok": true, "result": {"sessions": [{"session": "s-1234", "agent": "claude-code", "apps": []}]}}), b""),
             "hello" => (json!({"ok": true, "result": {"os": "macos", "agent": "fake", "screen": [1440, 900], "scale": 2}}), b""),
+            "session.new" if args["kind"] == "desktop" => (
+                json!({"ok": true, "result": {"session": "s-desk", "kind": "desktop", "renderer": "gles2", "flavour": "sway", "scanout": 0}}),
+                b"",
+            ),
             "session.new" => (json!({"ok": true, "result": {"session": "s-1234"}}), b""),
             "screenshot" => (json!({"ok": true, "result": {"width": 1440, "height": 900}, "payload_len": PNG.len()}), PNG),
             "push" => (json!({"ok": true, "result": {"path": format!("/Users/berth/Pushed/{}", args["name"].as_str().unwrap())}}), b""),
@@ -208,7 +212,15 @@ fn command_lines_become_protocol_args() {
     assert!(parse(&["wait", "Done", "--idle"]).is_err());
     let a = parse(&["tree", "--app", "Notes"]).unwrap();
     assert_eq!(action(a.cmd).unwrap(), Action::Guest { verb: "tree", args: json!({"app": "Notes", "depth": 12}) });
-    assert_eq!(action(parse(&["session", "new", "--clone"]).unwrap().cmd).unwrap(), Action::SessionNew { clone: true });
+    assert_eq!(action(parse(&["session", "new", "--clone"]).unwrap().cmd).unwrap(), Action::SessionNew { clone: true, linux: json!({}) });
+    assert_eq!(
+        action(parse(&["session", "new", "--kind", "desktop", "--flavour", "sway"]).unwrap().cmd).unwrap(),
+        Action::SessionNew { clone: false, linux: json!({"kind": "desktop", "flavour": "sway"}) }
+    );
+    assert_eq!(
+        action(parse(&["session", "new", "--app", "firefox", "--new-window"]).unwrap().cmd).unwrap(),
+        Action::SessionNew { clone: false, linux: json!({"app": ["firefox", "--new-window"]}) }
+    );
     assert_eq!(action(parse(&["session", "end", "s-9"]).unwrap().cmd).unwrap(), Action::SessionEnd { session: Some("s-9".into()) });
     assert_eq!(action(parse(&["key", "cmd+s"]).unwrap().cmd).unwrap(), Action::Guest { verb: "key", args: json!({"combo": "cmd+s"}) });
 }
@@ -233,7 +245,7 @@ fn a_mac_session_end_to_end() {
     fake.mac_guest("test");
     let mut ctx = fake.ctx(Some("mac:test"));
 
-    let new = perform(&mut ctx, Action::SessionNew { clone: false }).unwrap();
+    let new = perform(&mut ctx, Action::SessionNew { clone: false, linux: json!({}) }).unwrap();
     assert_eq!(render(&new), "export BERTH_GUI_SESSION=s-1234");
     assert_eq!(ctx.session.as_deref(), Some("s-1234"));
     // Later calls find the target from the session alone.
@@ -302,6 +314,17 @@ fn a_mac_session_end_to_end() {
 }
 
 #[test]
+fn linux_session_options_need_a_linux_target() {
+    let fake = Fake::new(json!({"mac": true}));
+    fake.mac_guest("test");
+    let desktop = perform(&mut fake.ctx(Some("mac:test")), Action::SessionNew { clone: false, linux: json!({"kind": "desktop"}) });
+    assert!(desktop.unwrap_err().to_string().contains("for Linux targets"));
+    let clone = perform(&mut fake.ctx(Some("mac:test")), Action::SessionNew { clone: true, linux: json!({"app": ["foot"]}) });
+    assert!(clone.unwrap_err().to_string().contains("not --clone"));
+    assert!(fake.requests().is_empty(), "nothing reaches the guest");
+}
+
+#[test]
 fn linux_through_the_daemon() {
     let fake = Fake::new(json!({"gui": true}));
     fake.linux_daemon();
@@ -320,6 +343,16 @@ fn linux_through_the_daemon() {
     let push = fake.requests().into_iter().find(|r| r["verb"] == "push").unwrap();
     assert_eq!((push["args"]["name"].as_str(), push["args"]["dest"].as_str()), (Some("-odd"), Some("/tmp")));
 
+    // A desktop: the guest's kind, renderer and scanout are kept for Berth.app.
+    let desk = perform(&mut ctx, Action::SessionNew { clone: false, linux: json!({"kind": "desktop", "flavour": "sway"}) }).unwrap();
+    assert_eq!(render(&desk), "export BERTH_GUI_SESSION=s-desk");
+    let new = fake.requests().into_iter().find(|r| r["verb"] == "session.new").unwrap();
+    assert_eq!((new["args"]["kind"].as_str(), new["args"]["flavour"].as_str()), (Some("desktop"), Some("sway")));
+    let saved = sessions::find(&fake.paths, "s-desk").unwrap().unwrap();
+    assert_eq!((saved.kind.as_deref(), saved.renderer.as_deref(), saved.scanout), (Some("desktop"), Some("gles2"), Some(0)));
+    let file: Value = serde_json::from_slice(&std::fs::read(sessions::dir(&fake.paths).join("sessions.json")).unwrap()).unwrap();
+    assert_eq!(file[0]["scanout"], 0);
+
     let mut missing = fake.ctx(Some("linux:missing"));
     let err = perform(&mut missing, Action::Guest { verb: "windows", args: json!({}) }).unwrap_err();
     assert!(err.to_string().contains("no machine named missing"), "{err}");
@@ -337,6 +370,9 @@ fn idle_sessions_end_on_the_next_call() {
         started: "2026-01-01T00:00:00Z".into(),
         last_used: "2026-01-01T00:00:00Z".into(),
         note: None,
+        kind: None,
+        renderer: None,
+        scanout: None,
     };
     {
         let lock = sessions::lock(&fake.paths).unwrap();
@@ -353,7 +389,7 @@ fn idle_sessions_end_on_the_next_call() {
 #[test]
 fn clones_are_for_macos() {
     let fake = Fake::new(json!({"gui": true}));
-    let err = perform(&mut fake.ctx(Some("linux:dev")), Action::SessionNew { clone: true }).unwrap_err();
+    let err = perform(&mut fake.ctx(Some("linux:dev")), Action::SessionNew { clone: true, linux: json!({}) }).unwrap_err();
     assert!(err.to_string().contains("--clone copies a macOS VM"), "{err}");
 }
 
@@ -380,6 +416,9 @@ fn a_clone_session_wins_over_its_base_target() {
         started: gui_log::now(),
         last_used: gui_log::now(),
         note: None,
+        kind: None,
+        renderer: None,
+        scanout: None,
     };
     {
         let lock = sessions::lock(&fake.paths).unwrap();
@@ -407,6 +446,9 @@ fn saved(fake: &Fake, records: &[(&str, &str, bool)]) {
             started: gui_log::now(),
             last_used: gui_log::now(),
             note: None,
+            kind: None,
+            renderer: None,
+            scanout: None,
         })
         .collect();
     sessions::save_sessions(&fake.paths, &lock, &records).unwrap();
@@ -497,6 +539,9 @@ fn the_apps_screenshots_are_not_use() {
         started: used.clone(),
         last_used: used.clone(),
         note: None,
+        kind: None,
+        renderer: None,
+        scanout: None,
     };
     {
         let lock = sessions::lock(&fake.paths).unwrap();

@@ -67,6 +67,12 @@ units); otherwise directly. `session.new` and `session.list` say each
 session's `kind` and `renderer`, and a desktop's `flavour` and
 `"scanout": 0`.
 
+From the Mac: `berth gui --target linux:dev session new --kind desktop
+[--flavour sway]`, or `--app firefox` for an app session. The host keeps
+`kind`, `renderer` and `scanout` in `~/.berth/gui/sessions.json`, where
+Berth.app finds them: a desktop's Display window shows scanout 0 and sends
+its input to the session.
+
 Rendering is GLES on the render node (`"renderer": "gles2"`) when the VM's
 GPU does 3D (virgl), else the CPU (`pixman`); a compositor that doesn't
 come up on GLES is started again on pixman, its first log kept as

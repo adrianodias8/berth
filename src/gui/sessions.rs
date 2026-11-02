@@ -22,6 +22,15 @@ pub struct Record {
     pub last_used: String,
     /// The latest `berth gui note` in this session.
     pub note: Option<String>,
+    /// Linux: what the guest started (agent, app or desktop), how its
+    /// compositor renders (gles2, pixman), and for a desktop the VM scanout
+    /// that shows it (Berth.app's Display window reads these).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renderer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanout: Option<u32>,
 }
 
 /// A `session new --clone` waiting for a macOS VM slot.
@@ -262,6 +271,9 @@ mod tests {
             started: last_used.into(),
             last_used: last_used.into(),
             note: None,
+            kind: None,
+            renderer: None,
+            scanout: None,
         }
     }
 

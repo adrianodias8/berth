@@ -281,7 +281,7 @@ fn action_for(name: &str, a: &Value) -> Result<Action> {
     };
     let guest = |verb, args| Ok(Action::Guest { verb, args });
     match name {
-        "gui_session_new" => Ok(Action::SessionNew { clone: a["clone"] == true }),
+        "gui_session_new" => Ok(Action::SessionNew { clone: a["clone"] == true, linux: json!({}) }),
         "gui_session_end" => Ok(Action::SessionEnd { session: s("session") }),
         "gui_session_list" => Ok(Action::SessionList),
         "gui_push" => Ok(Action::Push { path: pushable(&need("path")?)?, to: s("to") }),

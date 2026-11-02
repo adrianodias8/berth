@@ -214,7 +214,8 @@ pub fn display(paths: &Paths, name: &str, session: Option<&str>, screenshot: Opt
         }
     }
     println!();
-    println!("Sessions run headless: watch one in Berth.app (Agents > Watch opens its Display window).");
+    println!("Watch one in Berth.app (Agents > Watch opens its Display window). A desktop session drives the VM's");
+    println!("own display: berth gui --target linux:{name} session new --kind desktop, then watch it the same way.");
     println!("To see one now, save its screen: berth machine display {name} --session <id> --screenshot screen.png");
     Ok(())
 }
