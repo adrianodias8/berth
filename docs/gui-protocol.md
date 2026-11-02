@@ -233,3 +233,92 @@ gone is dropped. Running macOS VMs are counted by held
 clones `~/.berth/mac/default-base`. A clone is named `gui-<8 hex>` and deleted when
 its session ends. Both files change only under `flock` on
 `~/.berth/gui/lock`. `gui_idle_minutes: 0` turns expiry off.
+
+## Streams (Linux)
+
+Two verbs are the exception to one request per connection: after their
+reply the connection stays open and carries a stream, for a live Display
+window (the daemon's `display` request, whose ring, doorbell and input
+lines are `docs/display-protocol.md`). Both work in one session
+(`session` as for any verb) and only over the `gui <machine>` channel (or
+`gui-local`); the `machine gui` action and any other path answer
+`"<verb> needs the gui channel (a stream)"`.
+
+| verb | args | after the reply |
+|---|---|---|
+| `screen.stream` | `{"format":"bgra8","max_fps":60}` (both optional; `max_fps` 1 to 120) | guest → host: frame records |
+| `input.stream` | `{}` | host → guest: input lines; guest → host: `{"error"}` lines for lines it refused |
+
+The reply is the usual line, `{"ok":true,"result":{},"error":null,"payload_len":0}`,
+or `ok: false` with why (no such session, the machine isn't running), after
+which the connection closes as for any verb.
+
+**Frame records.** Each is one JSON line, then `payload_len` bytes:
+
+```json
+{"seq":1,"w":1280,"h":800,"stride":5120,"format":"bgra8","damage":[[0,0,1280,800]],"payload_len":4096000}
+```
+
+- `seq` counts records from 1. `w`, `h` are the screen in pixels; `stride`
+  is a full frame's packed row, `w*4`.
+- `damage` lists the rectangles `[x,y,w,h]` (top-left origin) that changed
+  since the record before. The payload is each rectangle's rows in turn,
+  top to bottom, packed: `w*4` bytes a row, B, G, R, A, opaque. More than
+  16 rectangles in a frame come as their bounding box.
+- The first record is the whole screen, and so is the first after a size
+  change (a new `w`/`h`) or a capture the compositor failed.
+- Records come only when something changed (wlr-screencopy's
+  copy_with_damage), at most `max_fps` a second (default 60), so a still
+  screen sends nothing. The cursor isn't in the pixels.
+- `{"format":"resource",…,"payload_len":0}`, carrying a virtio-gpu
+  `res_id` instead of pixels, is reserved for a dmabuf capture; asking for
+  `"format":"resource"` today gives one `{"error":"not implemented"}` line.
+- A line `{"error":"…"}` is the stream's last: `"session ended"` when the
+  session's compositor has gone, else what failed.
+
+**Input lines** (one JSON object per line, as `docs/display-protocol.md`
+has them):
+
+| line | does |
+|---|---|
+| `{"ev":"pointer","x":640,"y":400}` | moves the pointer there (screen points, clamped to the screen) |
+| `{"ev":"button","button":272,"down":true}` | presses or releases a button: evdev codes, 272 left, 273 right, 274 middle (0x110 to 0x117) |
+| `{"ev":"scroll","dx":0,"dy":30,"discrete":true}` | scrolls by points, positive `dy` down; `discrete` (true, or a non-zero count) sends mouse-wheel clicks of 15 points (at least one), otherwise a continuous scroll |
+| `{"ev":"key","code":30,"down":true}` | presses or releases a key: evdev codes below 0x300, on a US keymap |
+| `{"ev":"release_all"}` | releases every key and button held |
+| `{"ev":"control","on":false}` | the host's control toggle: off releases everything, on does nothing |
+
+The guest keeps one virtual pointer and one virtual keyboard for the
+stream's life, so keys stay held between lines (toolkits repeat them). The
+modifier state follows the modifier keys held (42/54 Shift, 29/97 Ctrl,
+56/100 Alt, 125/126 Super; Caps Lock and Num Lock lock on their press). A
+press of a key or button already held, or a release of one that isn't, is
+ignored. A line it can't use (unknown `ev`, a code out of range, bad JSON)
+is answered with `{"error":"…"}` and skipped.
+
+**Lifetime.** A stream ends when either side closes:
+
+- the host closing (or half-closing) its side: the guest's process gets
+  EOF, input releases everything still held, and it is stopped if it
+  hasn't exited within 2 s;
+- the session ending, or its process failing: a last `{"error"}` record,
+  then the guest closes.
+
+The host keeps its side open for as long as it wants the stream, even for
+`screen.stream`, where it sends nothing.
+
+**In the guest.** Each stream is a process in the machine, as its user, in
+the session's environment: `$RT/berth-gui-input gui-capture '<args>'` (its
+stdout is the records) or `$RT/berth-gui-input gui-input <w>x<h>` (its stdin
+is the lines; the size is the session's), the session's copy of
+`berth-agent`, refreshed when a stream starts. On a systemd machine it is
+the unit `berth-gui-<session>-cap-<hex>` or `…-inp-<hex>` (`systemd-run
+--pipe --wait`), so `session.end` stops it with the session's other units.
+Capture is a wlr-screencopy client into a wl_shm buffer (a memfd); input
+is zwlr_virtual_pointer_v1 and zwp_virtual_keyboard_v1. Testing from a
+shell in the VM:
+
+```sh
+berth-agent gui-local dev '{"v":1,"session":"s-x","verb":"screen.stream","args":{}}' | head -c 300
+printf '%s\n' '{"ev":"pointer","x":100,"y":100}' | berth-agent gui-local dev '{"v":1,"session":"s-x","verb":"input.stream"}'
+```

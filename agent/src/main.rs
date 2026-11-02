@@ -89,9 +89,13 @@ fn main() {
             shares::mount_all();
             std::process::exit(0);
         }
-        // GUI sessions (gui/mod.rs): pointer input inside a session, and the
-        // request handler and --gui setup from a shell, for testing a build.
+        // GUI sessions (gui/mod.rs): pointer input inside a session, the
+        // streams' capture (records on stdout) and input (lines on stdin),
+        // and the request handler and --gui setup from a shell, for testing
+        // a build.
         (Some("gui-pointer"), Some(plan)) => std::process::exit(gui::local_pointer(&[plan])),
+        (Some("gui-capture"), Some(opts)) => std::process::exit(gui::capture::local(&[opts])),
+        (Some("gui-input"), Some(extent)) => std::process::exit(gui::input::local(&[extent])),
         (Some("gui-local"), Some(machine)) => {
             std::process::exit(gui::local(&std::iter::once(machine).chain(args).collect::<Vec<_>>()))
         }
