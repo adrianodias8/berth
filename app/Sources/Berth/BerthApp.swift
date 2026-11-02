@@ -45,6 +45,14 @@ struct BerthApp: App {
                 .environmentObject(engine)
                 .environmentObject(updater)
         }
+
+        // A Linux GUI session's screen (Display.swift), opened from Agents.
+        // No File menu items: it's only ever opened for a session.
+        WindowGroup("Display", id: "display", for: DisplayTarget.self) { $target in
+            if let target { DisplayWindow(target: target).environmentObject(engine) }
+        }
+        .defaultSize(width: 1024, height: 680)
+        .commandsRemoved()
     }
 }
 
@@ -52,10 +60,11 @@ struct BerthApp: App {
 struct SectionCommands: Commands {
     @AppStorage("selectedSection") private var section: Section = .containers
     @Environment(\.openWindow) private var openWindow
+    @ObservedObject private var flags = FeatureFlags.shared
 
     var body: some Commands {
         CommandGroup(before: .sidebar) {
-            ForEach(Array(Section.allCases.enumerated()), id: \.element) { i, s in
+            ForEach(Array(Section.allCases.filter { $0.isShown(flags) }.enumerated()), id: \.element) { i, s in
                 Button(s.rawValue) {
                     section = s
                     openWindow(id: "main")
@@ -116,6 +125,8 @@ struct MenuBarContent: View {
                     .frame(height: min(CGFloat(engine.containers.count) * 26, 260))
                 }
             }
+
+            AgentsMenuSection()
 
             if let error = engine.lastError {
                 Text(error).font(.caption).foregroundStyle(.red).lineLimit(3)
