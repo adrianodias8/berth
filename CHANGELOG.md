@@ -2,7 +2,7 @@
 
 What changed, newest first. Details are in the commit messages.
 
-## Unreleased
+## 0.1.3 (2026-11-02)
 
 - **App:** Settings is split into tabs (General, Resources, Network,
   Advanced). The window remembers its section, with ⌘1–⌘7 and View ›
