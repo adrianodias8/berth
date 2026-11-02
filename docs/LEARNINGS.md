@@ -142,6 +142,14 @@ something here stops being true, fix it.
     wallpaper) include `~/.local/state/omarchy/current/theme`, which only
     `omarchy-theme-set` makes. Its launcher (walker) can grab the keyboard
     from `berth gui` input (open question).
+  - Scanout readback was the desktop's bottleneck (measured 2026-11-02,
+    1080p Omarchy, a terminal scrolling): `transfer_read_iov` is a
+    `glReadPixels` into client memory, which ANGLE on Metal serves with
+    `MTLTexture getBytes`, the CPU decompressing the GPU's lossless
+    framebuffer compression. That was 92% of the virgl worker and held the
+    guest's commands up: 41 fps, berth at 97% CPU. Reading into a PBO from
+    a context in vrend's share group (src/gpu/virgl_readback.rs) has the GPU
+    copy it: 95 fps at 24%.
 
 - **Rosetta's translation cache isn't worth it here (measured 2026-10-24).**
   `VZLinuxRosettaUnixSocketCachingOptions` plus `rosettad daemon` in the

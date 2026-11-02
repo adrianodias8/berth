@@ -11,9 +11,10 @@
 //! (the resource's GL texture is vrend's), so none of vrend's GL state is
 //! touched, and the context vrend had current is current again after. It
 //! gives the same bytes `transfer_read_iov` does for what it takes: 2D
-//! RGBA/BGRA resources without Y_0_TOP (stored RGBA on GLES, BGR* swizzled
-//! back, as vrend does). Anything else, or a GL error, is `None`: the
-//! caller falls back to `transfer_read_iov`.
+//! RGBA/BGRA resources without Y_0_TOP (stored RGBA on GLES, BGR* read as
+//! BGRA through EXT_read_format_bgra, else swizzled back as vrend does).
+//! Anything else, or a GL error, is `false`: the caller falls back to
+//! `transfer_read_iov`.
 
 use std::cell::RefCell;
 use std::ffi::{CStr, c_int, c_void};
@@ -30,6 +31,9 @@ const GL_STREAM_READ: u32 = 0x88E1;
 const GL_MAP_READ_BIT: u32 = 0x0001;
 const GL_PACK_ALIGNMENT: u32 = 0x0D05;
 const GL_RGBA: u32 = 0x1908;
+/// EXT_read_format_bgra: ANGLE swizzles on the GPU.
+const GL_BGRA_EXT: u32 = 0x80E1;
+const GL_EXTENSIONS: u32 = 0x1F03;
 const GL_UNSIGNED_BYTE: u32 = 0x1401;
 const GL_NO_ERROR: u32 = 0;
 
@@ -80,6 +84,7 @@ struct Gl {
     unmap_buffer: unsafe extern "C" fn(u32) -> u8,
     get_error: unsafe extern "C" fn() -> u32,
     is_texture: unsafe extern "C" fn(u32) -> u8,
+    get_string: unsafe extern "C" fn(u32) -> *const std::ffi::c_char,
 }
 
 impl Gl {
@@ -104,6 +109,7 @@ impl Gl {
                 unmap_buffer: get(c"glUnmapBuffer")?,
                 get_error: get(c"glGetError")?,
                 is_texture: get(c"glIsTexture")?,
+                get_string: get(c"glGetString")?,
             })
         }
     }
@@ -117,6 +123,8 @@ struct Reader {
     fbo: u32,
     pbo: u32,
     pbo_size: usize,
+    /// It reads BGRA itself, so BGR* resources need no swizzle here.
+    bgra: bool,
 }
 
 enum Slot {
@@ -152,9 +160,11 @@ impl Reader {
             (gl.gen_framebuffers)(1, &mut fbo);
             (gl.gen_buffers)(1, &mut pbo);
             (gl.pixel_storei)(GL_PACK_ALIGNMENT, 4);
+            let ext = (gl.get_string)(GL_EXTENSIONS);
+            let bgra = !ext.is_null() && CStr::from_ptr(ext).to_bytes().split(|b| *b == b' ').any(|e| e == b"GL_EXT_read_format_bgra");
             let ok = (gl.get_error)() == GL_NO_ERROR;
             eglMakeCurrent(display, std::ptr::null_mut(), std::ptr::null_mut(), share);
-            ok.then_some(Reader { gl, display, context, fbo, pbo, pbo_size: 0 })
+            ok.then_some(Reader { gl, display, context, fbo, pbo, pbo_size: 0, bgra })
         }
     }
 
@@ -181,15 +191,18 @@ impl Reader {
                 (gl.buffer_data)(GL_PIXEL_PACK_BUFFER, size as isize, std::ptr::null(), GL_STREAM_READ);
                 self.pbo_size = size;
             }
-            (gl.read_pixels)(rect.x as i32, rect.y as i32, w as i32, h as i32, GL_RGBA, GL_UNSIGNED_BYTE, std::ptr::null_mut());
+            // vrend stores BGR* as RGBA on GLES: BGRA comes back as the guest's bytes.
+            let bgr = matches!(format, Format::B8G8R8A8 | Format::B8G8R8X8);
+            let swizzle = bgr && !self.bgra;
+            let read_as = if bgr && self.bgra { GL_BGRA_EXT } else { GL_RGBA };
+            (gl.read_pixels)(rect.x as i32, rect.y as i32, w as i32, h as i32, read_as, GL_UNSIGNED_BYTE, std::ptr::null_mut());
             let p = (gl.map_buffer_range)(GL_PIXEL_PACK_BUFFER, 0, size as isize, GL_MAP_READ_BIT) as *const u8;
             let ok = !p.is_null();
             if ok {
                 let src = std::slice::from_raw_parts(p, size);
-                let bgr = matches!(format, Format::B8G8R8A8 | Format::B8G8R8X8);
                 for (y, s) in src.chunks_exact(row).enumerate() {
                     let d = &mut dst[y * stride..y * stride + row];
-                    if bgr {
+                    if swizzle {
                         for (d, s) in d.chunks_exact_mut(4).zip(s.chunks_exact(4)) {
                             d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
                         }
@@ -227,7 +240,10 @@ pub fn read_back(res: u32, rect: Rect, dst: &mut [u8], stride: usize) -> bool {
     READER.with_borrow_mut(|slot| {
         if let Slot::Untried = slot {
             *slot = match Reader::start() {
-                Some(r) => Slot::Ready(r),
+                Some(r) => {
+                    eprintln!("gpu: scanouts read back through a pixel buffer{}", if r.bgra { ", BGRA on the GPU" } else { "" });
+                    Slot::Ready(r)
+                }
                 None => {
                     eprintln!("gpu: no PBO readback, reading scanouts back the slow way");
                     Slot::Off
