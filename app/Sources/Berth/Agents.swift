@@ -257,13 +257,19 @@ struct GuiSession: Decodable, Identifiable, Hashable {
     var started: Date?
     var lastUsed: Date?
     var note: String?
+    /// A desktop session's VM scanout, and how the compositor renders
+    /// ("gles2", "pixman"), when the session JSON says.
+    var scanout: Int?
+    var renderer: String?
     var id: String { session }
     var isLinux: Bool { target.hasPrefix("linux:") }
+    /// What a Display window or a card's peek shows for this session.
+    var display: DisplayTarget { DisplayTarget(target: target, session: session, scanout: scanout, renderer: renderer) }
     /// "test" from "mac:test", "dev" from "linux:dev".
     var targetName: String { target.split(separator: ":", maxSplits: 1).last.map(String.init) ?? target }
 
     enum CodingKeys: String, CodingKey {
-        case session, target, agent, clone, started, note
+        case session, target, agent, clone, started, note, scanout, renderer
         case lastUsed = "last_used"
     }
 
@@ -276,6 +282,8 @@ struct GuiSession: Decodable, Identifiable, Hashable {
         started = GuiTime.parse(try? c.decodeIfPresent(JSONValue.self, forKey: .started))
         lastUsed = GuiTime.parse(try? c.decodeIfPresent(JSONValue.self, forKey: .lastUsed))
         note = try? c.decodeIfPresent(String.self, forKey: .note)
+        scanout = try? c.decodeIfPresent(Int.self, forKey: .scanout)
+        renderer = try? c.decodeIfPresent(String.self, forKey: .renderer)
     }
 }
 
@@ -698,13 +706,17 @@ struct ShotImage: View {
     }
 }
 
-/// A card's own screenshot of its session, taken every few seconds while
-/// the card is on screen, so it shows what the agent sees now rather than
-/// its newest logged screenshot. Through DisplayCapture, as Display windows:
-/// the CLI doesn't log these or count them as use of the session.
+/// A card's own view of its session while the card is on screen, so it
+/// shows what the agent sees now rather than its newest logged screenshot.
+/// Linux sessions read the daemon's display ring twice a second (a CPU
+/// copy of the newest slot, no Metal). macOS sessions, and daemons without
+/// display streams, get a screenshot every few seconds through
+/// DisplayCapture, as Display windows do: the CLI doesn't log these or
+/// count them as use of the session. A peek never sends input.
 @MainActor
 final class SessionPeek: ObservableObject {
     static let every: Duration = .seconds(3)
+    static let liveEvery: Duration = .milliseconds(500)
 
     @Published private(set) var image: NSImage?
     /// Why the newest try failed; the card shows the logged screenshot.
@@ -715,6 +727,7 @@ final class SessionPeek: ObservableObject {
     /// Until cancelled. `stagger` spreads the cards' shots over the period.
     func run(_ target: DisplayTarget, stagger: Duration) async {
         try? await Task.sleep(for: stagger)
+        if target.isLinux, await watch(target) { return }
         let clock = ContinuousClock()
         while !Task.isCancelled {
             let started = clock.now
@@ -724,6 +737,27 @@ final class SessionPeek: ObservableObject {
             let wait = failures == 0 ? Self.every : min(Self.every * (1 << min(failures, 4)), .seconds(30))
             try? await clock.sleep(until: started + wait)
         }
+    }
+
+    /// The live ring at 2 fps, until cancelled (true) or until the stream
+    /// is unavailable (false: screenshots instead).
+    private func watch(_ target: DisplayTarget) async -> Bool {
+        let stream = SurfaceStream(target: target, maxFPS: 2)
+        stream.start()
+        defer { stream.cancel() }
+        var shown: (ring: ObjectIdentifier, serial: UInt64)?
+        while !Task.isCancelled {
+            if case .unavailable = stream.state { return false }
+            let (ring, pending) = stream.current
+            if let ring, shown.map({ $0 != (ObjectIdentifier(ring), pending.serial) }) ?? true,
+               let frame = await offPool({ ring.snapshot() }) {
+                image = NSImage(cgImage: frame, size: NSSize(width: frame.width, height: frame.height))
+                failure = nil
+                shown = (ObjectIdentifier(ring), pending.serial)
+            }
+            try? await Task.sleep(for: Self.liveEvery)
+        }
+        return true
     }
 
     private func capture(_ target: DisplayTarget) async {
@@ -884,11 +918,11 @@ struct AgentsView: View {
         }
     }
 
-    /// macOS: the VM's own window. Linux: a Display window (screenshots
-    /// until the GPU display lands).
+    /// macOS: the VM's own window. Linux: a Display window (live, with
+    /// Take control, when the daemon streams the session's display).
     private func takeOver(_ s: GuiSession) {
         if s.isLinux {
-            openWindow(id: "display", value: DisplayTarget(target: s.target, session: s.session))
+            openWindow(id: "display", value: s.display)
         } else {
             Task {
                 if let error = await MacVMs.run(["start", s.targetName, "--display"]) {
@@ -1005,7 +1039,7 @@ private struct SessionCard: View {
                 .onTapGesture(count: 2, perform: showTimeline)
                 .task(id: peeking) {
                     guard peeking else { return }
-                    await peek.run(DisplayTarget(target: session.target, session: session.session), stagger: stagger)
+                    await peek.run(session.display, stagger: stagger)
                 }
             HStack(spacing: 6) {
                 Image(systemName: who.icon).foregroundStyle(.secondary)
@@ -1038,7 +1072,7 @@ private struct SessionCard: View {
                 Spacer()
                 Button(session.isLinux ? "Watch" : "Take Over", action: takeOver)
                     .help(session.isLinux
-                        ? "Linux sessions show as refreshed screenshots until the GPU display lands; watch-only"
+                        ? "Opens the session's screen in a window; Take control there to use it. The agent keeps running."
                         : "Shows the VM's screen in a window you can use. The agent keeps running.")
             }
             .controlSize(.small)
