@@ -70,6 +70,41 @@ something here stops being true, fix it.
     pixman;
   - the classes aren't in objc2-virtualization 0.3.2: declare them with
     `extern_class!`/`extern_protocol!` and look them up at runtime.
+  - S6 (config-space writes) can't run as written: the guest kernel
+    refuses to mmap a BAR (`resource0`, EINVAL) while `virtio_gpu` holds
+    it, so it needs the driver unbound first. Set aside: it only matters
+    for resizing the display without a reset.
+
+- **virglrenderer runs on ANGLE's Metal backend (spike S2, 2026-11-02,
+  macOS 27.2, Xcode 27.1): it starts and offers VIRGL v1 and VIRGL2 v2.**
+  ANGLE gives GLES 3.0 contexts on Metal (vrend asks for 4.6 and steps
+  down). What it took, all in `bench/spikes/gpu/s2-virgl-angle.sh`:
+  - googlesource answers `gclient sync`'s burst of parallel clones with
+    HTTP 429: sync with `-j 2 --no-history --shallow` and retry;
+  - ANGLE (chromium/7258) against the macOS 27 SDK: its bundled clang (an
+    LLVM 21 pre-release) can't compile the SDK's Metal headers (`INFINITY`
+    undeclared), and its lld can't read the SDK's `.tbd` stubs ("unknown
+    architecture"). Build with Xcode's clang and ld (`clang_base_path` to a
+    folder of Xcode's clang/clang++, the bundled llvm-ar and lib/clang, and
+    Xcode's libLTO; `use_lld=false use_custom_libcxx=false
+    clang_use_chrome_plugins=false treat_warnings_as_errors=false`);
+  - the Metal shader compiler is a separate download since Xcode 26
+    (`xcodebuild -downloadComponent MetalToolchain`, 839 MB), and ANGLE
+    calls it by the toolchain path, a stub that can't see it: run it
+    through `xcrun`;
+  - ANGLE's dylibs are named `./libEGL.dylib`: rename to `@rpath/…` (and
+    re-sign) so anything links and dlopens them through its own rpath.
+    `DYLD_LIBRARY_PATH` is dropped through `scripts/sign.sh`;
+  - libepoxy has no EGL on Apple and looks for `.so` names there: two
+    lines, `PLATFORM_HAS_EGL` on and `@rpath/libEGL.dylib` /
+    `@rpath/libGLESv2.dylib`;
+  - virglrenderer needs PyYAML for its generators (Homebrew's Python has
+    none, nor a formula: a venv). It builds with no source changes, but
+    its own EGL setup (`VIRGL_RENDERER_USE_EGL`) needs GBM, so on macOS
+    it isn't compiled. The way in is callbacks v4: `get_egl_display`
+    hands it ANGLE's display, and the caller makes its contexts
+    (`create_gl_context`, `destroy_gl_context`, `make_current`:
+    surfaceless, no config, shared with the first). Don't pass `USE_EGL`.
 
 - **Rosetta's translation cache isn't worth it here (measured 2026-10-24).**
   `VZLinuxRosettaUnixSocketCachingOptions` plus `rosettad daemon` in the

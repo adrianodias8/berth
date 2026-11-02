@@ -10,9 +10,10 @@
 //! - **Start-up.** `Renderer::new` creates an ANGLE display on Metal
 //!   (`eglGetPlatformDisplay(EGL_PLATFORM_ANGLE_ANGLE, …,
 //!   EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE)`), then `virgl_renderer_init` with
-//!   `USE_EGL | USE_GLES | USE_SURFACELESS | THREAD_SYNC` and callbacks of
-//!   version 4, whose `get_egl_display` hands it that display: virglrenderer
-//!   then makes its GLES contexts on ANGLE instead of looking for Mesa.
+//!   `USE_GLES | THREAD_SYNC` and callbacks of version 4, whose
+//!   `get_egl_display` hands it that display and whose `create_gl_context`
+//!   / `make_current` make its GLES contexts on ANGLE (not `USE_EGL`: that's
+//!   virglrenderer's own EGL setup, which needs GBM, so macOS has none).
 //! - **Capsets.** `virgl_renderer_get_cap_set` / `fill_caps` for VIRGL and
 //!   VIRGL2 answer GET_CAPSET_INFO and GET_CAPSET (`capsets()`); the device
 //!   then offers F_VIRGL (device.rs).
@@ -189,7 +190,15 @@ pub mod ffi {
     unsafe extern "C" {
         pub fn eglGetPlatformDisplay(platform: u32, native_display: *mut c_void, attribs: *const isize) -> *mut c_void;
         pub fn eglInitialize(display: *mut c_void, major: *mut i32, minor: *mut i32) -> u32;
+        pub fn eglBindAPI(api: u32) -> u32;
+        pub fn eglCreateContext(display: *mut c_void, config: *mut c_void, share: *mut c_void, attribs: *const i32) -> *mut c_void;
+        pub fn eglDestroyContext(display: *mut c_void, context: *mut c_void) -> u32;
+        pub fn eglMakeCurrent(display: *mut c_void, draw: *mut c_void, read: *mut c_void, context: *mut c_void) -> u32;
     }
+
+    const EGL_OPENGL_ES_API: u32 = 0x30A0;
+    const EGL_CONTEXT_MAJOR_VERSION: i32 = 0x3098;
+    const EGL_CONTEXT_MINOR_VERSION: i32 = 0x30FB;
 
     /// The process's renderer (virglrenderer is one global per process).
     pub struct Renderer {
@@ -198,6 +207,37 @@ pub mod ffi {
 
     unsafe extern "C" fn get_egl_display(cookie: *mut c_void) -> *mut c_void {
         cookie
+    }
+
+    // With get_egl_display, virglrenderer makes no contexts itself: these
+    // make them on ANGLE's display, surfaceless and without a config
+    // (EGL_KHR_surfaceless_context, EGL_KHR_no_config_context). Shared
+    // ones share with the first, which is vrend's own.
+    static FIRST: std::sync::atomic::AtomicPtr<c_void> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+    unsafe extern "C" fn create_gl_context(cookie: *mut c_void, _scanout: c_int, param: *mut virgl_renderer_gl_ctx_param) -> virgl_renderer_gl_context {
+        use std::sync::atomic::Ordering;
+        let param = unsafe { &*param };
+        let share = if param.shared { FIRST.load(Ordering::Acquire) } else { std::ptr::null_mut() };
+        let attribs = [EGL_CONTEXT_MAJOR_VERSION, param.major_ver, EGL_CONTEXT_MINOR_VERSION, param.minor_ver, EGL_NONE as i32];
+        let ctx = unsafe {
+            eglBindAPI(EGL_OPENGL_ES_API);
+            eglCreateContext(cookie, std::ptr::null_mut(), share, attribs.as_ptr())
+        };
+        // vrend asks for 4.6 first and steps down; ANGLE on Metal gives 3.0.
+        if !ctx.is_null() {
+            let _ = FIRST.compare_exchange(std::ptr::null_mut(), ctx, Ordering::AcqRel, Ordering::Acquire);
+        }
+        ctx
+    }
+
+    unsafe extern "C" fn destroy_gl_context(cookie: *mut c_void, ctx: virgl_renderer_gl_context) {
+        unsafe { eglDestroyContext(cookie, ctx) };
+    }
+
+    unsafe extern "C" fn make_current(cookie: *mut c_void, _scanout: c_int, ctx: virgl_renderer_gl_context) -> c_int {
+        let ok = unsafe { eglMakeCurrent(cookie, std::ptr::null_mut(), std::ptr::null_mut(), ctx) };
+        if ok != 0 { 0 } else { -1 }
     }
 
     unsafe extern "C" fn write_fence(_cookie: *mut c_void, _fence: u32) {}
@@ -217,15 +257,17 @@ pub mod ffi {
                 let callbacks = Box::leak(Box::new(virgl_renderer_callbacks {
                     version: 4,
                     write_fence: Some(write_fence),
-                    create_gl_context: None,
-                    destroy_gl_context: None,
-                    make_current: None,
+                    create_gl_context: Some(create_gl_context),
+                    destroy_gl_context: Some(destroy_gl_context),
+                    make_current: Some(make_current),
                     get_drm_fd: None,
                     write_context_fence: None,
                     get_server_fd: None,
                     get_egl_display: Some(get_egl_display),
                 }));
-                let flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLES | VIRGL_RENDERER_USE_SURFACELESS | VIRGL_RENDERER_THREAD_SYNC;
+                // Not USE_EGL: that's virglrenderer's own EGL setup, which on
+                // macOS (no GBM) isn't built; the display comes from the callback.
+                let flags = VIRGL_RENDERER_USE_GLES | VIRGL_RENDERER_THREAD_SYNC;
                 let err = virgl_renderer_init(display, flags, callbacks);
                 if err != 0 {
                     eprintln!("gpu: virglrenderer didn't start ({err})");
