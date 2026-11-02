@@ -15,6 +15,7 @@
 //! Experimental: only with `"mac": true` in ~/.berth/config.json.
 
 mod dhcp;
+mod guest;
 mod store;
 mod vz;
 
@@ -112,6 +113,9 @@ pub enum MacCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Give berth-gui-mac its one-time Accessibility and Screen Recording
+    /// grants in a running VM (installing it first if needed); clones keep them
+    Grant { name: String },
     /// Run a VM in the foreground (used by `start`)
     #[command(hide = true)]
     Run {
@@ -145,6 +149,13 @@ pub fn command(paths: &Paths, cmd: MacCmd) -> Result<()> {
         MacCmd::Delete { name, yes } => delete(&root, &name, yes),
         MacCmd::Shell { name, command } => shell(paths, &root, &name, &command),
         MacCmd::Info { name, json } => info(&root, &name, json),
+        MacCmd::Grant { name } => {
+            let vm = existing(&root, &name)?;
+            if !vm.is_running() {
+                bail!("{name} isn't running: berth mac start {name}");
+            }
+            guest::grant(paths, &vm)
+        }
         MacCmd::Run { name, display } => vz::run(&existing(&root, &name)?, display),
     }
 }
@@ -438,12 +449,11 @@ fn create(paths: &Paths, name: &str, opts: CreateOptions) -> Result<()> {
     println!("First boot: macOS sets up user {} and logs in (a few minutes)…", opts.user);
     let started = Instant::now();
     finish_setup(paths, &vm)?;
+    println!("{name} is set up in {:.0}s: user {}, SSH with berth's key only.", started.elapsed().as_secs_f64(), opts.user);
+    guest::after_create(paths, &vm)?;
     println!(
-        "{name} is set up in {:.0}s: user {}, SSH with berth's key only.\n  \
-         berth mac shell {name}\n  \
-         berth mac stop {name} && berth mac set-base {name}   to make it the clean state for clones and resets",
-        started.elapsed().as_secs_f64(),
-        opts.user
+        "Next:\n  berth mac shell {name}\n  \
+         berth mac stop {name} && berth mac set-base {name}   to make it the clean state for clones and resets"
     );
     Ok(())
 }

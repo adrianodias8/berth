@@ -7,7 +7,7 @@ What changed, newest first. Details are in the commit messages.
 Experimental, off unless turned on in `~/.berth/config.json`
 (`docs/configuration.md`, Experimental):
 
-- **macOS VMs** (`"mac": true`): `berth mac create|list|start|stop|reset|clone|set-base|delete|shell|info`
+- **macOS VMs** (`"mac": true`): `berth mac create|list|start|stop|reset|clone|set-base|delete|shell|info|grant`
   installs macOS from the newest or a given IPSW with its account set up
   (no Setup Assistant; user and password `berth`, and SSH then takes only
   berth's key), runs each VM in its own process with an optional
@@ -15,6 +15,8 @@ Experimental, off unless turned on in `~/.berth/config.json`
   copies. At most 2 run at once (Apple's license). `docs/mac-vms.md`.
 - **berth-gui-mac** (`guest/mac-agent`): the GUI agent for macOS guests, in
   Swift: screenshots, accessibility tree, clicks by label, typing, keys.
+  Built into berth: `create` installs it and walks you through its two
+  one-time grants (`berth mac grant` later), which clones keep.
 - **Linux GUI machines** (`"gui": true`): `berth machine create --gui[=omarchy]`,
   `berth machine run <name> -- <cmd>` and `berth machine display <name>`;
   each GUI session is a headless sway or cage compositor in the machine

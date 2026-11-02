@@ -110,6 +110,10 @@ if ! grep 'accessibility:' "$LOG" 2>/dev/null | tail -n 1 | grep -q 'accessibili
     echo
     echo "Grant berth-gui-mac Accessibility and Screen Recording in System Settings,"
     echo "then run ./install.sh --status (restart it after granting Screen Recording)."
-    open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null || true
-    open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture" 2>/dev/null || true
+    # berth mac grant opens the panes itself, through the agent: `open`
+    # from an SSH session can't show them.
+    if [ -z "${BERTH_NO_PANES:-}" ]; then
+        open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null || true
+        open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture" 2>/dev/null || true
+    fi
 fi

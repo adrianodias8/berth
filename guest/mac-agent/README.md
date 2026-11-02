@@ -20,6 +20,10 @@ macOS needs no Xcode).
 
 ## Install in a base image
 
+`berth mac create` does this for you: berth carries the build
+(`scripts/build.sh` makes it) and `berth mac grant <vm>` walks through the
+grants. By hand:
+
 Copy the binary, `install.sh` and `dev.berth.gui-mac.plist` into the guest
 (the push share or `scp`), then, as the auto-login user, in the guest:
 

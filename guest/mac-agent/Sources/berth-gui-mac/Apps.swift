@@ -73,7 +73,19 @@ enum Apps {
 
     /// Launches (or re-activates) an app and waits for its first window.
     static func open(_ app: String, args: [String], wait: Double) throws -> (pid_t, String?, String) {
-        let url = try resolve(app)
+        // A URL (x-apple.systempreferences:…, https://…) opens in the app that
+        // handles it: how berth shows the privacy panes for the one-time
+        // grants. `open` over SSH can't, being outside the user's session.
+        if let url = URL(string: app), let scheme = url.scheme, scheme.count > 1, !app.hasPrefix("/") {
+            guard let handler = NSWorkspace.shared.urlForApplication(toOpen: url) else {
+                throw GuiError("open: no app opens \(scheme): URLs")
+            }
+            return try launch(handler, opening: url, args: args, wait: wait)
+        }
+        return try launch(try resolve(app), opening: nil, args: args, wait: wait)
+    }
+
+    private static func launch(_ url: URL, opening document: URL?, args: [String], wait: Double) throws -> (pid_t, String?, String) {
         let config = NSWorkspace.OpenConfiguration()
         config.arguments = args
         config.activates = true
@@ -81,10 +93,15 @@ enum Apps {
         let sem = DispatchSemaphore(value: 0)
         var launched: NSRunningApplication?
         var failure: Error?
-        NSWorkspace.shared.openApplication(at: url, configuration: config) { a, e in
+        let done: (NSRunningApplication?, Error?) -> Void = { a, e in
             launched = a
             failure = e
             sem.signal()
+        }
+        if let document {
+            NSWorkspace.shared.open([document], withApplicationAt: url, configuration: config, completionHandler: done)
+        } else {
+            NSWorkspace.shared.openApplication(at: url, configuration: config, completionHandler: done)
         }
         if sem.wait(timeout: .now() + max(wait, 5)) == .timedOut {
             throw GuiError("open: \(url.lastPathComponent) didn't launch within \(Int(max(wait, 5))) s")

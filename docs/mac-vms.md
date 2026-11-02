@@ -59,8 +59,7 @@ sessions that need a VM wait in a queue for a free slot.
 Get one VM the way you want it, then save that as the clean state:
 
 ```sh
-berth mac create base
-# set it up: install berth-gui-mac and grant its permissions (below)
+berth mac create base           # in a terminal: walks you through the agent's two grants
 berth mac stop base
 berth mac set-base base         # saves base/disk.img and base/aux.img
 berth mac clone base try-1      # an APFS copy-on-write copy, own identity
@@ -76,27 +75,27 @@ base, which `berth gui session new --clone` uses when no target is given.
 ## The GUI agent and its permissions
 
 `berth gui` talks to `berth-gui-mac` in the guest (`guest/mac-agent`, see
-its README). Install it **in the base image**, so every clone has it:
+its README), which berth carries inside it. `create` installs it, then, in a
+terminal, opens the VM's window and one System Settings pane at a time:
+switch berth-gui-mac on under **Accessibility**, press Enter, then under
+**Screen & System Audio Recording**, press Enter. The password, if macOS
+asks, is `berth`. berth checks each grant and restarts the agent so Screen
+Recording applies.
+
+macOS takes these grants only from a person clicking in System Settings, so
+this is once per base image. Clones keep them, and so do newer builds of
+the agent (it's signed so that they match). When `create` runs without a
+terminal, as an agent would run it, it installs berth-gui-mac and says to
+run the grants later:
 
 ```sh
-cd guest/mac-agent && swift build -c release
-cp .build/release/berth-gui-mac install.sh dev.berth.gui-mac.plist ~/.berth/mac/base/push/
-berth mac start base --display
-# in the guest, as the berth user, from /Volumes/My Shared Files/berth-push:
-./install.sh ./berth-gui-mac
+berth mac grant base            # installs the agent if needed, then the two switches
 ```
-
-Then, in the VM's window, switch berth-gui-mac on in System Settings ›
-Privacy & Security under **Accessibility** and **Screen & System Audio
-Recording** (`install.sh` opens both panes), run `./install.sh` again, and
-check with `./install.sh --status`. macOS can't grant these from a script,
-so this is done by hand once per base image (and again after installing a
-new build of the agent). Then stop the VM and run `set-base`.
 
 ## Limits
 
 - Apple Silicon only; the guest's macOS must be one this Mac supports.
-- A clone's first boot and whether permissions survive cloning haven't been
-  measured on every macOS release yet (plan spike S5).
+- Clones keeping the grants and booting in ~10 s was measured on macOS 27.2
+  (spike S5); other macOS releases haven't been checked.
 - Socket paths must stay under 104 bytes: very long VM names under a long
   home folder fail to start (see the VM's `run.log`).
