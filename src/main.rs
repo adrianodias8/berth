@@ -209,6 +209,29 @@ enum MachineCmd {
         /// the internet only; implies --isolated)
         #[arg(long)]
         isolate_network: bool,
+        /// Set it up for GUI apps (sway, cage, AT-SPI); `--gui omarchy` on
+        /// archlinux adds Hyprland and Omarchy's configuration. Needs
+        /// "gui": true in config.json while experimental.
+        #[arg(long, num_args = 0..=1, default_missing_value = "1", value_name = "omarchy", hide = true)]
+        gui: Option<String>,
+    },
+    /// Run a GUI app in a machine, in a headless session of its own; prints
+    /// the session id (experimental: "gui": true in config.json)
+    #[command(hide = true)]
+    Run {
+        name: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
+    /// A machine's GUI sessions; --screenshot saves one's screen
+    /// (experimental: "gui": true in config.json)
+    #[command(hide = true)]
+    Display {
+        name: String,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, value_name = "FILE")]
+        screenshot: Option<std::path::PathBuf>,
     },
     /// Stop and start a machine
     Restart { name: String },
@@ -403,14 +426,19 @@ fn main() -> Result<()> {
                 bail!("berth is not running");
             }
             match action {
-                MachineCmd::Create { name, distro, arch, cloud_init, isolated, mounts, isolate_network } => machines::create(
+                MachineCmd::Create { name, distro, arch, cloud_init, isolated, mounts, isolate_network, gui } => machines::create(
                     &paths,
                     &name,
                     &distro,
                     &arch,
                     cloud_init.as_deref(),
                     machines::Isolation { isolated: isolated || !mounts.is_empty() || isolate_network, network: isolate_network, mounts },
+                    gui.as_deref(),
                 ),
+                MachineCmd::Run { name, command } => machines::run(&paths, &name, &command),
+                MachineCmd::Display { name, session, screenshot } => {
+                    machines::display(&paths, &name, session.as_deref(), screenshot.as_deref())
+                }
                 MachineCmd::Restart { name } => machines::simple(&paths, "restart", &name),
                 MachineCmd::Rename { name, new_name } => machines::rename(&paths, &name, &new_name),
                 MachineCmd::Info { name } => machines::info(&paths, &name),
