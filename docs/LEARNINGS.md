@@ -58,6 +58,16 @@ something here stops being true, fix it.
     reply interrupt back into the guest;
   - there's no API for interrupt control, but shared memory regions exist
     (relevant for a future GPU);
+  - **a custom device with ID 16 is a working virtio-gpu (spike S1,
+    2026-11-02, macOS 27.2, kernel 7.2.12-berth):** the stock `virtio_gpu`
+    driver binds it at boot (`[drm] features: -virgl +edid -resource_blob
+    +host_visible`), takes its mode from our EDID (1920x1080), and creates
+    `card0`, `renderD128` and `fb0`. Writing to `/dev/fb0` reaches the
+    Mac's scanout copy intact. The 256 MiB shared memory region shows up as
+    the driver's host memory window (`+host_visible`), the first half of
+    S4. Docker and the rest of the VM are unaffected. With no virgl capset,
+    the render node is plain software, so GUI sessions keep wlroots on
+    pixman;
   - the classes aren't in objc2-virtualization 0.3.2: declare them with
     `extern_class!`/`extern_protocol!` and look them up at runtime.
 

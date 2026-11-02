@@ -45,7 +45,9 @@ check "daemon.log: the guest driver set DRIVER_OK with edid and resource-uuid" \
 since | grep 'gpu: ' | grep -v 'virtio-gpu\|device created\|driver ready' | head -5 | sed 's/^/INFO  /'
 
 # The guest side: the driver bound, the mode we offered, the nodes.
-guest() { "$BERTH" shell -- sudo sh -c "$1"; }
+# The script goes in on stdin: `berth shell` joins its arguments into one
+# command line, which would split a `sh -c "<script>"` into words.
+guest() { printf '%s\n' "$1" | "$BERTH" shell -- sudo sh; }
 check "guest: virtio_gpu bound a virtio device" \
     "guest 'for d in /sys/bus/virtio/devices/*; do [ \"\$(cat \$d/device)\" = 0x0010 ] && readlink \$d/driver; done | grep -q virtio_gpu'"
 check "guest: /dev/dri/card0 exists" "guest 'test -c /dev/dri/card0'"
