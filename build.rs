@@ -75,6 +75,11 @@ fn virgl(manifest: &Path) {
     }
 
     println!("cargo:rustc-link-search=native={}", lib.display());
+    // Weakly: a copy of the binary without them next to it still starts
+    // (`berth helper install` copies it to /Library/PrivilegedHelperTools),
+    // and Renderer::get finds them missing instead of dyld aborting.
+    println!("cargo:rustc-link-arg=-Wl,-weak-lvirglrenderer");
+    println!("cargo:rustc-link-arg=-Wl,-weak-lEGL");
     println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Frameworks");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
 }
