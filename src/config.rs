@@ -7,9 +7,10 @@ use serde_json::{Map, Value};
 use crate::paths::Paths;
 
 /// Name, what it takes, and its default (as `berth config list` shows it).
-const KEYS: [(&str, &str, &str); 10] = [
+const KEYS: [(&str, &str, &str); 11] = [
     ("cpus", "a number of CPUs", "every core"),
     ("memory_mib", "MiB, at least 1024", "half the Mac's memory, 2-16 GiB"),
+    ("disk_gib", "GiB, 16 to 4096; disks only grow", "64 (new disks)"),
     ("file_sharing", "berth or apple", "berth (macOS 27)"),
     ("ipv6", "true or false", "false"),
     ("stop", "shutdown or suspend", "shutdown"),
@@ -34,6 +35,10 @@ fn parse(key: &str, value: &str) -> Result<Value> {
         "memory_mib" => match value.parse::<u64>() {
             Ok(n) if (1024..=1 << 22).contains(&n) => Value::from(n),
             _ => bail!("memory_mib is MiB, at least 1024 (e.g. 8192 for 8 GiB)"),
+        },
+        "disk_gib" => match value.parse::<u64>() {
+            Ok(n) if (16..=4096).contains(&n) => Value::from(n),
+            _ => bail!("disk_gib is GiB, 16 to 4096 (e.g. 128); the disk image is sparse, so it takes only what the VM uses"),
         },
         "file_sharing" if matches!(value, "berth" | "apple") => Value::from(value),
         "stop" if matches!(value, "shutdown" | "suspend") => Value::from(value),
@@ -96,9 +101,20 @@ pub fn get(paths: &Paths, key: &str) -> Result<()> {
 pub fn set(paths: &Paths, key: &str, value: &str) -> Result<()> {
     let parsed = parse(key, value)?;
     let mut config = load(paths)?;
-    config.insert(key.to_string(), parsed);
+    config.insert(key.to_string(), parsed.clone());
     save(paths, &config)?;
-    println!("{key} = {value}; {}", applies(key));
+    if key == "disk_gib"
+        && let Some(want) = parsed.as_u64()
+        // diskutil can't read an image the running VM has open: then the
+        // daemon's figure, read when it started.
+        && let Some(have) = crate::provision::disk_size(&paths.disk())
+            .or_else(|| crate::current_status(paths).map(|s| s.disk_size).filter(|&n| n > 0))
+        && want << 30 <= crate::provision::whole_gib(have)
+    {
+        println!("{key} = {value}; the disk is already {:.1} GiB, and disks only grow: it stays that size", have as f64 / (1u64 << 30) as f64);
+    } else {
+        println!("{key} = {value}; {}", applies(key));
+    }
     Ok(())
 }
 
@@ -106,7 +122,11 @@ pub fn unset(paths: &Paths, key: &str) -> Result<()> {
     let mut config = load(paths)?;
     if config.remove(key).is_some() {
         save(paths, &config)?;
-        println!("{key} is back to its default; {}", applies(key));
+        let note = match key {
+            "disk_gib" => "the disk keeps its size (disks only grow); new disks are 64 GiB",
+            _ => applies(key),
+        };
+        println!("{key} is back to its default; {note}");
     }
     Ok(())
 }
@@ -115,6 +135,7 @@ pub fn unset(paths: &Paths, key: &str) -> Result<()> {
 fn applies(key: &str) -> &'static str {
     match key {
         "ports" => "applies to new forwards right away",
+        "disk_gib" => "the disk grows on the next start (berth restart; a suspended VM boots instead of resuming)",
         _ => "applies on the next start (berth restart)",
     }
 }
@@ -128,6 +149,9 @@ mod tests {
         assert_eq!(parse("cpus", "4").unwrap(), Value::from(4));
         assert!(parse("cpus", "0").is_err());
         assert!(parse("memory_mib", "512").is_err());
+        assert_eq!(parse("disk_gib", "128").unwrap(), Value::from(128));
+        assert!(parse("disk_gib", "8").is_err());
+        assert!(parse("disk_gib", "1.5").is_err());
         assert_eq!(parse("ipv6", "on").unwrap(), Value::Bool(true));
         assert!(parse("stop", "hibernate").is_err());
         assert!(parse("proxy", "socks5://x").is_err());

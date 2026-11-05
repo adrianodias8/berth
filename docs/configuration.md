@@ -32,6 +32,7 @@ except `ports`, which applies to new forwards right away.
 |---|---|---|
 | `cpus` | every core | CPUs the VM may use, clamped to what Virtualization.framework allows |
 | `memory_mib` | half the Mac's RAM, 2–16 GiB | the most memory the VM may hold. The balloon limits the guest to what it uses plus headroom, so this is a ceiling, not a reservation; memory the guest has touched stays with the VM until it restarts |
+| `disk_gib` | `64` | the VM disk's size in GiB (16–4096). Raising it grows the disk on the next start (`berth restart`); the guest grows its partition and filesystem as it boots, and a suspended VM boots instead of resuming. Disks only grow: a smaller value is ignored. The image is sparse, so on the Mac it takes only what the VM uses. `berth status` shows how full it is |
 | `file_sharing` | `"berth"` on macOS 27 | `"apple"` uses Apple's virtiofs for the home folder, /Volumes, /tmp and $TMPDIR (`docs/file-sharing.md`). Before macOS 27 it's always Apple's |
 | `ipv6` | `false` | IPv6 subnets for Docker networks, NAT'd out of the VM. Changing it restarts dockerd, which stops running containers; a suspended VM boots instead of resuming |
 | `stop` | `"shutdown"` | `"suspend"`: `berth stop` saves the VM's state and the next start resumes it (see below) |

@@ -2,6 +2,13 @@
 
 What changed, newest first. Details are in the commit messages.
 
+## Unreleased
+
+- **Disk size:** `berth config set disk_gib 128` (or Settings › Resources)
+  grows the VM disk on the next restart; the guest grows its partition and
+  filesystem as it boots. Disks only grow. `berth status` and Settings show
+  how full the disk is, and `berth status` warns when it's nearly full.
+
 ## 0.1.3 (2026-11-02)
 
 - **App:** Settings is split into tabs (General, Resources, Network,
