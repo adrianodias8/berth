@@ -6,6 +6,7 @@
 //!   info domains\n          (replies with the domain table as JSON)
 //!   info network\n          (replies with the guest address and Docker subnets)
 //!   info memory\n           (replies with MemTotal/MemAvailable/PSI, see memory.rs)
+//!   info disk\n             (replies with the root filesystem's size and free bytes, disk.rs)
 //!   info listeners\n        (replies with host-network containers' listening ports, listeners.rs)
 //!   k8s <action>\n          enable|disable|status|kubeconfig (k8s.rs)
 //!   machine <action>\n      then JSON args until EOF: create|start|stop|delete|list (machines.rs)
@@ -34,6 +35,7 @@
 //! host-network containers' ports (listeners.rs).
 
 mod boot;
+mod disk;
 mod dns;
 mod docker;
 mod domains;
@@ -100,6 +102,7 @@ fn main() {
     thread::spawn(memory::ensure_kernel_args);
     thread::spawn(memory::tune);
     thread::spawn(boot::tune);
+    thread::spawn(disk::grow_root);
     thread::spawn(boot::export_kernel);
     thread::spawn(kmod::run);
     thread::spawn(install_guest_files);
@@ -276,6 +279,10 @@ fn handle(fd: OwnedFd) -> io::Result<()> {
         }
         Some(("info", "memory")) => {
             serde_json::to_writer(&mut host, &memory::read()?).map_err(io::Error::other)?;
+            Ok(())
+        }
+        Some(("info", "disk")) => {
+            serde_json::to_writer(&mut host, &disk::usage()?).map_err(io::Error::other)?;
             Ok(())
         }
         Some(("info", "network")) => {

@@ -592,7 +592,7 @@ pub fn request_with_timeout<T: serde::de::DeserializeOwned>(paths: &Paths, req: 
     Ok(serde_json::from_str(&line)?)
 }
 
-fn current_status(paths: &Paths) -> Option<Status> {
+pub(crate) fn current_status(paths: &Paths) -> Option<Status> {
     request(paths, &Request::Status).ok()
 }
 
@@ -802,6 +802,18 @@ fn status(paths: &Paths) -> Result<()> {
                     s.memory_used as f64 / (1u64 << 30) as f64,
                     s.memory_allowed as f64 / (1u64 << 30) as f64
                 );
+            }
+            if s.disk_total > 0 {
+                let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                println!(
+                    "Disk:    {:.1} of {:.1} GiB used, {:.1} GiB free",
+                    gib(s.disk_total.saturating_sub(s.disk_available)),
+                    gib(s.disk_total),
+                    gib(s.disk_available)
+                );
+                if s.disk_available < s.disk_total / 10 {
+                    println!("         nearly full: docker system df shows what's reclaimable; berth config set disk_gib <GiB> grows it");
+                }
             }
             println!("Socket:  {}", paths.docker_socket().display());
             if !s.file_sharing.is_empty() {

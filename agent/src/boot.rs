@@ -11,7 +11,7 @@ use std::process::Command;
 use std::time::Duration;
 
 const CLOUD_INIT_DONE: &str = "/var/lib/cloud/instance/boot-finished";
-const CLOUD_INIT_DISABLED: &str = "/etc/cloud/cloud-init.disabled";
+pub(crate) const CLOUD_INIT_DISABLED: &str = "/etc/cloud/cloud-init.disabled";
 
 /// /boot/efi is only needed when GRUB is updated, yet mounting it held up
 /// local-fs.target (and so Docker) for ~0.9 s. Mount it on first access.

@@ -130,6 +130,22 @@ and boot messages). `berth shell` opens a shell in the VM.
   The guest reuses it, so it doesn't keep growing; `berth restart` (a full
   shutdown and start) gives it back.
 
+## Disk space
+
+- **The VM disk is full** (`berth status` says "nearly full"; MySQL fails
+  writing its redo log, builds fail with "no space left on device").
+  `docker system df` shows what's reclaimable: `docker builder prune`
+  (build cache), `docker image prune -a` (images no container uses),
+  `docker volume prune` (volumes no container uses; check first, DDEV keeps
+  databases in volumes). Or give the VM more room:
+  `berth config set disk_gib 128 && berth restart`.
+- **Space Docker doesn't list.** Docker's two image stores (`image_store`)
+  each keep their images on disk; `docker system df` counts only the current
+  one. With `image_store` at `classic`, images pulled while it was
+  `containerd` (or before berth set it) stay in `/var/lib/containerd`:
+  `berth shell -- sudo du -sh /var/lib/containerd` shows how much. To free
+  it, switch to `containerd`, `docker system prune -a`, and switch back.
+
 ## Suspend and snapshots
 
 - **`berth stop` shut down instead of suspending.** macOS saves a VM's

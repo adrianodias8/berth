@@ -104,7 +104,18 @@ pub struct Status {
     /// Why file sharing is slower than it could be, if it is.
     #[serde(default)]
     pub file_sharing_note: String,
+    /// The VM disk's size, and its root filesystem's size and free bytes
+    /// (0 until the guest has answered).
+    #[serde(default)]
+    pub disk_size: u64,
+    #[serde(default)]
+    pub disk_total: u64,
+    #[serde(default)]
+    pub disk_available: u64,
 }
+
+/// The VM disk's size, read before the VM opens it (diskutil can't after).
+static DISK_SIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 static STOPPING: AtomicBool = AtomicBool::new(false);
 
@@ -325,8 +336,8 @@ pub fn run(paths: Paths) -> Result<()> {
 
     let mut restore = crate::snapshots::take_restore(&paths);
     // A suspended VM resumes with the settings it had: if they've changed
-    // since (CPUs, memory, file sharing, IPv6, image store), boot instead so
-    // they apply.
+    // since (CPUs, memory, file sharing, IPv6, image store, a bigger disk),
+    // boot instead so they apply.
     // Its disk then boots as after a crash, and its containers are started.
     if let Some(r) = &mut restore
         && r.consumed
@@ -338,7 +349,8 @@ pub fn run(paths: Paths) -> Result<()> {
         });
         let ipv6_changed = r.ipv6.is_some_and(|saved| saved != crate::snapshots::ipv6_setting(&paths));
         let store_changed = r.image_store.as_ref().is_some_and(|saved| *saved != crate::snapshots::image_store_setting(&paths));
-        if now.cpus != r.resources.cpus || now.memory != r.resources.memory || share_changed || ipv6_changed || store_changed {
+        let disk_grows = crate::provision::disk_growth(&paths).is_some();
+        if now.cpus != r.resources.cpus || now.memory != r.resources.memory || share_changed || ipv6_changed || store_changed || disk_grows {
             eprintln!("settings changed since the VM was suspended; booting it instead of resuming");
             r.state = None;
             r.share = None;
@@ -350,6 +362,13 @@ pub fn run(paths: Paths) -> Result<()> {
         None => Resources::load(&paths),
     };
     let state = restore.as_ref().and_then(|r| r.state.clone());
+    // Booting (not resuming): the disk may grow to `disk_gib`.
+    if state.is_none()
+        && let Err(err) = crate::provision::grow_disk(&paths)
+    {
+        eprintln!("disk: could not grow the VM disk: {err:#}");
+    }
+    DISK_SIZE.store(crate::provision::disk_size(&paths.disk()).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     if let Some(share) = restore.as_ref().and_then(|r| r.share) {
         let _ = crate::virtiofs::FORCED.set(share);
     }
@@ -460,6 +479,7 @@ async fn handle_control(stream: UnixStream, cpus: usize, memory: u64) -> Result<
             let state = vm::state().await?;
             let running = vm::state_name(state) == "running";
             let (ports_unavailable, ports_need_helper) = ports::unavailable();
+            let disk = if running { disk_usage().await } else { DiskUsage::default() };
             serde_json::to_string(&Status {
                 pid: std::process::id(),
                 vm: vm::state_name(state).to_string(),
@@ -474,6 +494,9 @@ async fn handle_control(stream: UnixStream, cpus: usize, memory: u64) -> Result<
                 memory_allowed: crate::memory::TARGET.load(std::sync::atomic::Ordering::Relaxed),
                 file_sharing: crate::virtiofs::CURRENT.get().map_or("", |s| s.describe()).to_string(),
                 file_sharing_note: crate::virtiofs::slow_note(&Paths::new()).unwrap_or_default(),
+                disk_size: DISK_SIZE.load(std::sync::atomic::Ordering::Relaxed),
+                disk_total: disk.total,
+                disk_available: disk.available,
             })?
         }
         Request::K8s { action } => {
@@ -662,6 +685,36 @@ pub async fn guest_stream(target: &str) -> Result<UnixStream> {
     let mut stream = UnixStream::from_std(std)?;
     stream.write_all(format!("{target}\n").as_bytes()).await?;
     Ok(stream)
+}
+
+#[derive(serde::Deserialize, Default, Clone, Copy)]
+struct DiskUsage {
+    total: u64,
+    available: u64,
+}
+
+/// The guest's root filesystem usage (agent `info disk`). Kept for 10 s:
+/// the app asks for status every 2 s, and each question wakes the VM.
+async fn disk_usage() -> DiskUsage {
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, DiskUsage)>> = std::sync::Mutex::new(None);
+    if let Some((at, usage)) = *LAST.lock().unwrap()
+        && at.elapsed() < Duration::from_secs(10)
+    {
+        return usage;
+    }
+    let ask = async {
+        let mut guest = guest_stream("info disk").await?;
+        let mut json = String::new();
+        guest.read_to_string(&mut json).await?;
+        anyhow::Ok(serde_json::from_str::<DiskUsage>(&json)?)
+    };
+    match tokio::time::timeout(Duration::from_secs(2), ask).await {
+        Ok(Ok(usage)) => {
+            *LAST.lock().unwrap() = Some((std::time::Instant::now(), usage));
+            usage
+        }
+        _ => LAST.lock().unwrap().map(|(_, u)| u).unwrap_or_default(),
+    }
 }
 
 /// Docker answers its ping. A success counts for a while: the app asks for

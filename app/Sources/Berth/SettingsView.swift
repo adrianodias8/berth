@@ -32,6 +32,9 @@ struct SettingsView: View {
     @State private var httpsMessage: String?
     @State private var engines: [String: Bool] = [:]
     @State private var engineMessage: String?
+    /// Saving would grow the disk, which can't be undone: asked first. The
+    /// value is whether to restart after saving.
+    @State private var confirmDiskGrowth: Bool?
 
     private let hostCPUs = ProcessInfo.processInfo.activeProcessorCount
     private let hostMemoryGiB = Int(ProcessInfo.processInfo.physicalMemory >> 30)
@@ -107,6 +110,12 @@ struct SettingsView: View {
                     Text("A ceiling, not a reservation: the VM only takes what it uses. What it has used stays with it until it restarts.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                VStack(alignment: .leading) {
+                    Stepper(value: diskBinding, in: minimumDiskGiB...4096, step: 16) {
+                        LabeledContent("Disk size", value: "\(diskGiB) GiB")
+                    }
+                    Text(diskCaption).font(.caption).foregroundStyle(diskNearlyFull ? .orange : .secondary)
+                }
                 if ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27 {
                     Picker("File sharing", selection: Binding(get: { config.fileSharing ?? "berth" }, set: { config.fileSharing = $0 })) {
                         Text("berth (faster)").tag("berth")
@@ -158,14 +167,40 @@ struct SettingsView: View {
                     HStack {
                         Text("Restart Berth to apply.").foregroundStyle(.secondary)
                         Spacer()
-                        Button("Save") { save(restart: false) }.disabled(proxyMode == "url" && !proxyURLValid)
-                        Button("Save & Restart") { save(restart: true) }.disabled(!engine.isRunning || (proxyMode == "url" && !proxyURLValid))
+                        Button("Save") { requestSave(restart: false) }.disabled(proxyMode == "url" && !proxyURLValid)
+                        Button("Save & Restart") { requestSave(restart: true) }.disabled(!engine.isRunning || (proxyMode == "url" && !proxyURLValid))
                     }
                 }
             }
         }
         .formStyle(.grouped)
         .fixedSize(horizontal: false, vertical: true)
+        .confirmationDialog(
+            "Grow the VM disk to \(diskGiB) GiB?",
+            isPresented: Binding(get: { confirmDiskGrowth != nil }, set: { if !$0 { confirmDiskGrowth = nil } }),
+            presenting: confirmDiskGrowth
+        ) { restart in
+            Button(restart ? "Grow Disk & Restart" : "Grow Disk") { save(restart: restart) }
+            Button("Keep \(keptDiskGiB) GiB") {
+                config.diskGib = saved.diskGib
+                save(restart: restart)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { restart in
+            let from = diskSizeKnown ? "from \(currentDiskGiB) GiB" : "from its current size"
+            let when = restart ? "when Berth restarts now" : "the next time Berth restarts"
+            Text("This can't be undone: the disk can grow but never shrink. It grows \(from) \(when). On your Mac it only takes the space the VM actually uses.")
+        }
+    }
+
+    /// Save, first asking if the disk would grow.
+    private func requestSave(restart: Bool) {
+        // Without the disk's size (Berth stopped) any new size may grow it.
+        if config.diskGib != saved.diskGib, config.diskGib != nil, !diskSizeKnown || diskGiB > currentDiskGiB {
+            confirmDiskGrowth = restart
+        } else {
+            save(restart: restart)
+        }
     }
 
     private var network: some View {
@@ -305,6 +340,46 @@ struct SettingsView: View {
 
     private var memoryGiB: Int {
         config.memoryMib.map { $0 / 1024 } ?? Int((engine.status?.memory ?? 8 << 30) >> 30)
+    }
+
+    private static let gib = Double(1 << 30)
+
+    private var diskSizeKnown: Bool { (engine.status?.diskSize ?? 0) > 0 }
+
+    /// What "Keep" keeps: the saved setting, which may itself still be
+    /// waiting for a restart to grow the disk.
+    private var keptDiskGiB: Int { max(saved.diskGib ?? currentDiskGiB, currentDiskGiB) }
+
+    /// The disk as it is now, rounded up to whole GiB as the host counts it
+    /// (src/provision.rs `whole_gib`; 64 for a new one).
+    private var currentDiskGiB: Int {
+        guard let size = engine.status?.diskSize, size > 0 else { return 64 }
+        return Int((Double(size) / Self.gib).rounded(.up))
+    }
+
+    /// Disks only grow, so the stepper starts at today's size.
+    private var minimumDiskGiB: Int { max(16, currentDiskGiB) }
+
+    private var diskGiB: Int { max(config.diskGib ?? currentDiskGiB, minimumDiskGiB) }
+
+    private var diskBinding: Binding<Int> {
+        // Back at today's size with nothing saved: no setting, rather than
+        // one equal to the size.
+        Binding(get: { diskGiB }, set: { config.diskGib = $0 == currentDiskGiB && saved.diskGib == nil ? nil : $0 })
+    }
+
+    private var diskNearlyFull: Bool {
+        guard let total = engine.status?.diskTotal, let free = engine.status?.diskAvailable, total > 0 else { return false }
+        return free < total / 10
+    }
+
+    private var diskCaption: String {
+        var parts: [String] = []
+        if let total = engine.status?.diskTotal, let free = engine.status?.diskAvailable, total > 0 {
+            parts.append(String(format: "%.1f of %.1f GiB used.", Double(total - min(free, total)) / Self.gib, Double(total) / Self.gib))
+        }
+        parts.append("The disk grows on the next restart and can't shrink. On the Mac it takes only what the VM uses.")
+        return parts.joined(separator: " ")
     }
 
     private var memoryBinding: Binding<Double> {

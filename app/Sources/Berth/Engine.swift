@@ -40,6 +40,11 @@ struct BerthStatus: Decodable, Equatable {
     /// root helper would fix them all.
     let portsUnavailable: [String]?
     let portsNeedHelper: Bool?
+    /// The VM disk's size, and its root filesystem's size and free bytes
+    /// (0 until the guest has answered; agent/src/disk.rs).
+    let diskSize: UInt64?
+    let diskTotal: UInt64?
+    let diskAvailable: UInt64?
 
     enum CodingKeys: String, CodingKey {
         case pid, vm, docker, cpus, memory, ports
@@ -49,6 +54,9 @@ struct BerthStatus: Decodable, Equatable {
         case fileSharingNote = "file_sharing_note"
         case portsUnavailable = "ports_unavailable"
         case portsNeedHelper = "ports_need_helper"
+        case diskSize = "disk_size"
+        case diskTotal = "disk_total"
+        case diskAvailable = "disk_available"
     }
 
     /// The root helper predates abilities this berth needs; reinstall it.
@@ -93,6 +101,8 @@ enum Control {
 struct BerthConfig: Codable, Equatable {
     var cpus: Int?
     var memoryMib: Int?
+    /// The VM disk's size in GiB; it only grows (src/provision.rs).
+    var diskGib: Int?
     /// "berth" (its own share, macOS 27; the default) or "apple" (src/virtiofs.rs).
     var fileSharing: String?
     /// IPv6 for containers (agent/src/ipv6.rs).
@@ -111,6 +121,7 @@ struct BerthConfig: Codable, Equatable {
     enum CodingKeys: String, CodingKey, CaseIterable {
         case cpus
         case memoryMib = "memory_mib"
+        case diskGib = "disk_gib"
         case fileSharing = "file_sharing"
         case ipv6
         case stop
